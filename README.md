@@ -103,6 +103,28 @@ Then open:
 http://127.0.0.1:8000/
 ```
 
+## Docker Deployment
+
+当前 Docker 镜像面向“已有本地索引的 Web 运行时”，不会在容器里安装
+Playwright 或执行知乎抓取。构建和空数据 smoke：
+
+```powershell
+Copy-Item .env.example .env
+docker build -t personaforge:local .
+docker run --rm --name personaforge -p 8000:8000 personaforge:local
+```
+
+访问 `http://127.0.0.1:8000/health` 应返回 `{"status":"ok"}`。
+挂载已有本地数据并后台运行：
+
+```powershell
+docker compose up -d --build
+docker compose ps
+```
+
+数据卷、模型缓存、API Key 和线上服务器步骤见
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)。
+
 ## Offline Evaluation
 
 PersonaForge can prepare a strict temporal holdout without rebuilding the local index. It keeps the newest valid answers out of retrieval, including all later articles and pins, then dynamically excludes those parent IDs in every dense/sparse query.

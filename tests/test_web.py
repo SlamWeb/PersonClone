@@ -6,7 +6,7 @@ from time import perf_counter
 from personaforge.ingest.query_understanding import RetrievalQuery
 from personaforge.ingest.retrieve import ChildHit, ParentHit, RetrieveResult
 from personaforge.persona.suggestions import validate_suggestions
-from personaforge.web.app import _chat_stream_events, create_app
+from personaforge.web.app import _chat_stream_events, _frontend_dist_dir, create_app
 from personaforge.web.service import (
     ChatProgress,
     PersonaChatService,
@@ -288,6 +288,13 @@ def test_create_app_registers_trace_endpoint(tmp_path) -> None:
     paths = {route.path for route in app.routes}
 
     assert "/api/personas/{author}/traces/{trace_id}" in paths
+
+
+def test_frontend_dist_dir_accepts_deployment_override(tmp_path, monkeypatch) -> None:
+    dist_dir = tmp_path / "web-dist"
+    monkeypatch.setenv("PERSONAFORGE_WEB_DIST", str(dist_dir))
+
+    assert _frontend_dist_dir() == dist_dir.resolve()
 
 
 def test_chat_stream_emits_status_before_first_token() -> None:

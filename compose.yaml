@@ -1,0 +1,23 @@
+name: personaforge
+
+services:
+  app:
+    build:
+      context: .
+    image: personaforge:local
+    container_name: personaforge
+    init: true
+    ports:
+      - "${PERSONAFORGE_PORT:-8000}:8000"
+    env_file:
+      - .env
+    volumes:
+      - type: bind
+        source: ./data
+        target: /app/data
+      - "${PERSONAFORGE_DOCKER_MODEL_SOURCE:-personaforge-models}:/app/models"
+    restart: unless-stopped
+    stop_grace_period: 20s
+
+volumes:
+  personaforge-models:

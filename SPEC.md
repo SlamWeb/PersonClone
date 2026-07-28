@@ -511,3 +511,30 @@ SPEC.md
 - 是否做作者相似度 HCI 论文实验。
 
 原则：两周内不继续钻相似度研究，先把开源工程跑通。
+
+## 18. Docker Web 运行时
+
+第一版 Docker 镜像只承担已有 persona 索引的 Web 推理，不在容器中执行
+知乎抓取，因此运行依赖安装 `index + web`，不安装 Playwright。
+
+镜像采用两阶段构建：
+
+```text
+Node.js builder -> npm ci + React production build
+Python runtime  -> 缓存第三方依赖层 + 安装当前源码 wheel + web/dist
+```
+
+运行契约：
+
+- FastAPI 监听 `0.0.0.0:8000`，宿主机通过端口映射访问。
+- `/app/data` 保存 persona、Qdrant、session 和 trace，必须使用外部数据卷。
+- `/app/models` 保存 Hugging Face/BGE-M3 缓存，必须跨容器复用。
+- `.env` 仅在容器启动时注入，绝不复制进镜像。
+- 首版使用一个 FastAPI 进程，避免多个进程同时打开同一个 Qdrant local 目录。
+- Web 静态资源通过 `PERSONAFORGE_WEB_DIST` 明确指定，避免依赖 editable install 的源码目录布局。
+- Python 第三方依赖层仅由 `pyproject.toml` 失效；README 或业务源码变化只重装
+  无依赖的 PersonaForge wheel，不能反复下载或安装 PyTorch。
+- Node/Python 基础镜像固定 digest，避免浮动标签导致不可复现的构建变化。
+- `compose.yaml` 把宿主机 `data/` 绑定到 `/app/data`；模型默认使用命名卷，
+  也允许通过 `PERSONAFORGE_DOCKER_MODEL_SOURCE` 复用宿主机已有缓存。
+- Compose 使用 `restart: unless-stopped`，但不会替代应用级健康检查和日志。

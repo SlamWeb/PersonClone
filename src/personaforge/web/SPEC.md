@@ -359,3 +359,15 @@ GET /api/personas/{author}/suggestions
 - eval 面板。
 - 多模型对比。
 - session memory。
+
+## Docker 静态资源契约
+
+容器部署设置：
+
+```text
+PERSONAFORGE_WEB_DIST=/app/web/dist
+```
+
+`app.py` 优先读取该环境变量定位编译后的 React 静态资源；本地开发未设置时，
+继续使用仓库内的 `web/dist`。这样生产镜像可以使用普通 wheel 安装，不依赖
+editable install 的源码路径。

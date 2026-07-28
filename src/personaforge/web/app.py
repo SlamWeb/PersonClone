@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import traceback
 import mimetypes
 from collections.abc import Iterator
@@ -181,6 +182,9 @@ def _chat_stream_events(service: PersonaChatService, request: ChatStreamRequest)
 
 
 def _frontend_dist_dir() -> Path:
+    configured_path = os.getenv("PERSONAFORGE_WEB_DIST")
+    if configured_path:
+        return Path(configured_path).expanduser().resolve()
     return Path(__file__).resolve().parents[3] / "web" / "dist"
 
 

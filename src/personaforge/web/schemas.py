@@ -15,6 +15,7 @@ class PersonaInfo(BaseModel):
     avatar_url: str | None = None
     headline: str = ""
     content_count: int | None = None
+    persona_pack_available: bool = False
 
 
 class PersonasResponse(BaseModel):
@@ -60,6 +61,6 @@ class ChatStreamRequest(BaseModel):
     session_id: str | None = None
     query: str = Field(min_length=1)
     query_mode: Literal["raw", "grounded"] = "grounded"
-    writer_prompt: Literal["current", "strong_identity"] = "strong_identity"
+    writer_prompt: Literal["current", "strong_identity", "persona_pack"] = "strong_identity"
     parent_top_k: int = Field(default=20, ge=1, le=40)
     trace_capture: Literal["summary", "full"] = "summary"

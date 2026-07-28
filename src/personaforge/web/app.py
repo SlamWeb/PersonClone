@@ -54,6 +54,7 @@ def create_app(config: WebConfig | None = None, *, service: PersonaChatService |
                 avatar_url=item.avatar_url,
                 headline=item.headline,
                 content_count=item.content_count,
+                persona_pack_available=item.persona_pack_available,
             )
             for item in service.list_personas()
         ]
@@ -190,4 +191,4 @@ def run_web(config: WebConfig) -> None:
         raise RuntimeError('Web server requires optional dependencies: pip install -e ".[web]"') from exc
 
     app = create_app(config)
-    uvicorn.run(app, host="127.0.0.1", port=config.port)
+    uvicorn.run(app, host=config.host, port=config.port)

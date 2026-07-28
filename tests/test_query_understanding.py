@@ -43,6 +43,18 @@ def test_plan_web_search_keeps_router_schema_small() -> None:
     assert plan.search_queries == ["武亮 生活费", "武亮 大一 电脑"]
 
 
+def test_search_planner_prompt_covers_old_word_with_new_online_meaning() -> None:
+    llm = FakeJsonClient([{"needs_web": True, "search_queries": ['"力工" 网络梗 是什么意思']}])
+
+    plan = plan_web_search("为什么大多数人在嘲笑力工？", llm=llm)
+    prompt = "\n".join(message["content"] for message in llm.messages[0])
+
+    assert plan.needs_web is True
+    assert "不能按字典第一义猜测" in prompt
+    assert "为什么大多数人在嘲笑力工" in prompt
+    assert '"力工梭哈" 彩礼 婚恋' in prompt
+
+
 def test_background_transform_returns_fixed_four_routes() -> None:
     llm = FakeJsonClient(
         [
@@ -67,6 +79,41 @@ def test_background_transform_returns_fixed_four_routes() -> None:
         "mechanism_scene",
         "colloquial_surface",
     ]
+
+
+def test_background_transform_prompt_requires_resolved_meaning_in_retrieval() -> None:
+    llm = FakeJsonClient(
+        [
+            {
+                "objective_background": "此题中的“力工”不是体力劳动者，而是婚恋语境中的网络标签。",
+                "retrieval_queries": [
+                    {"route": "literal_question", "query": "嘲笑力工"},
+                    {"route": "event_background", "query": "力工梭哈 彩礼 婚恋"},
+                    {"route": "mechanism_scene", "query": "男人攒钱 彩礼买房 结婚梭哈"},
+                    {"route": "colloquial_surface", "query": "辛苦赚钱全给彩礼 被嘲笑"},
+                ],
+            }
+        ]
+    )
+    search_results = [
+        SearchResult(
+            query='"力工" 网络梗',
+            title="力工梭哈",
+            url="https://example.local/ligong",
+            content="力工梭哈用于描述把积蓄集中投入彩礼和婚姻的男性。",
+        )
+    ]
+
+    result = build_background_and_retrieval_queries(
+        "为什么大多数人在嘲笑力工？",
+        search_results=search_results,
+        llm=llm,
+    )
+    prompt = "\n".join(message["content"] for message in llm.messages[0])
+
+    assert "不是体力劳动者" in result.objective_background
+    assert result.retrieval_queries[2].query == "男人攒钱 彩礼买房 结婚梭哈"
+    assert "不得继续围绕被排除的字面义检索" in prompt
 
 
 def test_grounded_query_plan_runs_search_between_two_llm_calls() -> None:

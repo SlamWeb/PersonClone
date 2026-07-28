@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from personaforge.ingest.retrieve import ParentHit
+from personaforge.persona.pack import PersonaPack, render_persona_pack_prompt
 
 
 class TextChatClient(Protocol):
@@ -25,6 +26,8 @@ class AnswerResult:
     messages: list[dict[str, str]]
     parent_titles: list[str]
     writer_prompt: str
+    persona_pack_id: str | None = None
+    persona_pack_sha256: str | None = None
 
 
 def generate_answer(
@@ -34,6 +37,7 @@ def generate_answer(
     llm: TextChatClient,
     objective_background: str = "",
     writer_prompt: str = "current",
+    persona_pack: PersonaPack | None = None,
     temperature: float = 0.85,
     max_tokens: int = 1600,
 ) -> AnswerResult:
@@ -42,6 +46,7 @@ def generate_answer(
         parent_hits=parent_hits,
         objective_background=objective_background,
         writer_prompt=writer_prompt,
+        persona_pack=persona_pack,
     )
     answer = llm.complete_text(messages, temperature=temperature, max_tokens=max_tokens).strip()
     return AnswerResult(
@@ -49,6 +54,8 @@ def generate_answer(
         messages=messages,
         parent_titles=[hit.title for hit in parent_hits],
         writer_prompt=writer_prompt,
+        persona_pack_id=persona_pack.pack_id if writer_prompt == "persona_pack" and persona_pack else None,
+        persona_pack_sha256=persona_pack.sha256 if writer_prompt == "persona_pack" and persona_pack else None,
     )
 
 
@@ -58,6 +65,7 @@ def build_prompt_pack(
     parent_hits: list[ParentHit],
     objective_background: str = "",
     writer_prompt: str = "current",
+    persona_pack: PersonaPack | None = None,
 ) -> str:
     """Render writer messages as a single pasteable prompt for ChatGPT web testing."""
     messages = build_writer_messages(
@@ -65,6 +73,7 @@ def build_prompt_pack(
         parent_hits=parent_hits,
         objective_background=objective_background,
         writer_prompt=writer_prompt,
+        persona_pack=persona_pack,
     )
     return render_prompt_pack(messages, query=query, writer_prompt=writer_prompt)
 
@@ -75,6 +84,7 @@ def build_writer_messages(
     parent_hits: list[ParentHit],
     objective_background: str = "",
     writer_prompt: str = "current",
+    persona_pack: PersonaPack | None = None,
 ) -> list[dict[str, str]]:
     context = pack_author_context(parent_hits)
     background_block = objective_background.strip() or "无额外背景。"
@@ -89,6 +99,10 @@ def build_writer_messages(
 
     请直接给出回答正文。"""
     system_prompt = writer_system_prompt(writer_prompt)
+    if writer_prompt == "persona_pack":
+        if persona_pack is None:
+            raise ValueError("writer_prompt='persona_pack' requires a validated Persona Pack.")
+        system_prompt = f"{system_prompt}\n\n{render_persona_pack_prompt(persona_pack)}"
     return [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
@@ -146,10 +160,12 @@ def writer_system_prompt(name: str) -> str:
         return CURRENT_WRITER_SYSTEM_PROMPT
     if name == "strong_identity":
         return STRONG_IDENTITY_SYSTEM_PROMPT
+    if name == "persona_pack":
+        return STRONG_IDENTITY_SYSTEM_PROMPT
     raise ValueError(f"Unknown writer prompt: {name}")
 
 
-WRITER_PROMPT_CHOICES = ("current", "strong_identity")
+WRITER_PROMPT_CHOICES = ("current", "strong_identity", "persona_pack")
 
 
 CURRENT_WRITER_SYSTEM_PROMPT = """你正在帮助用户生成一段“像这个创作者会写出来”的知乎回答。
@@ -170,6 +186,7 @@ CURRENT_WRITER_SYSTEM_PROMPT = """你正在帮助用户生成一段“像这个�
 - 先判断哪些过往表达真的能帮助回答当前问题；无关内容只可作为语气参考。
 - 观点、语气、句式和节奏都要贴近该创作者，而不只是观点类似。
 - 可以有短句、跳跃、突然判断、口语化表达，不必每段都严密承接，也不必覆盖所有角度。
+- 标点也要服从历史表达。先观察多篇历史表达的引号习惯；除非引号明确是该创作者的高频特征，当前回答默认不用引号，最多使用一处。不得用引号强调普通概念、制造标签、代替解释、改写题意或模拟人物内心话；必要的原话引用除外。
 - 少用“本质上”“你仔细品”“血淋淋的现实”“第一第二第三”这类 AI 味模板。
 - 不要使用“材料1/材料2”或任何编号引用。
 
@@ -210,6 +227,7 @@ STRONG_IDENTITY_SYSTEM_PROMPT = """你将接管一个创作者的公开表达身
 - 不要把创作者改写成通用知乎答主、通用情感博主、通用科普博主或通用 AI 助手。
 - 如果历史表达显示这个创作者常给建议，就给建议；如果历史表达显示他/她常吐槽，就吐槽；如果常短评，就短评；如果常长文，就长文。
 - 保留这个创作者表达里的不平衡、偏执、跳跃、重复、粗糙、尖锐或突然判断；不要自动修成更礼貌、更中立、更完整、更有条理的 AI 文。
+- 标点也属于表达身份。先观察多篇历史表达的引号习惯；除非引号明确是该创作者的高频特征，当前回答默认不用引号，最多使用一处。不得用引号强调普通概念、制造标签、代替解释、改写题意或模拟人物内心话；必要的原话引用除外。
 - 默认从历史表达和题目复杂度判断长度；如果问题适合短答，不要硬写长。
 - 你可以改变具体论点，但不能改变这个创作者看世界的方式。
 """

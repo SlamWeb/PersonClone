@@ -451,6 +451,62 @@ textarea {
   border-top: 1px solid rgba(228, 231, 236, 0.9);
 }
 
+.writer-mode-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: min(936px, calc(100vw - 380px));
+  min-height: 34px;
+  margin: 0 auto 10px;
+}
+
+.writer-mode-label {
+  flex: 0 0 auto;
+  color: var(--faint);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.writer-mode-segments {
+  display: inline-grid;
+  grid-template-columns: repeat(3, max-content);
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.writer-mode-segments button {
+  min-height: 28px;
+  padding: 4px 11px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 680;
+  white-space: nowrap;
+}
+
+.writer-mode-segments button:hover:not(:disabled) {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.writer-mode-segments button.active {
+  border-color: var(--line);
+  background: #ffffff;
+  color: var(--accent);
+  box-shadow: 0 1px 3px rgba(16, 24, 40, 0.08);
+}
+
+.writer-mode-segments button:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
+}
+
 .composer {
   display: grid;
   grid-template-columns: minmax(0, 820px) 104px;
@@ -500,31 +556,35 @@ textarea {
 
 .source-list {
   display: grid;
-  gap: 8px;
+  gap: 0;
   margin-top: 10px;
+  padding-left: 24px;
 }
 
-.source-card {
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  padding: 10px 11px;
-  background: var(--surface);
+.source-list li {
+  padding: 8px 2px;
+  border-bottom: 1px solid var(--line);
+  color: var(--faint);
 }
 
-.source-title {
-  font-weight: 760;
-  line-height: 1.45;
+.source-list li:last-child {
+  border-bottom: 0;
 }
 
-.source-meta {
-  margin-top: 4px;
+.source-list a {
+  display: inline-flex;
+  gap: 6px;
+  align-items: baseline;
   color: var(--muted);
-  font-size: 12px;
-  word-break: break-all;
+  font-size: 13px;
+  line-height: 1.5;
+  text-decoration: none;
 }
 
-.technical-source {
-  margin-top: 8px;
+.source-list a:hover {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 
 .hit-list {
@@ -801,6 +861,20 @@ textarea {
   line-height: 1.45;
 }
 
+.trace-parent-link {
+  display: inline-flex;
+  gap: 5px;
+  align-items: baseline;
+  color: var(--text);
+  text-decoration: none;
+}
+
+.trace-parent-link:hover strong {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
 .trace-parent small {
   overflow: hidden;
   margin-top: 2px;
@@ -1029,6 +1103,25 @@ textarea {
   .suggestion-list {
     width: 100%;
     grid-template-columns: 1fr;
+  }
+
+  .writer-mode-bar {
+    width: 100%;
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .writer-mode-segments {
+    width: 100%;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .writer-mode-segments button {
+    min-width: 0;
+    padding: 5px 6px;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .trace-drawer {

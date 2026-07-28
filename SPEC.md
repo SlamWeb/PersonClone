@@ -90,7 +90,7 @@ pf build wu-ren-jun-28 --quality fast
 pf index wu-ren-jun-28 --embedding-device cuda
 pf ask wu-ren-jun-28 "如何看待女生常说的配得感" --query-mode grounded --embedding-device cuda
 pf prompt-pack wu-ren-jun-28 "如何看待女生常说的配得感" --writer-prompt strong_identity --out .tmp/chatgpt_prompt.md
-pf web wu-ren-jun-28 --port 8000
+pf web wu-ren-jun-28 --host 127.0.0.1 --port 8000
 ```
 
 也提供一键命令：
@@ -99,7 +99,14 @@ pf web wu-ren-jun-28 --port 8000
 pf forge zhihu wu-ren-jun-28 --quality fast --port 8000
 ```
 
-一键命令只是顺序调用 crawl/build/web，底层分步命令必须保留，方便排错和面试讲解。
+一键命令顺序调用 crawl/build/index/web，底层分步命令继续保留，方便排错和
+面试讲解。默认抓取所有当前可访问内容；`--max-items` 用于 smoke，
+`--skip-crawl/--skip-build/--skip-index` 用于显式复用已有产物，`--no-web`
+用于只完成索引。任何 skip 对应的产物不存在时必须立即失败，不能假装完成。
+
+`pf forge` 自动寻找 `<data-dir>/auth/zhihu_storage_state.json` 作为登录态 fallback。
+登录态只留在用户本机。默认 Web host 为 `127.0.0.1`；Docker 或服务器部署时显式
+使用 `--host 0.0.0.0`。
 
 ## 6. Sample Corpus
 

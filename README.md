@@ -15,11 +15,29 @@ The detailed contract lives in [SPEC.md](SPEC.md).
 
 ## Quick Start
 
+从 GitHub 安装当前开发版：
+
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\activate
 python -m pip install -U pip
-pip install -e ".[dev]"
+pip install -e ".[all]"
+playwright install chromium
+pf forge zhihu <author-token> --quality fast
+```
+
+`pf forge` 默认抓取所有当前可访问内容，然后依次 build、index 并在
+`http://127.0.0.1:8000/` 启动 Web。若公开接口不可用，先保存本地登录态：
+
+```powershell
+pf zhihu-login
+pf forge zhihu <author-token> --quality fast
+```
+
+开发者安装和验证：
+
+```powershell
+pip install -e ".[all,dev]"
 pf --help
 pf init
 python -m pytest -q
@@ -47,6 +65,14 @@ Start the FastAPI backend:
 ```powershell
 pf web mock-columnist --port 8000
 ```
+
+Docker 或服务器部署时显式监听所有网卡：
+
+```powershell
+pf web mock-columnist --host 0.0.0.0 --port 8000
+```
+
+本地默认仍绑定 `127.0.0.1`，不会无意暴露给局域网或公网。
 
 For frontend development:
 
@@ -99,6 +125,7 @@ For a low-cost smoke run, add `--limit 1`. Each run writes a local manifest, mac
 - Embedding stays local with BGE-M3 in the first version.
 - Web uses FastAPI + React/Vite. Streamlit/Gradio are not the main architecture.
 - Web v0 supports existing local indexes only; crawl/build/index stay in CLI.
+- `pf forge` is the one-command CLI orchestration for crawl -> build -> index -> Web.
 
 No real crawled corpus, auth state, local index, model files, eval output, or API keys should be committed.
 

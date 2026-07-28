@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useMemo, useState } from 'react';
-import { Activity, Check, Clock3, Copy, Plus, Settings2, SlidersHorizontal, Trash2, X } from 'lucide-react';
+import { Activity, Check, Clock3, Copy, ExternalLink, Plus, Settings2, SlidersHorizontal, Trash2, X } from 'lucide-react';
 import {
   ChatSessionSummary,
   deleteSession,
@@ -23,8 +23,17 @@ type Message = {
   traceId?: string | null;
 };
 
+type WriterPrompt = 'current' | 'strong_identity' | 'persona_pack';
+
 const USER_AVATAR = '你';
 const OPENING_LINE = '今天想聊点什么？';
+
+function initialWriterPrompt(): WriterPrompt {
+  const saved = localStorage.getItem('pf-writer-prompt');
+  return saved === 'current' || saved === 'persona_pack' || saved === 'strong_identity'
+    ? saved
+    : 'strong_identity';
+}
 
 export default function App() {
   const [personas, setPersonas] = useState<PersonaInfo[]>([]);
@@ -33,7 +42,7 @@ export default function App() {
   const [suggestions, setSuggestions] = useState<string[]>([]);
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
   const [queryMode, setQueryMode] = useState<'raw' | 'grounded'>('grounded');
-  const [writerPrompt, setWriterPrompt] = useState<'current' | 'strong_identity'>('strong_identity');
+  const [writerPrompt, setWriterPrompt] = useState<WriterPrompt>(initialWriterPrompt);
   const [parentTopK, setParentTopK] = useState(20);
   const [input, setInput] = useState('');
   const [messages, setMessages] = useState<Message[]>([]);
@@ -75,6 +84,16 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('pf-trace-capture', traceCapture);
   }, [traceCapture]);
+
+  useEffect(() => {
+    localStorage.setItem('pf-writer-prompt', writerPrompt);
+  }, [writerPrompt]);
+
+  useEffect(() => {
+    if (selectedPersona && !selectedPersona.persona_pack_available && writerPrompt === 'persona_pack') {
+      setWriterPrompt('strong_identity');
+    }
+  }, [selectedPersona, writerPrompt]);
 
   useEffect(() => {
     if (!author) return;
@@ -309,16 +328,6 @@ export default function App() {
             </label>
           </div>
 
-          <label>
-            Writer
-            <select
-              value={writerPrompt}
-              onChange={(event) => setWriterPrompt(event.target.value as 'current' | 'strong_identity')}
-            >
-              <option value="strong_identity">Strong Identity</option>
-              <option value="current">Current</option>
-            </select>
-          </label>
           {developerMode ? (
             <label>
               Trace 记录
@@ -365,6 +374,12 @@ export default function App() {
         </section>
 
         <div className="composer-area">
+          <WriterModeSelector
+            value={writerPrompt}
+            onChange={setWriterPrompt}
+            personaPackAvailable={Boolean(selectedPersona?.persona_pack_available)}
+            disabled={busy}
+          />
           {messages.length === 0 && suggestions.length ? (
             <SuggestionChips suggestions={suggestions} onPickSuggestion={setInput} />
           ) : null}
@@ -387,6 +402,68 @@ export default function App() {
         error={traceError}
         onClose={() => setTraceOpen(false)}
       />
+    </div>
+  );
+}
+
+function WriterModeSelector({
+  value,
+  onChange,
+  personaPackAvailable,
+  disabled
+}: {
+  value: WriterPrompt;
+  onChange: (value: WriterPrompt) => void;
+  personaPackAvailable: boolean;
+  disabled: boolean;
+}) {
+  const modes: Array<{
+    value: WriterPrompt;
+    label: string;
+    title: string;
+    available: boolean;
+  }> = [
+    {
+      value: 'current',
+      label: '定向提示',
+      title: '使用当前人工调优的 Writer 提示词',
+      available: true
+    },
+    {
+      value: 'strong_identity',
+      label: '强身份',
+      title: '仅使用通用强身份提示与 RAG20',
+      available: true
+    },
+    {
+      value: 'persona_pack',
+      label: 'Persona Pack',
+      title: personaPackAvailable
+        ? '在强身份模式上加入证据化作者画像'
+        : '这个作者还没有 Persona Pack',
+      available: personaPackAvailable
+    }
+  ];
+
+  return (
+    <div className="writer-mode-bar">
+      <span className="writer-mode-label">回答模式</span>
+      <div className="writer-mode-segments" role="radiogroup" aria-label="回答模式">
+        {modes.map((mode) => (
+          <button
+            key={mode.value}
+            className={value === mode.value ? 'active' : ''}
+            type="button"
+            role="radio"
+            aria-checked={value === mode.value}
+            disabled={disabled || !mode.available}
+            title={mode.title}
+            onClick={() => onChange(mode.value)}
+          >
+            {mode.label}
+          </button>
+        ))}
+      </div>
     </div>
   );
 }
@@ -524,28 +601,21 @@ function Avatar({ label, src }: { label: string; src?: string }) {
 function Sources({ sources }: { sources: Source[] }) {
   return (
     <details className="sources">
-      <summary>引用了 {sources.length} 篇历史材料</summary>
-      <div className="source-list">
+      <summary>引用来源 · {sources.length} 篇</summary>
+      <ol className="source-list">
         {sources.map((source) => (
-          <div className="source-card" key={`${source.rank}-${source.parent_id}`}>
-            <div className="source-title">
-              {source.rank}. {source.title || source.parent_id}
-            </div>
-            <div className="source-meta">{source.path}</div>
-            <details className="technical-source">
-              <summary>技术详情</summary>
-              <div className="source-meta">{source.parent_id}</div>
-              <div className="hit-list">
-                {source.first_hits.map((hit) => (
-                  <span key={`${hit.route}-${hit.rank}-${hit.node_id}`}>
-                    {hit.route} #{hit.rank} {hit.node_type}
-                  </span>
-                ))}
-              </div>
-            </details>
-          </div>
+          <li key={`${source.rank}-${source.parent_id}`}>
+            {source.url ? (
+              <a href={source.url} target="_blank" rel="noreferrer">
+                <span>{source.title || '查看原文'}</span>
+                <ExternalLink size={13} aria-hidden="true" />
+              </a>
+            ) : (
+              <span>{source.title || source.parent_id}</span>
+            )}
+          </li>
         ))}
-      </div>
+      </ol>
     </details>
   );
 }
@@ -660,7 +730,14 @@ function TraceDrawer({
                       <div className="trace-parent" key={parent.parent_id}>
                         <span className="trace-rank">{parent.rank}</span>
                         <div>
-                          <strong>{parent.title || parent.parent_id}</strong>
+                          {parent.url ? (
+                            <a className="trace-parent-link" href={parent.url} target="_blank" rel="noreferrer">
+                              <strong>{parent.title || parent.parent_id}</strong>
+                              <ExternalLink size={12} aria-hidden="true" />
+                            </a>
+                          ) : (
+                            <strong>{parent.title || parent.parent_id}</strong>
+                          )}
                           <small>{parent.first_hits.map((hit) => `${hit.route} #${hit.rank}`).join(' · ')}</small>
                         </div>
                       </div>

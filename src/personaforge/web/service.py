@@ -20,6 +20,7 @@ from personaforge.ingest.query_understanding import (
 )
 from personaforge.ingest.retrieve import ParentHit, RetrieveResult, retrieve_parents, retrieve_parents_for_queries
 from personaforge.llm import DeepSeekJsonClient, JsonChatClient
+from personaforge.persona.pack import load_persona_pack_for_index
 from personaforge.persona.writer import build_writer_messages
 from personaforge.web.trace import (
     DEFAULT_TRACE_RETENTION,
@@ -37,6 +38,7 @@ from personaforge.web.trace import (
 class WebConfig:
     author: str | None = None
     data_dir: Path = Path("data")
+    host: str = "127.0.0.1"
     port: int = 8000
     model_name: str = "BAAI/bge-m3"
     embedding_device: str = "auto"
@@ -58,6 +60,7 @@ class LocalPersona:
     avatar_url: str | None
     headline: str
     content_count: int | None
+    persona_pack_available: bool
     author_dir: Path
     index_dir: Path
     qdrant_path: Path
@@ -86,6 +89,9 @@ class PreparedChat:
     generation_ttft_ms: int | None = None
     generation_usage: dict[str, Any] | None = None
     stages: list[dict[str, Any]] | None = None
+    persona_pack_id: str | None = None
+    persona_pack_sha256: str | None = None
+    persona_pack_claim_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +175,10 @@ class PersonaChatService:
         try:
             index_dir = self.config.data_dir / "authors" / "zhihu" / selected_author / "index"
             qdrant_path = index_dir / "qdrant"
+            persona_pack = load_persona_pack_for_index(
+                index_dir,
+                required=writer_prompt == "persona_pack",
+            ) if writer_prompt == "persona_pack" else None
             query_trace: dict[str, Any] | None = None
             objective_background = ""
             understanding_ms = 0
@@ -289,6 +299,7 @@ class PersonaChatService:
                 parent_hits=retrieve_result.parents,
                 objective_background=objective_background,
                 writer_prompt=writer_prompt,
+                persona_pack=persona_pack,
             )
             stages.append(
                 self._stage(
@@ -299,6 +310,9 @@ class PersonaChatService:
                         "parent_count": len(retrieve_result.parents),
                         "message_count": len(messages),
                         "context_characters": sum(len(message.get("content", "")) for message in messages),
+                        "persona_pack_id": persona_pack.pack_id if persona_pack else None,
+                        "persona_pack_sha256": persona_pack.sha256 if persona_pack else None,
+                        "persona_pack_claim_count": persona_pack.claim_count if persona_pack else 0,
                     },
                     usage=estimated_usage_for_text(*(message.get("content", "") for message in messages)),
                 )
@@ -335,6 +349,9 @@ class PersonaChatService:
             retrieval_duration_ms=retrieval_ms,
             writer_build_duration_ms=elapsed_ms(writer_started_at),
             stages=stages,
+            persona_pack_id=persona_pack.pack_id if persona_pack else None,
+            persona_pack_sha256=persona_pack.sha256 if persona_pack else None,
+            persona_pack_claim_count=persona_pack.claim_count if persona_pack else 0,
         )
         self.record_prepared_trace(prepared)
         yield prepared
@@ -386,7 +403,12 @@ class PersonaChatService:
         return self._write_trace(prepared, status="failed", error=error)
 
     def get_trace(self, author: str, trace_id: str) -> dict[str, Any]:
-        return read_trace(self.config.data_dir, author, trace_id)
+        payload = read_trace(self.config.data_dir, author, trace_id)
+        enrich_trace_source_urls(
+            payload,
+            self.config.data_dir / "authors" / "zhihu" / author / "index" / "parents.jsonl",
+        )
+        return payload
 
     def list_sessions(self, author: str) -> list[dict[str, Any]]:
         sessions: list[dict[str, Any]] = []
@@ -417,6 +439,10 @@ class PersonaChatService:
         payload.setdefault("author", author)
         payload.setdefault("title", "未命名对话")
         payload.setdefault("messages", [])
+        enrich_session_source_urls(
+            payload,
+            self.config.data_dir / "authors" / "zhihu" / author / "index" / "parents.jsonl",
+        )
         return payload
 
     def delete_session(self, author: str, session_id: str) -> None:
@@ -515,6 +541,9 @@ class PersonaChatService:
             "retrieval": serialize_retrieve_result(prepared.retrieve_result, prepared.retrieval_duration_ms),
             "writer": {
                 "variant": prepared.writer_prompt,
+                "persona_pack_id": prepared.persona_pack_id,
+                "persona_pack_sha256": prepared.persona_pack_sha256,
+                "persona_pack_claim_count": prepared.persona_pack_claim_count,
                 "duration_ms": prepared.writer_build_duration_ms,
                 "context_parents": [
                     {"rank": hit.rank, "parent_id": hit.parent_id, "title": hit.title}
@@ -703,6 +732,10 @@ def list_local_personas(data_dir: Path = Path("data")) -> list[LocalPersona]:
                     avatar_url=profile.get("avatar_url"),
                     headline=str(profile.get("headline") or ""),
                     content_count=count_parents(index_dir),
+                    persona_pack_available=(
+                        (author_dir / "persona_pack.json").exists()
+                        or (index_dir / "persona_pack.json").exists()
+                    ),
                     author_dir=author_dir,
                     index_dir=index_dir,
                     qdrant_path=qdrant_path,
@@ -719,6 +752,7 @@ def sources_from_parent_hits(parent_hits: list[ParentHit]) -> list[dict[str, Any
             "score": hit.score,
             "title": hit.title,
             "path": hit.path,
+            "url": public_source_url(hit.parent),
             "first_hits": [
                 {
                     "rank": child.rank,
@@ -774,8 +808,88 @@ def serialize_parent_hit(hit: ParentHit) -> dict[str, Any]:
         "parent_id": hit.parent_id,
         "title": hit.title,
         "path": hit.path,
+        "url": public_source_url(hit.parent),
         "first_hits": [serialize_child_hit(child) for child in hit.first_hits],
     }
+
+
+def public_source_url(parent: dict[str, Any] | None) -> str | None:
+    """Return a human-facing source URL instead of an ingestion API URL."""
+
+    if not parent:
+        return None
+    kind = str(parent.get("kind") or "")
+    source_id = str(parent.get("source_id") or "")
+    metadata = parent.get("metadata") if isinstance(parent.get("metadata"), dict) else {}
+    if kind == "answer" and source_id:
+        question_id = str(metadata.get("question_id") or "")
+        if question_id:
+            return f"https://www.zhihu.com/question/{question_id}/answer/{source_id}"
+    if kind == "article" and source_id:
+        return f"https://zhuanlan.zhihu.com/p/{source_id}"
+    if kind == "pin" and source_id:
+        return f"https://www.zhihu.com/pins/{source_id}"
+    url = str(parent.get("url") or "").strip()
+    if url.startswith("http://"):
+        return "https://" + url.removeprefix("http://")
+    return url or None
+
+
+def enrich_session_source_urls(payload: dict[str, Any], parents_path: Path) -> None:
+    """Add public URLs to old session sources without rewriting session files."""
+
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or not parents_path.exists():
+        return
+    missing_ids = {
+        str(source.get("parent_id"))
+        for message in messages
+        if isinstance(message, dict)
+        for source in (message.get("sources") or [])
+        if isinstance(source, dict) and not source.get("url") and source.get("parent_id")
+    }
+    if not missing_ids:
+        return
+    parents = load_parents_by_id(parents_path, missing_ids)
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        for source in message.get("sources") or []:
+            if not isinstance(source, dict) or source.get("url"):
+                continue
+            source["url"] = public_source_url(parents.get(str(source.get("parent_id") or "")))
+
+
+def enrich_trace_source_urls(payload: dict[str, Any], parents_path: Path) -> None:
+    retrieval = payload.get("retrieval")
+    parents = retrieval.get("parents") if isinstance(retrieval, dict) else None
+    if not isinstance(parents, list) or not parents_path.exists():
+        return
+    missing_ids = {
+        str(parent.get("parent_id"))
+        for parent in parents
+        if isinstance(parent, dict) and not parent.get("url") and parent.get("parent_id")
+    }
+    parent_records = load_parents_by_id(parents_path, missing_ids)
+    for parent in parents:
+        if not isinstance(parent, dict) or parent.get("url"):
+            continue
+        parent["url"] = public_source_url(parent_records.get(str(parent.get("parent_id") or "")))
+
+
+def load_parents_by_id(parents_path: Path, parent_ids: set[str]) -> dict[str, dict[str, Any]]:
+    parents: dict[str, dict[str, Any]] = {}
+    if not parent_ids:
+        return parents
+    with parents_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            parent = json.loads(line)
+            parent_id = str(parent.get("doc_id") or "")
+            if parent_id in parent_ids:
+                parents[parent_id] = parent
+    return parents
 
 
 def load_persona_profile(author_dir: Path) -> dict[str, Any]:

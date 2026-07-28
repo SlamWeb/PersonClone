@@ -90,3 +90,12 @@ def test_strong_identity_prompt_is_generic_identity_immersion() -> None:
     assert "不是“模仿文风”" in prompt
     assert "如果历史表达显示这个创作者常给建议，就给建议" in prompt
     assert "不要把创作者改写成通用知乎答主" in prompt
+    assert "当前回答默认不用引号，最多使用一处" in prompt
+    assert "模拟人物内心话" in prompt
+
+
+def test_current_prompt_avoids_model_generated_quote_labels() -> None:
+    prompt = writer_system_prompt("current")
+
+    assert "当前回答默认不用引号，最多使用一处" in prompt
+    assert "模拟人物内心话" in prompt

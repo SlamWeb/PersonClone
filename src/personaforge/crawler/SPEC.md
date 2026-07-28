@@ -89,7 +89,12 @@ Playwright fallback：
 ```powershell
 pf crawl zhihu <author> --all
 pf zhihu-login
+pf forge zhihu <author> --quality fast
 ```
+
+`pf forge` 是产品级一键入口，会复用本模块的 crawler 后继续 build、index 和 Web；
+它不在 CLI 中另写一套抓取逻辑。若 `<data-dir>/auth/zhihu_storage_state.json`
+已经存在，forge 会自动作为浏览器 fallback 使用。
 
 默认输出：
 

@@ -29,6 +29,7 @@ def test_list_local_personas_finds_indexed_authors(tmp_path) -> None:
     assert [item.author for item in personas] == ["alice"]
     assert personas[0].source == "zhihu"
     assert personas[0].display_name == "alice"
+    assert personas[0].persona_pack_available is False
 
 
 def test_list_local_personas_reads_profile_metadata(tmp_path) -> None:
@@ -40,12 +41,14 @@ def test_list_local_personas_reads_profile_metadata(tmp_path) -> None:
         json.dumps({"nickname": "Alice", "avatar_url": "https://example.com/a.jpg"}, ensure_ascii=False),
         encoding="utf-8",
     )
+    (author_dir / "persona_pack.json").write_text("{}", encoding="utf-8")
 
     persona = list_local_personas(tmp_path)[0]
 
     assert persona.display_name == "Alice"
     assert persona.avatar_url == "https://example.com/a.jpg"
     assert persona.content_count == 2
+    assert persona.persona_pack_available is True
 
 
 def test_save_turn_creates_author_scoped_session(tmp_path) -> None:
@@ -221,14 +224,54 @@ def test_sources_from_parent_hits_hides_parent_full_text() -> None:
                 route="literal_question:dense",
             )
         ],
-        parent={"text": "完整正文不应该进 sources"},
+        parent={
+            "kind": "answer",
+            "source_id": "1",
+            "metadata": {"question_id": "99"},
+            "text": "完整正文不应该进 sources",
+        },
     )
 
     sources = sources_from_parent_hits([hit])
 
     assert sources[0]["title"] == "标题"
+    assert sources[0]["url"] == "https://www.zhihu.com/question/99/answer/1"
     assert "完整正文" not in json.dumps(sources, ensure_ascii=False)
     assert sources[0]["first_hits"][0]["node_type"] == "passage"
+
+
+def test_old_trace_gets_public_source_url_when_read(tmp_path) -> None:
+    index_dir = tmp_path / "authors" / "zhihu" / "alice" / "index"
+    index_dir.mkdir(parents=True)
+    (index_dir / "parents.jsonl").write_text(
+        json.dumps(
+            {
+                "doc_id": "zhihu:answer:1",
+                "kind": "answer",
+                "source_id": "1",
+                "metadata": {"question_id": "99"},
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    trace_dir = tmp_path / "authors" / "zhihu" / "alice" / "traces"
+    trace_dir.mkdir(parents=True)
+    (trace_dir / "old.json").write_text(
+        json.dumps(
+            {
+                "trace_id": "old",
+                "retrieval": {"parents": [{"parent_id": "zhihu:answer:1"}]},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    trace = PersonaChatService(WebConfig(data_dir=tmp_path)).get_trace("alice", "old")
+
+    assert trace["retrieval"]["parents"][0]["url"] == "https://www.zhihu.com/question/99/answer/1"
 
 
 def test_sse_event_serializes_utf8_json() -> None:

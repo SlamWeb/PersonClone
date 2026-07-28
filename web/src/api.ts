@@ -6,6 +6,7 @@ export type PersonaInfo = {
   avatar_url?: string | null;
   headline: string;
   content_count?: number | null;
+  persona_pack_available: boolean;
 };
 
 export type SourceHit = {
@@ -22,6 +23,7 @@ export type Source = {
   score: number;
   title: string;
   path: string;
+  url?: string | null;
   first_hits: SourceHit[];
 };
 
@@ -30,7 +32,7 @@ export type ChatStreamRequest = {
   session_id?: string | null;
   query: string;
   query_mode: 'raw' | 'grounded';
-  writer_prompt: 'current' | 'strong_identity';
+  writer_prompt: 'current' | 'strong_identity' | 'persona_pack';
   parent_top_k: number;
   trace_capture: 'summary' | 'full';
 };
@@ -85,6 +87,7 @@ export type TraceParent = {
   parent_id: string;
   title: string;
   path: string;
+  url?: string | null;
   first_hits: TraceChildHit[];
 };
 
@@ -122,6 +125,9 @@ export type TracePayload = {
   } | null;
   writer: {
     variant: string;
+    persona_pack_id?: string | null;
+    persona_pack_sha256?: string | null;
+    persona_pack_claim_count?: number;
     duration_ms: number;
     context_parents: Array<{ rank: number; parent_id: string; title: string }>;
     messages: Array<{ role: string; characters: number }>;

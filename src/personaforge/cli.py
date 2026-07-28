@@ -18,6 +18,7 @@ from personaforge.ingest.index import index_corpus
 from personaforge.ingest.query_understanding import build_grounded_query_plan, plan_to_trace
 from personaforge.ingest.retrieve import retrieve_parents, retrieve_parents_for_queries
 from personaforge.llm import DeepSeekJsonClient
+from personaforge.persona.pack import load_persona_pack_for_index
 from personaforge.persona.suggestions import generate_suggestions
 from personaforge.persona.writer import WRITER_PROMPT_CHOICES, build_prompt_pack, generate_answer
 
@@ -208,6 +209,10 @@ def build_parser() -> argparse.ArgumentParser:
     eval_run_parser.add_argument("--dataset", required=True, help="Path to dataset.jsonl from pf eval prepare.")
     eval_run_parser.add_argument("--index-dir", help="Directory containing parents.jsonl and nodes.jsonl.")
     eval_run_parser.add_argument("--qdrant-path", help="Local Qdrant storage path.")
+    eval_run_parser.add_argument(
+        "--persona-pack-path",
+        help="Optional Persona Pack path when the eval index is outside the author directory.",
+    )
     eval_run_parser.add_argument("--out-dir", help="Dataset directory. Defaults to the dataset parent directory.")
     eval_run_parser.add_argument("--run-name", required=True, help="Unique local name for this experiment run.")
     eval_run_parser.add_argument("--split", choices=["dev", "test"], default="dev")
@@ -236,6 +241,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     web_parser = subparsers.add_parser("web", help="Start the local Web UI.")
     web_parser.add_argument("author", nargs="?", help="Creator token.")
+    web_parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Bind host. Use 0.0.0.0 inside Docker or on a server.",
+    )
     web_parser.add_argument("--port", type=int, default=8000)
     web_parser.add_argument("--data-dir", default="data", help="Local data root.")
     web_parser.add_argument("--model-name", default="BAAI/bge-m3", help="Embedding model name.")
@@ -253,11 +263,55 @@ def build_parser() -> argparse.ArgumentParser:
     web_parser.add_argument("--max-tokens", type=int, default=1600)
     web_parser.add_argument("--no-fp16", action="store_true", help="Disable fp16 when loading BGE-M3.")
 
-    forge_parser = subparsers.add_parser("forge", help="Crawl, build, and start the local Web UI.")
+    forge_parser = subparsers.add_parser(
+        "forge",
+        help="Crawl, build, index, and start the local Web UI.",
+    )
     forge_parser.add_argument("platform", choices=["zhihu"])
     forge_parser.add_argument("author")
     forge_parser.add_argument("--quality", choices=["fast", "full"], default="fast")
+    forge_parser.add_argument("--data-dir", default="data", help="Local data root.")
+    forge_parser.add_argument("--model-name", default="BAAI/bge-m3")
+    forge_parser.add_argument(
+        "--embedding-device",
+        choices=["auto", "cpu", "cuda"],
+        default="auto",
+    )
+    forge_parser.add_argument("--batch-size", type=int, default=12)
+    forge_parser.add_argument("--no-fp16", action="store_true")
+    forge_parser.add_argument(
+        "--max-items",
+        type=int,
+        help="Limit crawled items for a smoke run. Defaults to all reachable items.",
+    )
+    forge_parser.add_argument("--delay-seconds", type=float, default=1.5)
+    forge_parser.add_argument(
+        "--max-api-pages",
+        type=int,
+        default=100,
+        help="Safety cap per content kind; crawling still stops when the source is exhausted.",
+    )
+    forge_parser.add_argument("--storage-state", type=Path)
+    forge_parser.add_argument("--headed", action="store_true")
+    forge_parser.add_argument("--no-api", action="store_true")
+    forge_parser.add_argument("--no-browser", action="store_true")
+    forge_parser.add_argument("--quiet", action="store_true")
+    forge_parser.add_argument("--skip-crawl", action="store_true")
+    forge_parser.add_argument("--skip-build", action="store_true")
+    forge_parser.add_argument("--skip-index", action="store_true")
+    forge_parser.add_argument(
+        "--no-web",
+        action="store_true",
+        help="Stop after indexing instead of starting the Web UI.",
+    )
+    forge_parser.add_argument("--host", default="127.0.0.1")
     forge_parser.add_argument("--port", type=int, default=8000)
+    forge_parser.add_argument("--child-top-k", type=int, default=100)
+    forge_parser.add_argument("--per-query-parent-k", type=int, default=30)
+    forge_parser.add_argument("--parent-top-k", type=int, default=20)
+    forge_parser.add_argument("--max-search-results", type=int, default=5)
+    forge_parser.add_argument("--temperature", type=float, default=0.85)
+    forge_parser.add_argument("--max-tokens", type=int, default=1600)
 
     return parser
 
@@ -318,7 +372,7 @@ def main(argv: list[str] | None = None) -> int:
         return _run_web(args)
 
     if args.command == "forge":
-        parser.error(f"`pf {args.command}` is specified but not implemented yet.")
+        return _run_forge(args)
 
     parser.print_help()
     return 0
@@ -510,7 +564,7 @@ def _run_retrieve(args: argparse.Namespace) -> int:
 
 
 def _retrieve_for_generation(args: argparse.Namespace):
-    index_dir = Path(args.index_dir) if args.index_dir else Path("data/authors") / "zhihu" / args.author / "index"
+    index_dir = _generation_index_dir(args)
     qdrant_path = Path(args.qdrant_path) if args.qdrant_path else index_dir / "qdrant"
     encoder = BgeM3Encoder(
         args.model_name,
@@ -554,8 +608,21 @@ def _retrieve_for_generation(args: argparse.Namespace):
     return retrieve_result, query_trace, objective_background
 
 
+def _generation_index_dir(args: argparse.Namespace) -> Path:
+    return (
+        Path(args.index_dir)
+        if args.index_dir
+        else Path("data/authors") / "zhihu" / args.author / "index"
+    )
+
+
 def _run_ask(args: argparse.Namespace) -> int:
     retrieve_result, query_trace, objective_background = _retrieve_for_generation(args)
+    index_dir = _generation_index_dir(args)
+    persona_pack = load_persona_pack_for_index(
+        index_dir,
+        required=args.writer_prompt == "persona_pack",
+    ) if args.writer_prompt == "persona_pack" else None
     llm = DeepSeekJsonClient.from_env()
     answer = generate_answer(
         query=args.query,
@@ -563,6 +630,7 @@ def _run_ask(args: argparse.Namespace) -> int:
         llm=llm,
         objective_background=objective_background,
         writer_prompt=args.writer_prompt,
+        persona_pack=persona_pack,
         temperature=args.temperature,
         max_tokens=args.max_tokens,
     )
@@ -582,11 +650,17 @@ def _run_ask(args: argparse.Namespace) -> int:
 
 def _run_prompt_pack(args: argparse.Namespace) -> int:
     retrieve_result, query_trace, objective_background = _retrieve_for_generation(args)
+    index_dir = _generation_index_dir(args)
+    persona_pack = load_persona_pack_for_index(
+        index_dir,
+        required=args.writer_prompt == "persona_pack",
+    ) if args.writer_prompt == "persona_pack" else None
     prompt_pack = build_prompt_pack(
         query=args.query,
         parent_hits=retrieve_result.parents,
         objective_background=objective_background,
         writer_prompt=args.writer_prompt,
+        persona_pack=persona_pack,
     )
 
     if args.trace_path:
@@ -596,6 +670,8 @@ def _run_prompt_pack(args: argparse.Namespace) -> int:
             retrieve_result=retrieve_result,
             objective_background=objective_background,
             writer_prompt=args.writer_prompt,
+            persona_pack_id=persona_pack.pack_id if persona_pack else None,
+            persona_pack_sha256=persona_pack.sha256 if persona_pack else None,
         )
 
     if args.out:
@@ -679,6 +755,7 @@ def _run_eval(args: argparse.Namespace) -> int:
             temperature=args.temperature,
             max_tokens=args.max_tokens,
             limit=args.limit,
+            persona_pack_path=Path(args.persona_pack_path) if args.persona_pack_path else None,
         )
         encoder = BgeM3Encoder(args.model_name, device=args.embedding_device, use_fp16=not args.no_fp16)
         result = run_temporal_eval(
@@ -779,6 +856,8 @@ def _write_ask_trace(path: Path, *, query_trace: dict | None, retrieve_result, a
         ],
         "writer_parent_titles": answer.parent_titles,
         "writer_prompt": answer.writer_prompt,
+        "persona_pack_id": answer.persona_pack_id,
+        "persona_pack_sha256": answer.persona_pack_sha256,
         "answer": answer.answer,
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8", newline="\n")
@@ -791,6 +870,8 @@ def _write_prompt_pack_trace(
     retrieve_result,
     objective_background: str,
     writer_prompt: str,
+    persona_pack_id: str | None,
+    persona_pack_sha256: str | None,
 ) -> None:
     import json
 
@@ -823,6 +904,8 @@ def _write_prompt_pack_trace(
         ],
         "writer_parent_titles": [hit.title for hit in retrieve_result.parents],
         "writer_prompt": writer_prompt,
+        "persona_pack_id": persona_pack_id,
+        "persona_pack_sha256": persona_pack_sha256,
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8", newline="\n")
 
@@ -834,6 +917,7 @@ def _run_web(args: argparse.Namespace) -> int:
     config = WebConfig(
         author=args.author,
         data_dir=Path(args.data_dir),
+        host=args.host,
         port=args.port,
         model_name=args.model_name,
         embedding_device=args.embedding_device,
@@ -847,6 +931,123 @@ def _run_web(args: argparse.Namespace) -> int:
     )
     run_web(config)
     return 0
+
+
+def _run_forge(args: argparse.Namespace) -> int:
+    """Run the existing local pipeline stages without duplicating their logic."""
+
+    if args.platform != "zhihu":
+        raise ValueError(f"Unsupported platform: {args.platform}")
+    author = parse_user_token(args.author)
+    data_dir = Path(args.data_dir)
+    author_dir = data_dir / "authors" / "zhihu" / author
+    raw_dir = author_dir / "raw"
+    index_dir = author_dir / "index"
+    qdrant_path = index_dir / "qdrant"
+    _ensure_data_dirs(data_dir)
+
+    storage_state = args.storage_state
+    default_storage_state = data_dir / "auth" / "zhihu_storage_state.json"
+    if storage_state is None and default_storage_state.exists():
+        storage_state = default_storage_state
+
+    print(f"Forging local persona: zhihu/{author}")
+    if args.skip_crawl:
+        _require_forge_artifact(raw_dir, "crawl", "--skip-crawl")
+        print(f"[1/4] Reusing raw Markdown: {raw_dir}")
+    else:
+        print("[1/4] Crawling public creator content")
+        code = _run_crawl(
+            argparse.Namespace(
+                platform="zhihu",
+                author=author,
+                out_dir=str(raw_dir),
+                all=args.max_items is None,
+                max_items=args.max_items or 100,
+                kind=None,
+                delay_seconds=args.delay_seconds,
+                max_api_pages=args.max_api_pages,
+                storage_state=storage_state,
+                headed=args.headed,
+                no_api=args.no_api,
+                no_browser=args.no_browser,
+                quiet=args.quiet,
+            )
+        )
+        if code:
+            return code
+
+    if args.skip_build:
+        _require_forge_artifact(index_dir / "parents.jsonl", "build", "--skip-build")
+        _require_forge_artifact(index_dir / "nodes.jsonl", "build", "--skip-build")
+        print(f"[2/4] Reusing ingest artifacts: {index_dir}")
+    else:
+        print("[2/4] Building parent and child documents")
+        code = _run_build(
+            argparse.Namespace(
+                author=author,
+                raw_dir=str(raw_dir),
+                index_dir=str(index_dir),
+                quality=args.quality,
+            )
+        )
+        if code:
+            return code
+
+    if args.skip_index:
+        _require_forge_artifact(
+            index_dir / "qdrant_manifest.json",
+            "index",
+            "--skip-index",
+        )
+        _require_forge_artifact(qdrant_path, "index", "--skip-index")
+        print(f"[3/4] Reusing Qdrant index: {qdrant_path}")
+    else:
+        print("[3/4] Embedding child nodes and writing Qdrant index")
+        code = _run_index(
+            argparse.Namespace(
+                author=author,
+                index_dir=str(index_dir),
+                qdrant_path=str(qdrant_path),
+                model_name=args.model_name,
+                embedding_device=args.embedding_device,
+                batch_size=args.batch_size,
+                no_fp16=args.no_fp16,
+            )
+        )
+        if code:
+            return code
+
+    if args.no_web:
+        print("[4/4] Web startup skipped (--no-web)")
+        print(f"Persona ready: {author_dir}")
+        return 0
+
+    print(f"[4/4] Starting Web UI at http://{args.host}:{args.port}/")
+    return _run_web(
+        argparse.Namespace(
+            author=author,
+            data_dir=str(data_dir),
+            host=args.host,
+            port=args.port,
+            model_name=args.model_name,
+            embedding_device=args.embedding_device,
+            no_fp16=args.no_fp16,
+            child_top_k=args.child_top_k,
+            per_query_parent_k=args.per_query_parent_k,
+            parent_top_k=args.parent_top_k,
+            max_search_results=args.max_search_results,
+            temperature=args.temperature,
+            max_tokens=args.max_tokens,
+        )
+    )
+
+
+def _require_forge_artifact(path: Path, stage: str, flag: str) -> None:
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Cannot use {flag}: {stage} artifact does not exist: {path}"
+        )
 
 
 def _content_kinds(values: Iterable[str]) -> tuple[ContentKind, ...]:

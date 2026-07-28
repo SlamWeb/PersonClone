@@ -28,6 +28,13 @@ web = [
   "fastapi>=0.115",
   "uvicorn[standard]>=0.30",
 ]
+all = [
+  "playwright>=1.45",
+  "FlagEmbedding>=1.2.10",
+  "qdrant-client>=1.10",
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+]
 dev = [
   "pytest>=8.0",
 ]

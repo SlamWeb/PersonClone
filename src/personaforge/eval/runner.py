@@ -15,6 +15,7 @@ from personaforge.ingest.embeddings import TextEncoder
 from personaforge.ingest.query_understanding import build_grounded_query_plan, plan_to_trace
 from personaforge.ingest.retrieve import ParentHit, RetrieveResult, retrieve_parents, retrieve_parents_for_queries
 from personaforge.llm import JsonChatClient
+from personaforge.persona.pack import PersonaPack, load_persona_pack, load_persona_pack_for_index
 from personaforge.persona.writer import generate_answer
 
 
@@ -37,6 +38,7 @@ class EvalRunConfig:
     temperature: float = 0.85
     max_tokens: int = 1600
     limit: int | None = None
+    persona_pack_path: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +66,18 @@ def run_temporal_eval(
 
     dataset_manifest = load_dataset_manifest(config.dataset_path)
     excluded_parent_ids = set(str(value) for value in dataset_manifest.get("excluded_parent_ids", []))
+    if config.writer_prompt == "persona_pack" and config.persona_pack_path is not None:
+        persona_pack = load_persona_pack(
+            config.persona_pack_path,
+            parent_store_path=index_dir / "parents.jsonl",
+            verify_evidence=True,
+        )
+    elif config.writer_prompt == "persona_pack":
+        persona_pack = load_persona_pack_for_index(index_dir, required=True)
+    else:
+        persona_pack = None
+    if persona_pack is not None:
+        assert_persona_pack_no_leak(persona_pack, excluded_parent_ids)
     run_dir = config.out_dir / "runs" / config.run_name
     if run_dir.exists():
         raise FileExistsError(f"Eval run already exists: {run_dir}. Choose a new --run-name.")
@@ -85,6 +99,11 @@ def run_temporal_eval(
         "git": git_revision(),
         "writer_model": str(getattr(llm, "model", type(llm).__name__)),
         "embedding_model": type(encoder).__name__,
+        "persona_pack": {
+            "pack_id": persona_pack.pack_id,
+            "sha256": persona_pack.sha256,
+            "claim_count": persona_pack.claim_count,
+        } if persona_pack else None,
     }
     write_json(run_manifest, manifest_path)
 
@@ -99,6 +118,7 @@ def run_temporal_eval(
                 excluded_parent_ids=excluded_parent_ids,
                 encoder=encoder,
                 llm=llm,
+                persona_pack=persona_pack,
             )
             records.append(record)
             append_jsonl(record, runs_path)
@@ -136,6 +156,7 @@ def run_eval_item(
     excluded_parent_ids: set[str],
     encoder: TextEncoder,
     llm: JsonChatClient,
+    persona_pack: PersonaPack | None = None,
 ) -> dict[str, Any]:
     query = str(item["query"])
     started_at = perf_counter()
@@ -189,6 +210,7 @@ def run_eval_item(
         llm=llm,
         objective_background=objective_background,
         writer_prompt=config.writer_prompt,
+        persona_pack=persona_pack,
         temperature=config.temperature,
         max_tokens=config.max_tokens,
     )
@@ -208,6 +230,8 @@ def run_eval_item(
             "retrieval": serialize_retrieve_result(retrieve_result),
             "writer": {
                 "variant": answer_result.writer_prompt,
+                "persona_pack_id": answer_result.persona_pack_id,
+                "persona_pack_sha256": answer_result.persona_pack_sha256,
                 "context_parent_titles": answer_result.parent_titles,
                 "message_characters": [
                     {"role": message["role"], "characters": len(message["content"])}
@@ -234,6 +258,20 @@ def assert_no_leak(result: RetrieveResult, excluded_parent_ids: set[str]) -> Non
     leaked.update(hit.parent_id for hit in result.parents if hit.parent_id in excluded_parent_ids)
     if leaked:
         raise RuntimeError(f"Evaluation leakage: excluded parent(s) retrieved: {sorted(leaked)}")
+
+
+def assert_persona_pack_no_leak(pack: PersonaPack, excluded_parent_ids: set[str]) -> None:
+    evidence_ids = {
+        evidence.doc_id
+        for section in ("response_strategy", "worldview", "reasoning", "voice")
+        for claim in pack.claims_for(section)
+        for evidence in (*claim.evidence, *claim.counterevidence)
+    }
+    leaked = evidence_ids & excluded_parent_ids
+    if leaked:
+        raise RuntimeError(
+            f"Evaluation leakage: Persona Pack cites excluded parent(s): {sorted(leaked)}"
+        )
 
 
 def serialize_retrieve_result(result: RetrieveResult) -> dict[str, Any]:
@@ -299,6 +337,9 @@ def config_to_dict(config: EvalRunConfig) -> dict[str, Any]:
     value = asdict(config)
     value["dataset_path"] = str(config.dataset_path)
     value["out_dir"] = str(config.out_dir)
+    value["persona_pack_path"] = (
+        str(config.persona_pack_path) if config.persona_pack_path is not None else None
+    )
     return value
 
 

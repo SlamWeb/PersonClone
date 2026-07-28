@@ -25,16 +25,18 @@ RAG top20 父文档全文
 
 ## 当前 prompt 策略
 
-第一版保留两套 writer prompt，方便自用和实验对比：
+当前保留三套 writer prompt，方便自用和实验对比：
 
 - `current`：当前调过的反 AI / 反 advice / 反契约训诫 prompt，默认使用，保证现有自用效果不被覆盖。
 - `strong_identity`：通用强身份沉浸 prompt，不写任何特定作者词汇，测试“RAG20 + 强模型是否能自行归纳作者表达身份”。
+- `persona_pack`：在 `strong_identity` 的同一基础提示词上增加证据化作者画像；RAG20、query understanding、query transform 和生成参数均保持不变，用于隔离检验 Persona Pack 的增益。
 
 CLI 切换方式：
 
 ```powershell
 pf ask <author> "<question>" --writer-prompt current
 pf ask <author> "<question>" --writer-prompt strong_identity
+pf ask <author> "<question>" --writer-prompt persona_pack
 pf prompt-pack <author> "<question>" --writer-prompt strong_identity --out .tmp/chatgpt_prompt.md
 ```
 
@@ -65,7 +67,72 @@ pf prompt-pack <author> "<question>" --writer-prompt strong_identity --out .tmp/
 - 从 RAG20 中内部判断该创作者通常抓什么矛盾、采取什么表达形态、句子和段落节奏如何。
 - 如果历史表达显示创作者常给建议，就给建议；常吐槽，就吐槽；常短评，就短评；常长文，就长文。
 - 保留创作者表达中的不平衡、偏执、跳跃、重复、粗糙、尖锐或突然判断，不自动修成更礼貌、更中立、更完整、更有条理的 AI 文。
+- 标点同样从历史表达中归纳。除非多篇历史表达明确显示引号是作者的高频特征，否则回答默认不用、最多使用一处；禁止用引号强调普通概念、制造标签、代替解释、改写题意或模拟人物内心话，必要的原话引用除外。
 - 只输出最终回答正文，不描述风格，不输出分析过程。
+
+## 证据化 Persona Pack
+
+每位作者可以在作者目录保存一份本地资产：
+
+```text
+data/authors/zhihu/<author>/persona_pack.json
+```
+
+Pack 分为四层：
+
+- `response_strategy`（可选但推荐）：作者把问题当作待完成任务还是表达入口，以及常见的开篇转向、回答动作和收尾动作。
+- `worldview`：跨问题较稳定的价值判断、因果归因和观察框架。
+- `reasoning`：常见切入、机制抽象、举例、推进和收尾动作。
+- `voice`：词汇语域、人格姿态、句法节奏和口语表达倾向。
+
+每条 claim 必须包含：
+
+- 稳定 `claim_id`、置信度和适用主题。
+- `activation_condition`：什么问题下才值得激活。
+- `avoid_overapplication`：如何避免把画像机械套到无关问题。
+- 至少一条 `doc_id + excerpt` 原文证据。
+
+`pack.py` 加载 Pack 时会把每条摘录与当前作者 `index/parents.jsonl` 做逐字核验。缺失文档、改写证据、重复 claim ID 或非法置信度均直接失败，不允许把模型臆测静默送入 writer。
+
+生成时的优先级是：
+
+```text
+当前问题与客观背景
+-> 当前 RAG20 作者原文
+-> Persona Pack 中有证据的稳定倾向
+-> 模型自身常识
+```
+
+Pack 是概率性身份先验，不是写作清单。每次只应激活与问题相关的少量倾向，不能拼贴证据句、堆口癖或把两性主题立场迁移到无关领域。
+
+`response_strategy` 会在其他画像前渲染，但只提供一条紧凑边界：是否直接回答、
+是否转向、是否给建议以及何时结束，都优先跟随当前 RAG 中最相似的作者原文。
+它不要求 Writer 枚举或分类回应动作，也不展示证据摘录，避免把自然写作变成元规划
+任务。作者原文若借题发挥可以照做，但 Pack 不能授权模型凭自身常识发明新转向。
+
+2026-07-28 的首次回应策略消融将四条长 claim 与显式动作分类加入 Pack，
+在冻结 `temporal_dev10_v0` 上六维 Gold Judge 均未提高，且 D6 从 4.3
+降至 3.8。该 Pack 仅保留为实验资产，没有晋升为作者默认 Pack。代码继续支持
+可选 `response_strategy`。
+
+同日的 V3 把它缩成以同类 RAG 回应形态为准的一条短约束，并通过 Writer replay
+冻结了原问题、客观背景和 20 篇 parent 顺序。V3 的六维均分仍从 V1 的 3.63
+降至 3.48，D6 从 4.3 降至 3.7，因此同样不晋升。当前不再继续增强全局回应策略
+prompt；如要研究该构念，应改做由题目级同类 RAG 证据触发的局部控制。
+
+Writer replay 必须复用基线每题原有的客观背景、20 篇 parent、parent 顺序和生成
+参数，不重新调用 query understanding、query transform、embedding 或 Qdrant。
+因此回应策略实验只改变 Persona Pack 和一次 Writer 采样；生成温度带来的随机性
+仍需在结论中单独声明。
+
+时间切分评测使用 `persona_pack` 时，Runner 会额外检查 Pack 的所有证据文档都不在 `excluded_parent_ids` 中。这样检索和画像两条路径都不能偷看 holdout。
+
+如果评测使用的 `--index-dir` 不在作者目录下，可以显式传入：
+
+```powershell
+pf eval run <author> --dataset <dataset.jsonl> --run-name <name> `
+  --writer-prompt persona_pack --persona-pack-path <persona_pack.json>
+```
 
 ## 上下文打包
 
@@ -96,10 +163,17 @@ pf prompt-pack <author> "<question>" --writer-prompt strong_identity --out .tmp/
 - `generate_answer(...)`：调用 LLM 生成回答。
 - `AnswerResult`：保存 answer、messages 和进入 writer 的 parent 标题，便于 CLI trace。
 
-## 后续不进入 v0 的能力
+### `pack.py`
+
+- `load_persona_pack(...)`：解析并验证 Persona Pack。
+- `load_persona_pack_for_index(...)`：从作者目录加载与当前索引配套的 Pack。
+- `verify_persona_pack_evidence(...)`：逐字核验 claim evidence。
+- `render_persona_pack_prompt(...)`：把经过验证的 Pack 渲染为非清单式 writer 上下文。
+
+## 后续不进入当前版本的能力
 
 - judge/rewrite 在线闭环。
 - 多轮 session memory。
 - 长度控制前端选项。
 - 多 provider 完整抽象。
-- profile v2 / claim evidence。
+- 自动 Persona Pack 构建器与人工审核工作台。

@@ -171,10 +171,12 @@ FastAPI 进程内缓存：
 ## CLI
 
 ```powershell
-pf web <author-token> --port 8000 --embedding-device cuda
+pf web <author-token> --host 127.0.0.1 --port 8000 --embedding-device cuda
 ```
 
 `author-token` 作为本地开发默认 persona。若不传，则 Web 扫描本地 persona 并选择第一个。
+本地默认只监听 `127.0.0.1`；容器或服务器部署必须显式传
+`--host 0.0.0.0`，不能为了部署而改变本地安全默认值。
 
 ## MVP 展示范围
 
@@ -184,8 +186,9 @@ pf web <author-token> --port 8000 --embedding-device cuda
 - 左侧按作者隔离的历史会话列表。
 - 右侧聊天软件式消息流，用户和 persona 都显示头像。
 - 流式回答。
-- sources 折叠区：默认展示可读标题/path；二级“技术详情”展示 parent rank、child route/rank/node_type。
-- query mode、writer prompt、parent topK 收进“高级设置”，默认不打扰普通使用。
+- 普通 sources 折叠区只展示可读标题，并链接到知乎原回答；不显示本地 Markdown 文件名、parent ID、分数或 child 路由。
+- query mode、parent topK 收进“高级设置”，默认不打扰普通使用。
+- Writer 变体属于实验时的高频选择，显示在输入框上方的三段式“回答模式”控件中：`定向提示 / 强身份 / Persona Pack`。浏览器记住最近选择；没有 Pack 的作者禁用 Persona Pack。
 
 ## 视觉方向
 
@@ -250,10 +253,10 @@ Trace 结构按阶段分组：
 - `input`：问题、persona、会话、query mode、writer variant、检索参数。
 - `query_understanding`：路由、搜索词、来源、客观背景、4 路 retrieval query。
 - `retrieval`：每一路 child hit 与最终 parent 聚合；只保存 parent 元数据和命中节点，不保存 parent 正文副本。
-- `writer`：模板 variant、参与上下文的 parent 标题/ID、消息角色及长度。
+- `writer`：模板 variant、参与上下文的 parent 标题/ID、消息角色及长度；选择 `persona_pack` 时额外记录 Pack ID、SHA-256 和 claim 数量。
 - `generation`：provider 名称、temperature、max tokens、耗时、输出字符数、状态和错误。
 
-前端第一版不做独立评测后台。每条作者回答下面放一个低干扰的“查看过程”入口，打开后按阶段展示 trace；技术细节默认折叠。完整 prompt 临时预览、judge/rewrite trace 与跨运行对比属于后续阶段。
+前端第一版不做独立评测后台。每条作者回答下面放一个低干扰的“查看过程”入口，打开后按阶段展示 trace；Parent 标题可在新标签页打开知乎原文，技术细节默认折叠。完整 prompt 临时预览、judge/rewrite trace 与跨运行对比属于后续阶段。
 
 ### 实时运行状态
 

@@ -51,6 +51,7 @@ The current MVP contains:
 - Query understanding + query transform + RAG20 generation.
 - FastAPI Web backend with SSE streaming.
 - React/Vite Web frontend.
+- Web 作者库与服务端异步 `crawl -> build -> index` 任务。
 
 ## Web MVP
 
@@ -103,10 +104,23 @@ Then open:
 http://127.0.0.1:8000/
 ```
 
+页面左侧可以切换已就绪作者；“管理作者库”进入 `/authors`。添加作者时输入
+知乎用户名或主页 URL，确认后可以关闭弹窗或继续打开其他对话。服务端会把
+任务写入 SQLite，再由单 Worker 在后台依次抓取 Markdown、构建节点和创建
+Qdrant 索引。
+
+已有服务端登录态会自动作为知乎浏览器 fallback：
+
+```text
+data/auth/zhihu_storage_state.json
+```
+
+登录态只由后台 Worker 读取，不会发送到网页。
+
 ## Docker Deployment
 
-当前 Docker 镜像面向“已有本地索引的 Web 运行时”，不会在容器里安装
-Playwright 或执行知乎抓取。构建和空数据 smoke：
+当前 Docker 镜像包含 Web、索引依赖和 Playwright Chromium，因此也能执行
+网页发起的服务端作者任务。构建和空数据 smoke：
 
 ```powershell
 Copy-Item .env.example .env
@@ -138,7 +152,8 @@ For a low-cost smoke run, add `--limit 1`. Each run writes a local manifest, mac
 
 ## Current Decisions
 
-- MVP is a local CLI + local Web app, not a hosted crawler service.
+- MVP 是 local-first CLI + Web；连接该 Web 的用户可以把作者任务提交给服务
+  宿主机执行。
 - Sample corpus will use self-made Zhihu-like Markdown under `samples/zhihu_mock_md/`.
 - `--quality fast` is the default build path and does not call an LLM for preprocessing.
 - `--quality full` may add document summaries, but does not create hypothetical questions.
@@ -146,7 +161,8 @@ For a low-cost smoke run, add `--limit 1`. Each run writes a local manifest, mac
 - LLM providers will be abstracted for DeepSeek, OpenAI, and OpenRouter.
 - Embedding stays local with BGE-M3 in the first version.
 - Web uses FastAPI + React/Vite. Streamlit/Gradio are not the main architecture.
-- Web v0 supports existing local indexes only; crawl/build/index stay in CLI.
+- Web 作者库复用 CLI 的 crawl/build/index 实现，通过 SQLite 队列异步编排，
+  不在 API 层重复实现抓取和入库逻辑。
 - `pf forge` is the one-command CLI orchestration for crawl -> build -> index -> Web.
 
 No real crawled corpus, auth state, local index, model files, eval output, or API keys should be committed.

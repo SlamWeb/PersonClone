@@ -5,16 +5,22 @@ from __future__ import annotations
 import os
 import traceback
 import mimetypes
+from contextlib import asynccontextmanager
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from personaforge.web.schemas import (
+    AuthorJobCreateRequest,
+    AuthorJobResponse,
+    AuthorJobsResponse,
+    AuthorPreview,
+    AuthorPreviewRequest,
     ChatSession,
     ChatStreamRequest,
     PersonaInfo,
@@ -22,17 +28,48 @@ from personaforge.web.schemas import (
     SuggestionsResponse,
     SessionsResponse,
 )
+from personaforge.web.author_jobs import (
+    AuthorJobConfig,
+    AuthorJobManager,
+    local_avatar_path,
+    resolve_author_preview,
+    safe_author_token,
+)
 from personaforge.web.service import ChatProgress, PreparedChat, PersonaChatService, WebConfig, sources_from_parent_hits
 from personaforge.web.streaming import sse_event
 
 
-def create_app(config: WebConfig | None = None, *, service: PersonaChatService | None = None) -> FastAPI:
+def create_app(
+    config: WebConfig | None = None,
+    *,
+    service: PersonaChatService | None = None,
+    job_manager: AuthorJobManager | None = None,
+) -> FastAPI:
     mimetypes.add_type("application/javascript", ".js")
     mimetypes.add_type("text/css", ".css")
     config = config or WebConfig()
     service = service or PersonaChatService(config)
-    app = FastAPI(title="PersonaForge", version="0.1.0")
+    job_manager = job_manager or AuthorJobManager(
+        AuthorJobConfig(
+            data_dir=config.data_dir,
+            model_name=config.model_name,
+            embedding_device=config.embedding_device,
+            use_fp16=config.use_fp16,
+            batch_size=config.index_batch_size,
+        )
+    )
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        job_manager.start()
+        try:
+            yield
+        finally:
+            job_manager.stop()
+
+    app = FastAPI(title="PersonaForge", version="0.1.0", lifespan=lifespan)
     app.state.service = service
+    app.state.author_jobs = job_manager
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
@@ -56,10 +93,73 @@ def create_app(config: WebConfig | None = None, *, service: PersonaChatService |
                 headline=item.headline,
                 content_count=item.content_count,
                 persona_pack_available=item.persona_pack_available,
+                profile_url=item.profile_url,
+                last_synced_at=item.last_synced_at,
             )
             for item in service.list_personas()
         ]
         return PersonasResponse(personas=items, default_author=service.default_author())
+
+    @app.post("/api/personas/preview", response_model=AuthorPreview)
+    def preview_persona(request: AuthorPreviewRequest) -> AuthorPreview:
+        try:
+            return AuthorPreview(**resolve_author_preview(config.data_dir, request.value))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.get("/api/personas/{author}/avatar")
+    def persona_avatar(author: str) -> FileResponse:
+        try:
+            safe_author = safe_author_token(author)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        path = local_avatar_path(config.data_dir, safe_author)
+        if path is None:
+            raise HTTPException(status_code=404, detail="Avatar not found")
+        return FileResponse(path)
+
+    @app.get("/api/author-jobs", response_model=AuthorJobsResponse)
+    def author_jobs() -> AuthorJobsResponse:
+        return AuthorJobsResponse(
+            jobs=[AuthorJobResponse(**job.to_dict()) for job in job_manager.store.list()]
+        )
+
+    @app.get("/api/author-jobs/{job_id}", response_model=AuthorJobResponse)
+    def author_job(job_id: str) -> AuthorJobResponse:
+        try:
+            return AuthorJobResponse(**job_manager.store.get(job_id).to_dict())
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Author job not found") from exc
+
+    @app.post("/api/author-jobs", response_model=AuthorJobResponse)
+    def create_author_job(request: AuthorJobCreateRequest) -> AuthorJobResponse:
+        try:
+            job = job_manager.create_job(
+                author_input=request.author,
+                kinds=request.kinds,
+                max_items=request.max_items,
+            )
+            return AuthorJobResponse(**job.to_dict())
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/author-jobs/{job_id}/cancel", response_model=AuthorJobResponse)
+    def cancel_author_job(job_id: str) -> AuthorJobResponse:
+        try:
+            return AuthorJobResponse(**job_manager.cancel(job_id).to_dict())
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Author job not found") from exc
+
+    @app.post("/api/author-jobs/{job_id}/retry", response_model=AuthorJobResponse)
+    def retry_author_job(job_id: str) -> AuthorJobResponse:
+        try:
+            return AuthorJobResponse(**job_manager.retry(job_id).to_dict())
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Author job not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/api/personas/{author}/sessions", response_model=SessionsResponse)
     def sessions(author: str) -> SessionsResponse:

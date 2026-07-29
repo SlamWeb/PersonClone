@@ -288,6 +288,9 @@ def test_create_app_registers_trace_endpoint(tmp_path) -> None:
     paths = {route.path for route in app.routes}
 
     assert "/api/personas/{author}/traces/{trace_id}" in paths
+    assert "/api/personas/preview" in paths
+    assert "/api/author-jobs" in paths
+    assert "/api/author-jobs/{job_id}/cancel" in paths
 
 
 def test_frontend_dist_dir_accepts_deployment_override(tmp_path, monkeypatch) -> None:

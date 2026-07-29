@@ -241,6 +241,25 @@ data/index/wu-ren-jun-28/
 
 当前只实现 `quality="fast"`。`quality="full"` 预留给后续 summary node，不在这一版假装支持。
 
+## Web 异步入库
+
+网页添加作者只负责编排，不改变本模块的父文档、子节点和 Qdrant collection
+合同。后台任务依次执行：
+
+```text
+staging/raw
+-> build_corpus(staging/raw, staging/index)
+-> index_corpus(staging/index, staging/index/qdrant)
+-> 验证 parents.jsonl、nodes.jsonl、qdrant_manifest.json 和 qdrant/
+-> 激活为作者正式 raw/ 与 index/
+```
+
+一个作者同一时间只能有一个构建任务。不同作者仍使用各自 collection。
+
+同步已有作者时，旧 `index/` 在新索引完成前继续提供检索。新索引失败时不得
+删除或覆盖旧索引；只有 staged index 验证成功后才执行目录切换。第一版对
+几百篇规模的作者语料采用“raw 增量合并、索引完整重建”，不做逐点向量更新。
+
 ### `embeddings.py`
 
 负责 embedding 适配：

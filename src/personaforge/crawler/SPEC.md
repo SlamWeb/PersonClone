@@ -158,6 +158,37 @@ data/raw/<author>_md/
 
 但 crawler 新输出不再使用这个结构。
 
+## Web 后台任务集成
+
+Web 添加作者不另写一套知乎抓取器。后台 Worker 仍调用本模块公开入口，并把
+输出定向到作者 staging 目录：
+
+```text
+data/authors/zhihu/<author>/staging/<job-id>/raw/
+```
+
+默认行为：
+
+- 接受知乎用户名或主页 URL。
+- 抓取全部可达的 answer、article 和 pin。
+- 先使用公开策略。
+- 如果公开策略没有获得内容，再读取服务端本地
+  `data/auth/zhihu_storage_state.json` 作为浏览器 fallback。
+- Cookie 只存在于服务宿主机，不能由前端上传、读取或下载。
+- 抓取任务失败时不能破坏作者当前正式 `raw/`。
+
+已有作者同步时，staging 中的新 manifest 按 `(kind, id)` 与旧 manifest
+合并，新记录覆盖旧记录，未重新抓到但仍存在的旧记录暂时保留。完整索引由
+ingest 在合并后的 raw corpus 上重新构建。
+
+作者头像属于 profile 资源。抓取成功后，编排层可以把远程头像缓存为：
+
+```text
+raw/assets/avatar.*
+```
+
+`profile.json` 继续保留原始 `avatar_url`，保证本地缓存失败时仍有回退。
+
 ## 验证入口
 
 ```powershell

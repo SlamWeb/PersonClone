@@ -7,6 +7,44 @@ export type PersonaInfo = {
   headline: string;
   content_count?: number | null;
   persona_pack_available: boolean;
+  profile_url?: string | null;
+  last_synced_at?: string | null;
+};
+
+export type AuthorPreview = {
+  author: string;
+  display_name: string;
+  avatar_url?: string | null;
+  headline: string;
+  profile_url: string;
+  exists: boolean;
+  ready: boolean;
+};
+
+export type AuthorJob = {
+  id: string;
+  source: string;
+  author_input: string;
+  author: string;
+  operation: 'create' | 'sync';
+  status: 'queued' | 'running' | 'ready' | 'failed' | 'cancelled' | 'interrupted';
+  stage: string;
+  label: string;
+  kinds: string[];
+  max_items?: number | null;
+  display_name: string;
+  avatar_url?: string | null;
+  headline: string;
+  profile_url: string;
+  item_count?: number | null;
+  parent_count?: number | null;
+  node_count?: number | null;
+  error_message?: string | null;
+  cancel_requested: boolean;
+  created_at: string;
+  updated_at: string;
+  started_at?: string | null;
+  completed_at?: string | null;
 };
 
 export type SourceHit = {
@@ -178,6 +216,59 @@ export async function fetchPersonas(): Promise<{ personas: PersonaInfo[]; defaul
   return response.json();
 }
 
+export async function previewAuthor(value: string): Promise<AuthorPreview> {
+  const response = await fetch('/api/personas/preview', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ value })
+  });
+  if (!response.ok) {
+    throw new Error(await apiError(response, '无法读取作者资料'));
+  }
+  return response.json();
+}
+
+export async function fetchAuthorJobs(): Promise<AuthorJob[]> {
+  const response = await fetch('/api/author-jobs');
+  if (!response.ok) {
+    throw new Error(await apiError(response, '无法读取作者任务'));
+  }
+  const payload = await response.json();
+  return payload.jobs || [];
+}
+
+export async function createAuthorJob(request: {
+  author: string;
+  kinds: Array<'answer' | 'article' | 'pin'>;
+  max_items?: number | null;
+}): Promise<AuthorJob> {
+  const response = await fetch('/api/author-jobs', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(request)
+  });
+  if (!response.ok) {
+    throw new Error(await apiError(response, '无法创建作者任务'));
+  }
+  return response.json();
+}
+
+export async function cancelAuthorJob(jobId: string): Promise<AuthorJob> {
+  const response = await fetch(`/api/author-jobs/${encodeURIComponent(jobId)}/cancel`, { method: 'POST' });
+  if (!response.ok) {
+    throw new Error(await apiError(response, '无法取消任务'));
+  }
+  return response.json();
+}
+
+export async function retryAuthorJob(jobId: string): Promise<AuthorJob> {
+  const response = await fetch(`/api/author-jobs/${encodeURIComponent(jobId)}/retry`, { method: 'POST' });
+  if (!response.ok) {
+    throw new Error(await apiError(response, '无法重试任务'));
+  }
+  return response.json();
+}
+
 export async function fetchSessions(author: string): Promise<ChatSessionSummary[]> {
   const response = await fetch(`/api/personas/${encodeURIComponent(author)}/sessions`);
   if (!response.ok) {
@@ -272,4 +363,13 @@ function dispatchSse(raw: string, callbacks: ChatCallbacks): void {
   if (event === 'token') callbacks.onToken?.(String(payload.text || ''));
   if (event === 'done') callbacks.onDone?.(payload);
   if (event === 'error') callbacks.onError?.(String(payload.error || 'Unknown error'));
+}
+
+async function apiError(response: Response, fallback: string): Promise<string> {
+  try {
+    const payload = await response.json();
+    return String(payload.detail || payload.error || `${fallback}（${response.status}）`);
+  } catch {
+    return `${fallback}（${response.status}）`;
+  }
 }

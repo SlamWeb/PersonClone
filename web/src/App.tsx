@@ -1,19 +1,28 @@
 import { FormEvent, useEffect, useMemo, useState } from 'react';
 import { Activity, Check, Clock3, Copy, ExternalLink, Plus, Settings2, SlidersHorizontal, Trash2, X } from 'lucide-react';
 import {
+  AuthorJob,
+  cancelAuthorJob,
   ChatSessionSummary,
   deleteSession,
+  fetchAuthorJobs,
   fetchPersonas,
   fetchSession,
   fetchSessions,
   fetchSuggestions,
   fetchTrace,
   PersonaInfo,
+  retryAuthorJob,
   Source,
   streamChat,
   TraceStage,
   TracePayload
 } from './api';
+import {
+  AddAuthorModal,
+  AuthorLibraryPage,
+  PersonaSwitcher
+} from './AuthorManager';
 
 type Message = {
   id: string;
@@ -57,6 +66,9 @@ export default function App() {
   );
   const [status, setStatus] = useState('Loading local personas...');
   const [busy, setBusy] = useState(false);
+  const [authorJobs, setAuthorJobs] = useState<AuthorJob[]>([]);
+  const [authorLibraryOpen, setAuthorLibraryOpen] = useState(() => window.location.pathname === '/authors');
+  const [addAuthorOpen, setAddAuthorOpen] = useState(false);
 
   const selectedPersona = useMemo(
     () => personas.find((item) => item.author === author) || null,
@@ -65,9 +77,10 @@ export default function App() {
   const canSend = useMemo(() => Boolean(author && input.trim() && !busy), [author, input, busy]);
 
   useEffect(() => {
-    fetchPersonas()
-      .then((payload) => {
+    Promise.all([fetchPersonas(), fetchAuthorJobs()])
+      .then(([payload, jobs]) => {
         setPersonas(payload.personas);
+        setAuthorJobs(jobs);
         const selected = payload.default_author || payload.personas[0]?.author || '';
         setAuthor(selected);
         setStatus(selected ? `Ready: ${selected}` : 'No local persona index found.');
@@ -75,6 +88,28 @@ export default function App() {
       .catch((error) => {
         setStatus(String(error.message || error));
       });
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setInterval(async () => {
+      try {
+        const [payload, jobs] = await Promise.all([fetchPersonas(), fetchAuthorJobs()]);
+        setPersonas(payload.personas);
+        setAuthorJobs(jobs);
+        setAuthor((current) => current || payload.default_author || payload.personas[0]?.author || '');
+      } catch {
+        // A transient polling failure should not interrupt an active chat.
+      }
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    function handlePopState() {
+      setAuthorLibraryOpen(window.location.pathname === '/authors');
+    }
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
   }, []);
 
   useEffect(() => {
@@ -158,6 +193,41 @@ export default function App() {
     setTrace(null);
     setTraceOpen(false);
     setLiveStatus(null);
+  }
+
+  function showAuthorLibrary() {
+    window.history.pushState({}, '', '/authors');
+    setAuthorLibraryOpen(true);
+  }
+
+  function showChat() {
+    window.history.pushState({}, '', '/');
+    setAuthorLibraryOpen(false);
+  }
+
+  function selectAuthor(nextAuthor: string) {
+    setAuthor(nextAuthor);
+    showChat();
+  }
+
+  function upsertAuthorJob(job: AuthorJob) {
+    setAuthorJobs((items) => [job, ...items.filter((item) => item.id !== job.id)]);
+  }
+
+  async function cancelJob(jobId: string) {
+    try {
+      upsertAuthorJob(await cancelAuthorJob(jobId));
+    } catch (error) {
+      setStatus(String((error as Error).message || error));
+    }
+  }
+
+  async function retryJob(jobId: string) {
+    try {
+      upsertAuthorJob(await retryAuthorJob(jobId));
+    } catch (error) {
+      setStatus(String((error as Error).message || error));
+    }
   }
 
   async function openTrace(traceId: string) {
@@ -267,10 +337,43 @@ export default function App() {
     }
   }
 
+  if (authorLibraryOpen) {
+    return (
+      <>
+        <AuthorLibraryPage
+          personas={personas}
+          jobs={authorJobs}
+          onBack={showChat}
+          onAdd={() => setAddAuthorOpen(true)}
+          onSelect={selectAuthor}
+          onCancel={cancelJob}
+          onRetry={retryJob}
+        />
+        <AddAuthorModal
+          open={addAuthorOpen}
+          jobs={authorJobs}
+          onClose={() => setAddAuthorOpen(false)}
+          onJobCreated={upsertAuthorJob}
+          onReady={(nextAuthor) => {
+            setAddAuthorOpen(false);
+            selectAuthor(nextAuthor);
+          }}
+        />
+      </>
+    );
+  }
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
-        <PersonaPicker personas={personas} author={author} onAuthorChange={setAuthor} selectedPersona={selectedPersona} />
+        <PersonaSwitcher
+          personas={personas}
+          jobs={authorJobs}
+          selectedPersona={selectedPersona}
+          onSelect={setAuthor}
+          onAdd={() => setAddAuthorOpen(true)}
+          onManage={showAuthorLibrary}
+        />
 
         <button className="new-chat-button" type="button" onClick={newChat}>
           <Plus size={16} />
@@ -402,6 +505,16 @@ export default function App() {
         error={traceError}
         onClose={() => setTraceOpen(false)}
       />
+      <AddAuthorModal
+        open={addAuthorOpen}
+        jobs={authorJobs}
+        onClose={() => setAddAuthorOpen(false)}
+        onJobCreated={upsertAuthorJob}
+        onReady={(nextAuthor) => {
+          setAddAuthorOpen(false);
+          setAuthor(nextAuthor);
+        }}
+      />
     </div>
   );
 }
@@ -465,33 +578,6 @@ function WriterModeSelector({
         ))}
       </div>
     </div>
-  );
-}
-
-function PersonaPicker({
-  personas,
-  author,
-  selectedPersona,
-  onAuthorChange
-}: {
-  personas: PersonaInfo[];
-  author: string;
-  selectedPersona: PersonaInfo | null;
-  onAuthorChange: (author: string) => void;
-}) {
-  return (
-    <section className="persona-card">
-      <Avatar label={selectedPersona?.display_name || author || 'PF'} src={selectedPersona?.avatar_url || undefined} />
-      <div className="persona-main">
-        <select value={author} onChange={(event) => onAuthorChange(event.target.value)}>
-          {personas.map((item) => (
-            <option key={item.author} value={item.author}>
-              {item.display_name || item.author}
-            </option>
-          ))}
-        </select>
-      </div>
-    </section>
   );
 }
 

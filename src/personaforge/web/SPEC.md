@@ -18,13 +18,13 @@ Web MVP 面向面试展示，目标是把现有 CLI RAG 链路变成一个可交
 
 本阶段只做 Web，不改：
 
-- crawler 抓取逻辑。
-- build/index 入库逻辑。
+- crawler 的平台抓取实现。
+- build/index 的文档与索引语义。
 - query understanding / query transform 策略。
 - dense+sparse retrieval 和 parent RRF 聚合。
 - writer prompt 和生成策略。
 
-Web 只复用这些能力，不重新设计。
+Web 只编排已有 crawler、build 和 index 能力，不在 Web 模块里重写这些逻辑。
 
 ## 技术选择
 
@@ -182,7 +182,12 @@ pf web <author-token> --host 127.0.0.1 --port 8000 --embedding-device cuda
 
 第一版页面展示：
 
-- 左侧 persona 选择，显示头像、知乎昵称、用户名、内容数量。
+- 左侧自定义作者切换器，只显示当前作者头像与昵称，不使用浏览器原生
+  `select`。
+- 作者切换器弹层列出全部本地作者和正在构建的作者；作者数量较少时不提供
+  搜索框。
+- 独立作者库页面管理已就绪作者和后台构建任务。
+- 添加作者三步向导：输入知乎用户名或主页 URL、确认作者、查看后台进度。
 - 左侧按作者隔离的历史会话列表。
 - 右侧聊天软件式消息流，用户和 persona 都显示头像。
 - 流式回答。
@@ -223,6 +228,120 @@ data/authors/zhihu/<author>/raw/profile.json
 ```
 
 如果没有 profile，前端用 author token 和 initials 兜底。头像不应成为使用 Web 的硬依赖。
+
+抓取成功后，服务端应尝试把头像缓存到作者 raw 目录，并优先通过本地 API
+提供头像；远程 `avatar_url` 继续保留为失败回退：
+
+```text
+data/authors/zhihu/<author>/raw/assets/avatar.*
+```
+
+## 作者库与添加作者
+
+作者库是独立页面 `/authors`，不是聊天页里的大型下拉框。桌面端使用紧凑列表，
+移动端改为紧凑信息块。每位作者展示：
+
+- 头像、昵称和知乎用户名。
+- 已抓取内容数量。
+- 最后完成时间。
+- 当前状态。
+- 进入聊天和管理操作。
+
+添加作者入口同时存在于作者切换器底部和作者库右上角。输入支持用户名与
+`https://www.zhihu.com/people/<token>` 主页 URL，并复用 crawler 的
+`parse_user_token()` 归一化。
+
+添加向导：
+
+```text
+输入用户名或主页 URL
+-> 服务端读取公开作者资料，展示头像、昵称、用户名、简介和主页链接
+-> 用户确认默认抓取全部 answer/article/pin
+-> 创建后台任务
+-> 弹窗可关闭，任务继续
+-> Markdown、build、index 全部成功后作者变为可聊天
+```
+
+已有作者再次添加时视为同步请求。旧索引继续服务，新材料和索引在 staging
+目录构建成功后才替换正式目录。当前聊天不能被新作者任务强制切换。
+
+## 作者后台任务
+
+添加和同步作者是服务端持久化异步任务，不能在一个 HTTP 请求内串行完成。
+
+第一版采用：
+
+```text
+FastAPI
+-> SQLite 任务表
+-> 单 Worker 队列
+-> 复用现有 pf crawl / pf build / pf index
+```
+
+SQLite 路径：
+
+```text
+data/system/personaforge.sqlite3
+```
+
+同一时间只执行一个作者构建任务，避免多个 BGE-M3 索引任务争抢显存。聊天
+服务保持可用；后台任务可能降低运行期间的吞吐，但不能阻塞页面导航和已有
+会话。
+
+任务阶段只报告真实状态和已完成数量，不伪造百分比：
+
+```text
+queued
+resolving_profile
+crawling
+building
+indexing
+activating
+ready
+failed
+cancelled
+interrupted
+```
+
+网页刷新、关闭添加弹窗或切换作者不会终止任务。服务进程异常退出时，运行中
+任务在下次启动后标记为 `interrupted`，由用户点击重试；第一版不伪装成逐篇
+断点续传。
+
+任务工作目录：
+
+```text
+data/authors/zhihu/<author>/staging/<job-id>/
+```
+
+新 raw 和 index 均先写入 staging。成功后再替换正式目录；失败时保留旧
+ready 版本。成功任务清理 staging，失败任务保留有限排错信息。
+
+抓取默认先走公开策略，公开入口受限时由 Worker 读取服务端本地登录态：
+
+```text
+data/auth/zhihu_storage_state.json
+```
+
+登录态不得通过 API 返回，不得进入 trace、任务日志、前端状态或 Git。登录态
+失效时任务显示“等待管理员重新登录”或明确失败信息，由服务宿主机管理员重新
+执行 `pf zhihu-login`。
+
+作者材料与索引为共享资源；多用户会话隔离属于后续账号模块，不在本轮实现。
+Persona Pack 和建议问题也不阻塞作者首次就绪。
+
+### 作者任务 API
+
+```text
+POST /api/personas/preview
+POST /api/author-jobs
+GET  /api/author-jobs
+GET  /api/author-jobs/{job_id}
+POST /api/author-jobs/{job_id}/cancel
+POST /api/author-jobs/{job_id}/retry
+```
+
+作者任务 API 只接收平台、用户名/主页 URL、抓取类型和可选数量限制，不接受
+Cookie 内容或任意本地输出路径。
 
 ## 会话存储
 

@@ -12,12 +12,14 @@ FROM python:3.11-slim@sha256:db3ff2e1800a8581e2c48a27c3995339d47bdf046da21c7627a
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     HF_HOME=/app/models/huggingface \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     PERSONAFORGE_WEB_DIST=/app/web/dist
 
 WORKDIR /app
 
-# The hosted Web runtime does not need Playwright or crawler dependencies.
-# Install CPU PyTorch explicitly to avoid pulling a much larger CUDA runtime.
+# The Web runtime also executes server-side author jobs. Install CPU PyTorch
+# explicitly to avoid pulling a much larger CUDA runtime, then add Playwright
+# Chromium for the authenticated crawler fallback.
 #
 # A temporary package skeleton lets Docker cache third-party dependencies by
 # pyproject.toml. Editing application source no longer reinstalls PyTorch.
@@ -28,7 +30,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && printf '# PersonaForge\n' > README.md \
     && python -m pip install --upgrade pip \
     && python -m pip install --index-url https://download.pytorch.org/whl/cpu torch \
-    && python -m pip install ".[index,web]" \
+    && python -m pip install ".[crawler,index,web]" \
+    && python -m playwright install --with-deps chromium \
     && rm -rf src README.md build
 
 COPY README.md ./

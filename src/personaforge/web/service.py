@@ -50,6 +50,7 @@ class WebConfig:
     temperature: float = 0.85
     max_tokens: int = 1600
     trace_retention: int = DEFAULT_TRACE_RETENTION
+    index_batch_size: int = 12
 
 
 @dataclass(slots=True)
@@ -61,6 +62,8 @@ class LocalPersona:
     headline: str
     content_count: int | None
     persona_pack_available: bool
+    profile_url: str | None
+    last_synced_at: str | None
     author_dir: Path
     index_dir: Path
     qdrant_path: Path
@@ -729,13 +732,15 @@ def list_local_personas(data_dir: Path = Path("data")) -> list[LocalPersona]:
                     author=author_dir.name,
                     source="zhihu",
                     display_name=str(profile.get("display_name") or profile.get("nickname") or author_dir.name),
-                    avatar_url=profile.get("avatar_url"),
+                    avatar_url=local_persona_avatar_url(author_dir) or profile.get("avatar_url"),
                     headline=str(profile.get("headline") or ""),
                     content_count=count_parents(index_dir),
                     persona_pack_available=(
                         (author_dir / "persona_pack.json").exists()
                         or (index_dir / "persona_pack.json").exists()
                     ),
+                    profile_url=profile.get("profile_url"),
+                    last_synced_at=indexed_at(index_dir),
                     author_dir=author_dir,
                     index_dir=index_dir,
                     qdrant_path=qdrant_path,
@@ -905,6 +910,25 @@ def count_parents(index_dir: Path) -> int | None:
         return None
     with path.open("r", encoding="utf-8") as handle:
         return sum(1 for _ in handle)
+
+
+def local_persona_avatar_url(author_dir: Path) -> str | None:
+    assets_dir = author_dir / "raw" / "assets"
+    if not assets_dir.exists():
+        return None
+    if any(path.is_file() for path in assets_dir.glob("avatar.*")):
+        return f"/api/personas/{author_dir.name}/avatar"
+    return None
+
+
+def indexed_at(index_dir: Path) -> str | None:
+    for name, field in (("qdrant_manifest.json", "indexed_at"), ("build_manifest.json", "built_at")):
+        path = index_dir / name
+        if path.exists():
+            value = read_json(path).get(field)
+            if value:
+                return str(value)
+    return None
 
 
 def session_dir(data_dir: Path, author: str) -> Path:

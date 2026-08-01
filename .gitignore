@@ -10,9 +10,11 @@ data/index/
 data/auth/
 data/models/
 data/eval/
+data/system/
 .tmp/
 .tmp-data/
 .tmp-crawl/
+.tmp-*/
 
 # Runtime artifacts
 *.sqlite

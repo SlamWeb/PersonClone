@@ -1,23 +1,38 @@
-import { FormEvent, useEffect, useMemo, useState } from 'react';
-import { Activity, Check, Clock3, Copy, ExternalLink, Plus, Settings2, SlidersHorizontal, Trash2, X } from 'lucide-react';
+import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
+import { Activity, Brain, Check, Clock3, Copy, ExternalLink, LogOut, Pencil, Pin, Plus, Save, Settings2, SlidersHorizontal, Trash2, X } from 'lucide-react';
 import {
+  AuthState,
   AuthorJob,
   cancelAuthorJob,
+  ChatMessage as ApiChatMessage,
   ChatSessionSummary,
   deleteSession,
   fetchAuthorJobs,
+  fetchAuthState,
+  fetchMemories,
+  fetchMemorySettings,
   fetchPersonas,
   fetchSession,
   fetchSessions,
   fetchSuggestions,
+  fetchTurn,
   fetchTrace,
+  logoutAuth,
+  forgetMemory,
+  clearMemories,
   PersonaInfo,
   retryAuthorJob,
+  retryTurn,
   Source,
   streamChat,
   TraceStage,
-  TracePayload
+  TracePayload,
+  UserMemory,
+  UserMemorySettings,
+  updateMemory,
+  updateMemorySettings
 } from './api';
+import { AuthScreen } from './AuthScreen';
 import {
   AddAuthorModal,
   AuthorLibraryPage,
@@ -28,8 +43,10 @@ type Message = {
   id: string;
   role: 'user' | 'assistant' | 'error';
   text: string;
+  status?: 'queued' | 'running' | 'completed' | 'failed' | 'interrupted';
   sources?: Source[] | null;
   traceId?: string | null;
+  turnId?: string | null;
 };
 
 type WriterPrompt = 'current' | 'strong_identity' | 'persona_pack';
@@ -45,6 +62,7 @@ function initialWriterPrompt(): WriterPrompt {
 }
 
 export default function App() {
+  const [authState, setAuthState] = useState<AuthState | null>(null);
   const [personas, setPersonas] = useState<PersonaInfo[]>([]);
   const [author, setAuthor] = useState('');
   const [sessions, setSessions] = useState<ChatSessionSummary[]>([]);
@@ -65,18 +83,65 @@ export default function App() {
     localStorage.getItem('pf-trace-capture') === 'full' ? 'full' : 'summary'
   );
   const [status, setStatus] = useState('Loading local personas...');
-  const [busy, setBusy] = useState(false);
+  const [runningConversations, setRunningConversations] = useState<Record<string, string>>({});
+  const [pendingNewConversation, setPendingNewConversation] = useState(false);
   const [authorJobs, setAuthorJobs] = useState<AuthorJob[]>([]);
   const [authorLibraryOpen, setAuthorLibraryOpen] = useState(() => window.location.pathname === '/authors');
   const [addAuthorOpen, setAddAuthorOpen] = useState(false);
+  const [memoryOpen, setMemoryOpen] = useState(false);
+  const currentSessionRef = useRef<string | null>(null);
+  const currentAuthorRef = useRef('');
+  const pollingTurnsRef = useRef<Set<string>>(new Set());
+  const messagesRef = useRef<HTMLElement | null>(null);
+  const keepMessagesPinnedRef = useRef(true);
 
   const selectedPersona = useMemo(
     () => personas.find((item) => item.author === author) || null,
     [personas, author]
   );
+  const currentRunLabel = currentSessionId
+    ? runningConversations[currentSessionId] || null
+    : pendingNewConversation
+      ? '正在创建回答任务'
+      : null;
+  const busy = Boolean(currentRunLabel);
   const canSend = useMemo(() => Boolean(author && input.trim() && !busy), [author, input, busy]);
 
   useEffect(() => {
+    fetchAuthState()
+      .then(setAuthState)
+      .catch(() => setAuthState({ configured: true, authenticated: false, user: null }));
+    function handleExpiredSession() {
+      setAuthState((current) => ({
+        configured: current?.configured ?? true,
+        authenticated: false,
+        user: null
+      }));
+    }
+    window.addEventListener('pf-auth-expired', handleExpiredSession);
+    return () => window.removeEventListener('pf-auth-expired', handleExpiredSession);
+  }, []);
+
+  useEffect(() => {
+    currentSessionRef.current = currentSessionId;
+  }, [currentSessionId]);
+
+  useEffect(() => {
+    currentAuthorRef.current = author;
+  }, [author]);
+
+  useEffect(() => {
+    if (!keepMessagesPinnedRef.current) return;
+    const node = messagesRef.current;
+    if (!node) return;
+    const frame = window.requestAnimationFrame(() => {
+      node.scrollTo({ top: node.scrollHeight, behavior: 'auto' });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [messages, liveStatus, currentSessionId]);
+
+  useEffect(() => {
+    if (!authState?.authenticated) return;
     Promise.all([fetchPersonas(), fetchAuthorJobs()])
       .then(([payload, jobs]) => {
         setPersonas(payload.personas);
@@ -88,9 +153,10 @@ export default function App() {
       .catch((error) => {
         setStatus(String(error.message || error));
       });
-  }, []);
+  }, [authState?.authenticated]);
 
   useEffect(() => {
+    if (!authState?.authenticated) return;
     const timer = window.setInterval(async () => {
       try {
         const [payload, jobs] = await Promise.all([fetchPersonas(), fetchAuthorJobs()]);
@@ -102,7 +168,7 @@ export default function App() {
       }
     }, 3000);
     return () => window.clearInterval(timer);
-  }, []);
+  }, [authState?.authenticated]);
 
   useEffect(() => {
     function handlePopState() {
@@ -158,19 +224,28 @@ export default function App() {
   }
 
   async function openSession(sessionId: string) {
-    if (!author || busy) return;
+    if (!author) return;
     try {
+      keepMessagesPinnedRef.current = true;
       const session = await fetchSession(author, sessionId);
+      currentSessionRef.current = session.id;
       setCurrentSessionId(session.id);
-      setMessages(
-        session.messages.map((message) => ({
-          id: makeId(),
-          role: message.role,
-          text: message.text,
-          sources: message.sources,
-          traceId: message.trace_id
-        }))
+      setMessages(session.messages.map(chatMessageToMessage));
+      const pending = session.messages.find(
+        (message) =>
+          message.role === 'assistant' &&
+          (message.status === 'queued' || message.status === 'running') &&
+          message.turn_id
       );
+      if (pending?.turn_id) {
+        setRunningConversations((items) => ({
+          ...items,
+          [session.id]: '正在恢复生成进度'
+        }));
+        void watchTurn(author, session.id, pending.turn_id);
+      } else {
+        setLiveStatus(null);
+      }
       setStatus(`Ready: ${author}`);
     } catch (error) {
       setStatus(String((error as Error).message || error));
@@ -178,7 +253,11 @@ export default function App() {
   }
 
   async function removeSession(sessionId: string) {
-    if (!author || busy) return;
+    if (!author) return;
+    if (runningConversations[sessionId]) {
+      setStatus('这段对话仍在生成，请完成后再删除。');
+      return;
+    }
     await deleteSession(author, sessionId);
     if (currentSessionId === sessionId) {
       newChat();
@@ -187,12 +266,74 @@ export default function App() {
   }
 
   function newChat() {
+    keepMessagesPinnedRef.current = true;
+    currentSessionRef.current = null;
     setCurrentSessionId(null);
     setMessages([]);
     setInput('');
     setTrace(null);
     setTraceOpen(false);
     setLiveStatus(null);
+  }
+
+  async function watchTurn(targetAuthor: string, sessionId: string, turnId: string) {
+    if (pollingTurnsRef.current.has(turnId)) return;
+    pollingTurnsRef.current.add(turnId);
+    let terminal = false;
+    let failures = 0;
+    try {
+      while (!terminal && failures < 3) {
+        try {
+          const turn = await fetchTurn(turnId);
+          failures = 0;
+          terminal = turn.status === 'completed' || turn.status === 'failed' || turn.status === 'interrupted';
+          if (terminal) {
+            setRunningConversations((items) => omitKey(items, sessionId));
+          } else {
+            setRunningConversations((items) => ({ ...items, [sessionId]: turn.label }));
+          }
+
+          if (currentAuthorRef.current === targetAuthor && currentSessionRef.current === sessionId) {
+            const session = await fetchSession(targetAuthor, sessionId);
+            setMessages(session.messages.map(chatMessageToMessage));
+            setLiveStatus(terminal ? null : turn.label);
+          }
+          if (!terminal) {
+            await sleep(700);
+          }
+        } catch {
+          failures += 1;
+          if (failures < 3) await sleep(1000);
+        }
+      }
+    } finally {
+      pollingTurnsRef.current.delete(turnId);
+      if (terminal) {
+        await refreshSessions(targetAuthor);
+      }
+    }
+  }
+
+  async function retryFailedTurn(turnId: string) {
+    if (!author || !currentSessionId) return;
+    try {
+      const turn = await retryTurn(turnId);
+      setRunningConversations((items) => ({
+        ...items,
+        [turn.conversation_id]: turn.label
+      }));
+      setMessages((items) =>
+        items.map((message) =>
+          message.turnId === turnId
+            ? { ...message, text: '', status: 'queued', traceId: null, sources: null }
+            : message
+        )
+      );
+      setLiveStatus(turn.label);
+      void watchTurn(author, turn.conversation_id, turn.id);
+    } catch (error) {
+      setStatus(String((error as Error).message || error));
+    }
   }
 
   function showAuthorLibrary() {
@@ -248,14 +389,25 @@ export default function App() {
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const text = input.trim();
-    if (!text || !author) return;
+    if (!text || !author || busy) return;
 
     const userId = makeId();
     const assistantId = makeId();
-    let answerStarted = false;
-    setMessages((items) => [...items, { id: userId, role: 'user', text }]);
+    const requestAuthor = author;
+    const submissionSessionId = currentSessionId;
+    let requestSessionId = currentSessionId;
+    let requestTurnId = '';
+    const isVisible = () =>
+      currentAuthorRef.current === requestAuthor &&
+      currentSessionRef.current === requestSessionId;
+
+    keepMessagesPinnedRef.current = true;
+    setMessages((items) => [
+      ...items,
+      { id: userId, role: 'user', text, status: 'completed' }
+    ]);
     setInput('');
-    setBusy(true);
+    if (!submissionSessionId) setPendingNewConversation(true);
     setLiveStatus(queryMode === 'grounded' ? '正在理解问题' : '正在检索历史表达');
     setStatus('Retrieving and generating...');
 
@@ -271,54 +423,87 @@ export default function App() {
           trace_capture: developerMode ? traceCapture : 'summary'
         },
         {
+          onAccepted: (payload) => {
+            requestSessionId = payload.session_id;
+            requestTurnId = payload.turn_id;
+            setPendingNewConversation(false);
+            setRunningConversations((items) => ({
+              ...items,
+              [payload.session_id]: payload.label || '正在等待生成'
+            }));
+            if (
+              currentAuthorRef.current === requestAuthor &&
+              currentSessionRef.current === submissionSessionId
+            ) {
+              currentSessionRef.current = payload.session_id;
+              setCurrentSessionId(payload.session_id);
+              setLiveStatus(payload.label || '正在等待生成');
+              setMessages((items) =>
+                items.some((message) => message.turnId === payload.turn_id)
+                  ? items
+                  : [
+                      ...items,
+                      {
+                        id: assistantId,
+                        role: 'assistant',
+                        text: '',
+                        status: 'queued',
+                        turnId: payload.turn_id
+                      }
+                    ]
+              );
+            }
+          },
           onMeta: (payload) => {
             const sessionId = String(payload.session_id || '');
-            if (sessionId) setCurrentSessionId(sessionId);
+            const traceId = String(payload.trace_id || '');
+            if (sessionId) requestSessionId = sessionId;
+            if (isVisible() && traceId) {
+              setMessages((items) =>
+                items.map((message) =>
+                  message.turnId === requestTurnId
+                    ? { ...message, traceId }
+                    : message
+                )
+              );
+            }
           },
           onStatus: (payload) => {
-            if (payload.label) setLiveStatus(payload.label);
+            if (payload.label && requestSessionId) {
+              setRunningConversations((items) => ({
+                ...items,
+                [requestSessionId || '']: payload.label
+              }));
+            }
+            if (payload.label && isVisible()) setLiveStatus(payload.label);
           },
           onToken: (token) => {
-            if (!answerStarted) {
-              answerStarted = true;
+            if (isVisible()) {
               setLiveStatus(null);
-              setMessages((items) => [...items, { id: assistantId, role: 'assistant', text: token }]);
-              return;
+              setMessages((items) =>
+                appendAssistantToken(items, requestTurnId, assistantId, token)
+              );
             }
-            setMessages((items) =>
-              items.map((message) =>
-                message.id === assistantId ? { ...message, text: message.text + token } : message
-              )
-            );
           },
           onDone: async (payload) => {
-            setCurrentSessionId(payload.session_id);
-            setLiveStatus(null);
-            setMessages((items) =>
-              items.some((message) => message.id === assistantId)
-                ? items.map((message) =>
-                    message.id === assistantId
-                      ? {
-                          ...message,
-                          text: payload.answer || message.text,
-                          sources: payload.sources,
-                          traceId: payload.trace_id
-                        }
-                      : message
-                  )
-                : [
-                    ...items,
-                    {
-                      id: assistantId,
-                      role: 'assistant',
-                      text: payload.answer,
-                      sources: payload.sources,
-                      traceId: payload.trace_id
-                    }
-                  ]
-            );
-            setStatus(`Ready: ${author}`);
-            await refreshSessions(author);
+            requestSessionId = payload.session_id;
+            requestTurnId = payload.turn_id || requestTurnId;
+            setRunningConversations((items) => omitKey(items, payload.session_id));
+            if (isVisible()) {
+              setLiveStatus(null);
+              setMessages((items) =>
+                finishAssistantMessage(
+                  items,
+                  requestTurnId,
+                  assistantId,
+                  payload.answer,
+                  payload.sources,
+                  payload.trace_id
+                )
+              );
+              setStatus(`Ready: ${requestAuthor}`);
+            }
+            await refreshSessions(requestAuthor);
           },
           onError: (message) => {
             throw new Error(message);
@@ -326,15 +511,55 @@ export default function App() {
         }
       );
     } catch (error) {
+      setPendingNewConversation(false);
+      if (requestSessionId) {
+        setRunningConversations((items) => omitKey(items, requestSessionId || ''));
+      }
+      if (requestSessionId && isVisible()) {
+        try {
+          const session = await fetchSession(requestAuthor, requestSessionId);
+          setMessages(session.messages.map(chatMessageToMessage));
+        } catch {
+          setMessages((items) => [
+            ...items.filter((message) => message.id !== assistantId),
+            { id: makeId(), role: 'error', text: String((error as Error).message || error) }
+          ]);
+        }
+      } else if (currentAuthorRef.current === requestAuthor && currentSessionRef.current === submissionSessionId) {
+        setMessages((items) => [
+          ...items.filter((message) => message.id !== assistantId),
+          { id: makeId(), role: 'error', text: String((error as Error).message || error) }
+        ]);
+      }
       setLiveStatus(null);
-      setMessages((items) => [
-        ...items.filter((message) => message.id !== assistantId),
-        { id: makeId(), role: 'error', text: String((error as Error).message || error) }
-      ]);
       setStatus('Error');
-    } finally {
-      setBusy(false);
     }
+  }
+
+  async function signOut() {
+    try {
+      await logoutAuth();
+    } finally {
+      setAuthState({ configured: true, authenticated: false, user: null });
+      setPersonas([]);
+      setAuthor('');
+      setSessions([]);
+      setMessages([]);
+      setCurrentSessionId(null);
+      setRunningConversations({});
+    }
+  }
+
+  if (authState === null) {
+    return (
+      <main className="auth-page">
+        <div className="auth-loading">正在检查登录状态</div>
+      </main>
+    );
+  }
+
+  if (!authState.authenticated) {
+    return <AuthScreen configured={authState.configured} onAuthenticated={setAuthState} />;
   }
 
   if (authorLibraryOpen) {
@@ -390,7 +615,11 @@ export default function App() {
                 <div className={`session-item ${session.id === currentSessionId ? 'active' : ''}`} key={session.id}>
                   <button className="session-open" type="button" onClick={() => openSession(session.id)}>
                     <span>{session.title}</span>
-                    <small>{session.message_count} 条消息</small>
+                    <small>
+                      {runningConversations[session.id]
+                        ? '正在生成'
+                        : `${session.message_count} 条消息`}
+                    </small>
                   </button>
                   <button
                     className="delete-session"
@@ -453,13 +682,31 @@ export default function App() {
         </button>
 
         <div className="sidebar-footer">
-          <span>PersonaForge</span>
-          <span>{status === 'Error' ? '出现错误' : busy ? '生成中' : '本地运行中'}</span>
+          <button
+            className="memory-entry"
+            type="button"
+            title="管理我的记忆"
+            onClick={() => setMemoryOpen(true)}
+          >
+            <Brain size={14} />
+            <span className="signed-in-user">{authState.user?.display_name || authState.user?.username}</span>
+          </button>
+          <button className="logout-button" type="button" title="退出登录" onClick={signOut}>
+            <LogOut size={14} />
+          </button>
         </div>
       </aside>
 
       <main className="chat-panel">
-        <section className="messages">
+        <section
+          className="messages"
+          ref={messagesRef}
+          onScroll={(event) => {
+            const node = event.currentTarget;
+            keepMessagesPinnedRef.current =
+              node.scrollHeight - node.scrollTop - node.clientHeight < 120;
+          }}
+        >
           {messages.length === 0 ? (
             <OpeningMessage persona={selectedPersona} />
           ) : (
@@ -469,11 +716,14 @@ export default function App() {
                 message={message}
                 persona={selectedPersona}
                 onOpenTrace={openTrace}
+                onRetryTurn={retryFailedTurn}
                 showTrace={developerMode}
               />
             ))
           )}
-          {liveStatus ? <LiveStatus persona={selectedPersona} label={liveStatus} /> : null}
+          {liveStatus || currentRunLabel ? (
+            <LiveStatus persona={selectedPersona} label={liveStatus || currentRunLabel || '正在生成'} />
+          ) : null}
         </section>
 
         <div className="composer-area">
@@ -515,8 +765,150 @@ export default function App() {
           setAuthor(nextAuthor);
         }}
       />
+      <MemoryDrawer open={memoryOpen} onClose={() => setMemoryOpen(false)} />
     </div>
   );
+}
+
+function MemoryDrawer({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const [memories, setMemories] = useState<UserMemory[]>([]);
+  const [settings, setSettings] = useState<UserMemorySettings>({ enabled: true, auto_write: true });
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [draft, setDraft] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  async function refresh() {
+    setLoading(true);
+    setError('');
+    try {
+      const [items, nextSettings] = await Promise.all([fetchMemories(), fetchMemorySettings()]);
+      setMemories(items);
+      setSettings(nextSettings);
+    } catch (reason) {
+      setError(String((reason as Error).message || reason));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (open) void refresh();
+  }, [open]);
+
+  if (!open) return null;
+
+  async function patchSettings(patch: Partial<UserMemorySettings>) {
+    try {
+      setSettings(await updateMemorySettings(patch));
+    } catch (reason) {
+      setError(String((reason as Error).message || reason));
+    }
+  }
+
+  async function togglePinned(memory: UserMemory) {
+    try {
+      const updated = await updateMemory(memory.id, { pinned: !memory.pinned });
+      setMemories((items) => items.map((item) => item.id === memory.id ? updated : item));
+    } catch (reason) {
+      setError(String((reason as Error).message || reason));
+    }
+  }
+
+  async function saveCorrection(memory: UserMemory) {
+    if (!draft.trim()) return;
+    try {
+      const updated = await updateMemory(memory.id, { content: draft.trim() });
+      setMemories((items) => items.map((item) => item.id === memory.id ? updated : item));
+      setEditingId(null);
+    } catch (reason) {
+      setError(String((reason as Error).message || reason));
+    }
+  }
+
+  async function forget(memoryId: string) {
+    try {
+      await forgetMemory(memoryId);
+      setMemories((items) => items.filter((item) => item.id !== memoryId));
+    } catch (reason) {
+      setError(String((reason as Error).message || reason));
+    }
+  }
+
+  async function clearAll() {
+    if (!window.confirm('清空后，已有对话仍保留，但这些长期记忆不会再被召回。确定继续吗？')) return;
+    try {
+      await clearMemories();
+      setMemories([]);
+    } catch (reason) {
+      setError(String((reason as Error).message || reason));
+    }
+  }
+
+  return (
+    <div className="trace-overlay" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <aside className="memory-drawer" aria-label="我的记忆">
+        <header className="memory-header">
+          <div>
+            <span className="memory-eyebrow">跨会话上下文</span>
+            <h2>我的记忆</h2>
+            <p>只保存你的信息，不会把作者回答写成你的事实。</p>
+          </div>
+          <button className="icon-button" type="button" onClick={onClose} title="关闭"><X size={18} /></button>
+        </header>
+
+        <section className="memory-settings">
+          <label>
+            <span><strong>使用记忆</strong><small>在相关的新对话中召回</small></span>
+            <input type="checkbox" checked={settings.enabled} onChange={(event) => patchSettings({ enabled: event.target.checked })} />
+          </label>
+          <label>
+            <span><strong>自动形成记忆</strong><small>回答完成后异步审查写入</small></span>
+            <input type="checkbox" checked={settings.auto_write} disabled={!settings.enabled} onChange={(event) => patchSettings({ auto_write: event.target.checked })} />
+          </label>
+        </section>
+
+        <div className="memory-toolbar">
+          <span>{memories.length} 条有效记忆</span>
+          {memories.length ? <button type="button" onClick={clearAll}>全部清空</button> : null}
+        </div>
+        {error ? <div className="memory-error">{error}</div> : null}
+        <section className="memory-list">
+          {loading ? <div className="memory-empty">正在读取记忆</div> : null}
+          {!loading && memories.length === 0 ? (
+            <div className="memory-empty"><Brain size={22} /><strong>还没有长期记忆</strong><span>有价值的用户信息会在回答完成后异步形成。</span></div>
+          ) : null}
+          {memories.map((memory) => (
+            <article className="memory-item" key={memory.id}>
+              <div className="memory-meta">
+                <span>{memoryKindLabel(memory.kind)}</span>
+                {memory.sensitivity === 'restricted' ? <span>敏感概括</span> : null}
+                {memory.pinned ? <span>已置顶</span> : null}
+              </div>
+              {editingId === memory.id ? (
+                <textarea value={draft} onChange={(event) => setDraft(event.target.value)} autoFocus />
+              ) : <p>{memory.content}</p>}
+              <div className="memory-actions">
+                <button type="button" title={memory.pinned ? '取消置顶' : '置顶'} onClick={() => togglePinned(memory)}><Pin size={14} />{memory.pinned ? '取消置顶' : '置顶'}</button>
+                {editingId === memory.id ? (
+                  <button type="button" onClick={() => saveCorrection(memory)}><Save size={14} />保存修正</button>
+                ) : (
+                  <button type="button" onClick={() => { setEditingId(memory.id); setDraft(memory.content); }}><Pencil size={14} />纠正</button>
+                )}
+                <button type="button" onClick={() => forget(memory.id)}><Trash2 size={14} />遗忘</button>
+              </div>
+            </article>
+          ))}
+        </section>
+      </aside>
+    </div>
+  );
+}
+
+function memoryKindLabel(kind: UserMemory['kind']): string {
+  if (kind === 'semantic') return '个人信息';
+  if (kind === 'procedural') return '协作偏好';
+  return '持续事件';
 }
 
 function WriterModeSelector({
@@ -627,24 +1019,44 @@ function ChatBubble({
   message,
   persona,
   onOpenTrace,
+  onRetryTurn,
   showTrace
 }: {
   message: Message;
   persona: PersonaInfo | null;
   onOpenTrace: (traceId: string) => void;
+  onRetryTurn: (turnId: string) => void;
   showTrace: boolean;
 }) {
   const isUser = message.role === 'user';
   const isError = message.role === 'error';
+  const isPending = message.status === 'queued' || message.status === 'running';
+  const canRetry =
+    !isUser &&
+    Boolean(message.turnId) &&
+    (message.status === 'failed' || message.status === 'interrupted');
+  if (!isUser && isPending && !message.text) return null;
+  const displayText =
+    message.text ||
+    (message.status === 'interrupted' ? '这次回答因服务重启而中断。' : '这次回答生成失败。');
   return (
-    <article className={`chat-row ${isUser ? 'from-user' : 'from-persona'} ${isError ? 'error' : ''}`}>
+    <article className={`chat-row ${isUser ? 'from-user' : 'from-persona'} ${isError || canRetry ? 'error' : ''}`}>
       {!isUser ? <Avatar label={persona?.display_name || 'PF'} src={persona?.avatar_url || undefined} /> : null}
       <div className="bubble-stack">
         <div className="chat-bubble">
-          <CopyButton text={message.text} />
-          <div className="message-text">{message.text}</div>
+          <CopyButton text={displayText} />
+          <div className="message-text">{displayText}</div>
           {message.sources ? <Sources sources={message.sources} /> : null}
         </div>
+        {canRetry ? (
+          <button
+            className="retry-turn-button"
+            type="button"
+            onClick={() => onRetryTurn(message.turnId || '')}
+          >
+            重新生成
+          </button>
+        ) : null}
         {!isUser && !isError && message.traceId && showTrace ? (
           <button className="trace-button" type="button" onClick={() => onOpenTrace(message.traceId || '')}>
             <Activity size={14} />
@@ -726,6 +1138,10 @@ function TraceDrawer({
   const retrieval = trace?.retrieval;
   const writer = trace?.writer;
   const generation = trace?.generation;
+  const turnPlanner = trace?.turn_planner;
+  const conversationContext = trace?.conversation_context;
+  const memoryUpdate = trace?.memory_update;
+  const memoryRecall = trace?.user_memory_recall;
 
   return (
     <div className="trace-overlay" role="presentation" onMouseDown={onClose}>
@@ -777,6 +1193,72 @@ function TraceDrawer({
                   <div className="trace-state">这是旧版 trace，尚未记录细分节点。</div>
                 )}
               </section>
+
+              <details className="trace-section" open>
+                <summary>对话决策与记忆</summary>
+                <div className="trace-section-body">
+                  <TraceFact
+                    label="本轮类型"
+                    value={formatTurnType(turnPlanner?.turn_type)}
+                  />
+                  <TraceFact
+                    label="检索策略"
+                    value={formatRetrievalPolicy(turnPlanner?.retrieval_policy)}
+                  />
+                  <TraceFact
+                    label="回答深度"
+                    value={formatResponseDepth(turnPlanner?.response_depth)}
+                  />
+                  {turnPlanner?.resolved_question ? (
+                    <div className="trace-background">
+                      <span>独立语义问题</span>
+                      <p>{turnPlanner.resolved_question}</p>
+                    </div>
+                  ) : null}
+                  <TraceFact
+                    label="历史上下文"
+                    value={
+                      conversationContext?.used_full_short_history
+                        ? '短对话全量保留'
+                        : `最近 ${conversationContext?.recent_turn_ids?.length || 0} 轮 + 相关 ${conversationContext?.relevant_turn_ids?.length || 0} 轮`
+                    }
+                  />
+                  <TraceFact
+                    label="会话摘要"
+                    value={
+                      conversationContext?.summary_version
+                        ? `v${conversationContext.summary_version}`
+                        : '尚未生成'
+                    }
+                  />
+                  <TraceFact
+                    label="长期记忆召回"
+                    value={
+                      memoryRecall?.selected_ids?.length
+                        ? `从 ${memoryRecall.candidate_ids?.length || 0} 条候选中使用 ${memoryRecall.selected_ids.length} 条`
+                        : `候选 ${memoryRecall?.candidate_ids?.length || 0} 条，本轮未使用`
+                    }
+                  />
+                  {turnPlanner?.evidence_source_turn_id ? (
+                    <TraceFact
+                      label="复用证据轮次"
+                      value={turnPlanner.evidence_source_turn_id}
+                    />
+                  ) : null}
+                  {memoryUpdate ? (
+                    <TraceFact
+                      label="记忆更新"
+                      value={
+                        memoryUpdate.status === 'failed'
+                          ? '失败'
+                          : memoryUpdate.status === 'skipped'
+                            ? '本轮无需更新'
+                            : `长期记忆 ${memoryUpdate.user_memory?.operations?.length || 0} 项变更 · 会话摘要${memoryUpdate.conversation_summary?.status === 'completed' ? ` v${memoryUpdate.conversation_summary.summary_version}` : '未变更'}`
+                      }
+                    />
+                  ) : null}
+                </div>
+              </details>
 
               <details className="trace-section" open>
                 <summary>题目理解与检索改写</summary>
@@ -943,6 +1425,106 @@ function formatDuration(value?: number): string {
   if (value === undefined || value === null) return '-';
   if (value < 1000) return `${value} ms`;
   return `${(value / 1000).toFixed(1)} s`;
+}
+
+function formatTurnType(value?: string): string {
+  return {
+    new_topic: '新话题',
+    follow_up: '继续追问',
+    explain_previous: '解释上一回答',
+    casual: '轻量对话',
+    unclear: '需要澄清'
+  }[value || ''] || '旧版 Trace 未记录';
+}
+
+function formatRetrievalPolicy(value?: string): string {
+  return {
+    new: '重新检索',
+    reuse: '复用既有证据',
+    none: '无需检索'
+  }[value || ''] || '未记录';
+}
+
+function formatResponseDepth(value?: string): string {
+  return {
+    brief: '简短',
+    normal: '正常',
+    deep: '深入'
+  }[value || ''] || '未记录';
+}
+
+function chatMessageToMessage(message: ApiChatMessage): Message {
+  return {
+    id: message.id || makeId(),
+    role: message.role,
+    text: message.text,
+    status: message.status || 'completed',
+    sources: message.sources,
+    traceId: message.trace_id,
+    turnId: message.turn_id
+  };
+}
+
+function appendAssistantToken(
+  messages: Message[],
+  turnId: string,
+  fallbackId: string,
+  token: string
+): Message[] {
+  const index = messages.findIndex(
+    (message) => (turnId && message.turnId === turnId) || message.id === fallbackId
+  );
+  if (index < 0) {
+    return [
+      ...messages,
+      {
+        id: fallbackId,
+        role: 'assistant',
+        text: token,
+        status: 'running',
+        turnId: turnId || null
+      }
+    ];
+  }
+  return messages.map((message, itemIndex) =>
+    itemIndex === index
+      ? { ...message, text: message.text + token, status: 'running', turnId: turnId || message.turnId }
+      : message
+  );
+}
+
+function finishAssistantMessage(
+  messages: Message[],
+  turnId: string,
+  fallbackId: string,
+  answer: string,
+  sources: Source[],
+  traceId?: string
+): Message[] {
+  const index = messages.findIndex(
+    (message) => (turnId && message.turnId === turnId) || message.id === fallbackId
+  );
+  const completed: Message = {
+    id: index >= 0 ? messages[index].id : fallbackId,
+    role: 'assistant',
+    text: answer,
+    status: 'completed',
+    sources,
+    traceId,
+    turnId: turnId || null
+  };
+  if (index < 0) return [...messages, completed];
+  return messages.map((message, itemIndex) => itemIndex === index ? completed : message);
+}
+
+function omitKey(values: Record<string, string>, key: string): Record<string, string> {
+  const next = { ...values };
+  delete next[key];
+  return next;
+}
+
+function sleep(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 }
 
 function makeId(): string {

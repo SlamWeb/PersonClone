@@ -10,7 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 
-TRACE_SCHEMA_VERSION = "personaforge.web.trace.v1"
+TRACE_SCHEMA_VERSION = "personaforge.web.trace.v2"
 DEFAULT_TRACE_RETENTION = 200
 
 

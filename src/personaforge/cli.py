@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 from pathlib import Path
 from typing import Iterable
 
@@ -34,6 +35,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     init_parser = subparsers.add_parser("init", help="Create local data directories.")
     init_parser.add_argument("--data-dir", default="data", help="Local data root.")
+
+    user_parser = subparsers.add_parser("user", help="Manage local PersonaForge users.")
+    user_subparsers = user_parser.add_subparsers(dest="user_command", required=True)
+    user_create_parser = user_subparsers.add_parser("create", help="Create an invited local user.")
+    user_create_parser.add_argument("username", help="Login username.")
+    user_create_parser.add_argument("--display-name", help="Name shown in the Web UI.")
+    user_create_parser.add_argument("--admin", action="store_true", help="Create an administrator.")
+    user_create_parser.add_argument("--data-dir", default="data", help="Local data root.")
+    user_list_parser = user_subparsers.add_parser("list", help="List local users.")
+    user_list_parser.add_argument("--data-dir", default="data", help="Local data root.")
 
     crawl_parser = subparsers.add_parser("crawl", help="Crawl a creator into local Markdown.")
     crawl_parser.add_argument("platform", choices=["zhihu"], help="Content platform.")
@@ -341,6 +352,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"- {path}")
         return 0
 
+    if args.command == "user":
+        return _run_user(args)
+
     if args.command == "crawl":
         return _run_crawl(args)
 
@@ -375,6 +389,40 @@ def main(argv: list[str] | None = None) -> int:
         return _run_forge(args)
 
     parser.print_help()
+    return 0
+
+
+def _run_user(args: argparse.Namespace) -> int:
+    try:
+        from personaforge.web.auth import AuthStore
+    except ImportError as exc:
+        raise RuntimeError('User management requires Web dependencies: pip install -e ".[web]"') from exc
+
+    store = AuthStore(Path(args.data_dir))
+    if args.user_command == "list":
+        users = store.list_users()
+        if not users:
+            print("No local users. Start the Web UI to create the first administrator.")
+            return 0
+        for user in users:
+            print(f"{user.username}\t{user.role}\t{user.display_name}")
+        return 0
+
+    password = getpass.getpass("Password: ")
+    confirmation = getpass.getpass("Confirm password: ")
+    if password != confirmation:
+        raise ValueError("Passwords do not match.")
+    first_user = not store.has_users()
+    user = store.create_user(
+        username=args.username,
+        password=password,
+        display_name=args.display_name,
+        role="admin" if args.admin or first_user else "member",
+        claim_local_data=first_user,
+    )
+    print(f"Created {user.role}: {user.username}")
+    if first_user:
+        print("Existing local-user conversations were assigned to this account.")
     return 0
 
 

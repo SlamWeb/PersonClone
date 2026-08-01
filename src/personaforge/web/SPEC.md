@@ -52,6 +52,15 @@ React + Vite + TypeScript + 原生 CSS
 - 比 Next.js 轻。
 - 暂不上 shadcn/Tailwind/Ant Design，避免第一版被 UI 配置拖住。
 
+聊天页使用受视口约束的三段布局：
+
+- 桌面端作者与历史会话侧栏固定占满视口高度，只有历史会话列表内部滚动。
+- 右侧消息区独立滚动，输入区固定在聊天面板底部，不随消息历史离开视口。
+- 打开会话或发送消息时自动贴近最新消息；用户主动上翻后，流式更新不得强制拉回
+  底部。
+- 窄屏将作者与历史区放在顶部受限区域，消息区和输入区继续占用剩余视口，页面
+  本身不得产生需要寻找输入框的纵向滚动。
+
 ## 目录规划
 
 Python 后端：
@@ -81,7 +90,17 @@ web/
 
 ### `GET /health`
 
-返回服务状态。
+返回服务状态，并暴露本地 embedding 模型的预热状态：
+
+- `idle`：尚未开始加载；
+- `loading`：正在后台加载；
+- `ready`：可以直接执行检索；
+- `failed`：预热失败，保留错误摘要供本地排查。
+
+当启动时已经存在至少一个可用作者索引，Web 服务会在后台预热共享的 BGE-M3
+encoder。FastAPI 不等待模型加载即可先提供页面和 API，但首个聊天请求不再承担正常
+情况下约几十秒的模型冷启动成本。预热只改变加载时机，不改变 query transform、召回
+路线、排序或生成 prompt。
 
 ### `GET /api/personas`
 
@@ -326,8 +345,9 @@ data/auth/zhihu_storage_state.json
 失效时任务显示“等待管理员重新登录”或明确失败信息，由服务宿主机管理员重新
 执行 `pf zhihu-login`。
 
-作者材料与索引为共享资源；多用户会话隔离属于后续账号模块，不在本轮实现。
-Persona Pack 和建议问题也不阻塞作者首次就绪。
+作者材料、索引、Persona Pack 和建议问题是所有已登录用户共享的服务端资源；
+会话、消息、生成任务和 Trace 必须按登录用户隔离。作者首次就绪不依赖 Persona
+Pack 和建议问题。
 
 ### 作者任务 API
 
@@ -345,15 +365,332 @@ Cookie 内容或任意本地输出路径。
 
 ## 会话存储
 
-第一版不用数据库，采用 local-first JSON 文件：
+当前会话、消息和生成任务统一保存在本地 SQLite：
 
 ```text
-data/authors/zhihu/<author>/sessions/<session_id>.json
+data/system/personaforge.sqlite3
 ```
 
-会话只负责产品层历史记录，不改变当前 writer 的上下文策略。也就是说，继续同一个会话时，当前生成链路仍以“当前问题 + RAG 材料”为主；长期记忆和多轮上下文注入留到后续 developer mode / memory 模块。
+旧版 `data/authors/zhihu/<author>/sessions/*.json` 在启动时幂等导入 SQLite，
+原文件保留为只读备份。assistant 消息保存 `trace_id` 和 `turn_id`，因此历史回答
+既能打开对应运行过程，也能恢复或重试未完成任务。
 
-assistant 消息额外保存 `trace_id`。这样历史会话里的任意一轮生成也可以打开对应运行过程。
+## 多轮会话 v1
+
+本节既是已经冻结的多轮会话契约，也是当前实现说明。主要实现位于
+`conversations.py`、`multiturn.py`、`chat_tasks.py`、`service.py` 和 `app.py`；
+前端恢复与 Trace 展示位于 `web/src/App.tsx`。
+
+### 总体边界
+
+- 一个会话永久绑定一个作者，切换作者时切换到该作者自己的会话。
+- 用户消息、生成消息和作者原始材料是三种不同数据，生成消息绝不能写回作者索引。
+- 对话历史用于理解当前指代和保持交流连续性，不能证明作者观点或外部事实。
+- 现有四路 Query Transform、BGE-M3 dense/sparse、两级 RRF、Parent top20 和
+  Writer prompt variant 保持不变；多轮层只决定检索输入、是否执行或复用检索，
+  以及哪些历史消息进入 Writer。
+- 前端保持一种聊天形态，不增加“问答模式/对话模式”开关。回答深度由当前话语
+  自动判断，用户明确要求“一句话”或“详细展开”时优先服从用户。
+
+### 完整运行链路
+
+```text
+保存当前 user message 和 turn_run
+-> 读取会话摘要与最近 3 个完整 Turn
+-> Conversation-aware Turn Planner
+-> 用 resolved_question 召回最多 2 个更早的相关 Turn
+-> 根据 retrieval_policy 选择 new / reuse / none
+-> new：进入现有 Tavily + 四路 Query Transform + RAG20
+-> reuse：按 evidence_source_turn_id 重新装载该轮 Parent 全文
+-> none：跳过联网、Query Transform 和作者材料检索
+-> Writer Context Builder
+-> 流式生成并保存 assistant message
+-> 异步更新会话摘要和 Turn 向量
+```
+
+不同会话可以并行运行，同一个会话内严格串行。生成任务先持久化再执行，用户切换
+会话或刷新页面后任务仍继续；进程重启时，未完成任务标为 `interrupted`，允许
+在不重复插入 user message 的前提下重新生成。
+
+### SQLite 数据模型
+
+会话从作者目录下的 JSON 文件迁入现有数据库：
+
+```text
+data/system/personaforge.sqlite3
+```
+
+第一版继续复用项目已有的 `sqlite3 + Repository` 模式，不引入 ORM。核心实体：
+
+- `conversations`：`id`、`owner_id`、`author`、标题、摘要、摘要覆盖位置和时间。
+- `messages`：`id`、`conversation_id`、顺序、角色、正文、状态、`trace_id` 和时间。
+- `turn_runs`：当前 user message、选中的 assistant attempt、Planner 结果、
+  Parent IDs、运行状态和时间。
+- `generation_attempts`：同一 user message 的多次生成结果及对应 `trace_id`。
+- `turn_embeddings`：完整 Turn 的 BGE-M3 向量、模型名和模型版本。
+
+`owner_id` 来自服务端 Session 对应的 `users.id`，不能接受前端自行传入的用户 ID。
+旧 Session JSON 通过幂等迁移先导入 `local-user`；首次创建管理员时，系统在同一
+SQLite 中把这些历史会话一次性认领给首位管理员。相同 `session_id` 不重复导入，
+迁移验证完成前保留只读备份。
+
+## 登录与用户隔离 v1
+
+账号模块采用邀请制，不开放公共注册：
+
+```text
+数据库没有用户 -> Web 首屏创建第一位管理员并认领 local-user 历史
+数据库已有用户 -> Web 首屏只允许登录
+新增协作者 -> pf user create <username>
+```
+
+密码只保存 Argon2 哈希。登录成功后由 FastAPI 生成高熵随机 Session Token，浏览器
+通过 `HttpOnly + SameSite=Lax` Cookie 自动携带；SQLite 只保存 Token 的 SHA-256
+摘要和过期时间。Session 默认 30 天、可由服务端撤销；HTTPS 下 Cookie 自动启用
+`Secure`。同源 React + FastAPI 不采用 JWT，避免引入无法即时撤销的客户端身份状态。
+
+SQLite 新增：
+
+```text
+users          用户名、显示名、角色、密码哈希
+auth_sessions  用户、Token 摘要、创建/过期/最近访问时间
+```
+
+访问边界：
+
+- `/health`、React 静态资源和登录状态接口公开。
+- 作者库、添加作者、建议问题和作者任务仅对已登录用户开放，但内容在用户间共享。
+- `conversations.owner_id` 隔离会话及其级联消息、Turn、摘要和向量。
+- 读取、重试或订阅生成任务时，必须通过 `turn_runs -> conversations.owner_id` 校验。
+- Trace 文件仍按作者落盘，但 API 只有在当前用户消息确实引用该 `trace_id` 时才返回。
+- 越权资源统一返回 404，避免泄露其他用户的会话或任务是否存在。
+
+Tailscale 只控制哪些设备可以访问服务，不能替代应用身份。多人共用同一个服务时，
+仍必须登录，不能继续把所有访问者映射为 `local-user`。
+
+删除会话时级联删除消息、Turn、摘要、向量和普通 Web trace。已经显式复制到
+`data/eval/` 的冻结实验记录不受影响。
+
+## 用户长期记忆 v1
+
+用户长期记忆与会话摘要、作者 Persona Pack 是三种不同状态：
+
+- 会话摘要只压缩当前会话，用于短期指代和连续性。
+- 用户长期记忆跨会话、跨作者共享，但按登录用户 `owner_id` 严格隔离。
+- Persona Pack 描述创作者稳定表达，只属于作者，不能写入用户记忆。
+
+第一版不引入 LangGraph、Redis 或新的向量数据库。记忆正文、版本、来源和设置保存在
+现有 `data/system/personaforge.sqlite3`，少量活跃记忆使用现有 BGE-M3 在进程内执行
+dense+sparse 双路召回和 RRF 融合。表结构包括：
+
+- `user_memories`：semantic / episodic / procedural 三类记忆、敏感级别、重要度、
+  置信度、来源 message IDs、版本关系和软删除状态。
+- `user_memory_embeddings`：BGE-M3 dense 与 sparse 表征缓存。
+- `user_memory_settings`：每个用户的总开关和自动写入开关。
+
+读取链路仅在 `grounded` 模式启用：
+
+```text
+当前 query
+-> BGE-M3 从 active memories 召回最多 8 条候选
+-> 现有 Turn Planner 在同一次 LLM 调用中选择最多 4 条 memory_ids
+-> 只把选中内容作为“用户上下文”交给 Writer
+```
+
+`raw` 模式保持无长期记忆基线。用户记忆不能作为作者观点或外部事实；当前消息与记忆
+冲突时当前消息优先。Query Transform 使用 Planner 完成必要指代消解后的问题，不把
+全部用户记忆直接拼进作者 RAG query。
+
+写入在回答保存完成后异步执行，不影响首 token 延迟：
+
+```text
+最近用户原话（不含 assistant）
+-> 候选提取 LLM
+-> 保守审查 LLM
+-> 确定性证据、主语、疑问、敏感信息和 schema 校验
+-> append / supersede / reject
+```
+
+关键安全边界：
+
+- assistant 和创作者生成内容永远不是用户记忆来源。
+- 疑问、假设和担忧不得提升为用户信念；担忧本身可以作为 episodic 事件保存。
+- 必须区分用户与哥哥、朋友等第三方，不得把第三方经历归到用户本人。
+- API key、密码、Cookie、token 永不进入候选；第三方财务事件只存必要概括，不保存
+  金额、比例、余额和杠杆倍数。
+- 自动修订以新版本 supersede 旧版本，保留审计链；人工纠正直接替换语义，避免旧错误
+  被拼回新版本。
+- 删除单个会话不会自动删除已经独立形成的长期记忆；用户可在“我的记忆”中纠正、
+  置顶、遗忘或全部清空。遗忘是软删除，后续召回只读取 active 状态。
+
+记忆 API：
+
+```text
+GET    /api/memories
+PATCH  /api/memories/{memory_id}
+DELETE /api/memories/{memory_id}
+DELETE /api/memories
+GET    /api/memory-settings
+PATCH  /api/memory-settings
+```
+
+Trace 新增 `user_memory_recall` 和异步 `memory_update.user_memory`。普通摘要 Trace 只保存
+候选/采用 memory ID、操作类型、拒绝原因和耗时，不重复保存敏感正文；完整 Trace 也不得
+保存凭据或原始精确敏感数值。
+
+### 会话上下文选择
+
+短会话不做无意义压缩：前 6 个已完成问答 Turn 全量进入上下文。超过该范围后，
+Writer 上下文由三部分组成：
+
+```text
+结构化会话摘要
++ 最近 3 个完整 Turn
++ 最多 2 个语义相关的更早 Turn
+```
+
+Planner 先读取“摘要 + 最近 3 Turn + 当前消息”并生成 `resolved_question`，再用
+`resolved_question` 对更早 Turn 做语义召回。语义单位是完整的
+`user message + assistant message`，命中后把整轮原始角色消息交给 Writer。
+BGE-M3 向量缓存在 SQLite，不为会话记忆新增 Qdrant collection。
+
+满足以下任一条件后异步生成摘要：
+
+```text
+已完成超过 6 个问答 Turn
+或尚未摘要的历史超过约 8000 tokens
+```
+
+以后每新增 3 个完整 Turn 再更新一次。摘要使用 DeepSeek V4 Flash、
+`temperature=0` 和结构化 JSON，至少包含：
+
+```json
+{
+  "topics": [],
+  "entities": [],
+  "user_requests": [],
+  "assistant_previous_claims": [],
+  "unresolved_references": []
+}
+```
+
+`assistant_previous_claims` 必须表达为“此前 assistant 曾表示”，不得把生成观点
+提升为作者真实立场。摘要是可丢弃的派生缓存；生成失败时退回原始历史。
+
+### Conversation-aware Turn Planner
+
+Turn Planner 扩展并取代当前单轮 Search Planner，因此普通 grounded 新问题仍是
+“Planner + Background/Transform + Writer”三次 LLM 调用，不增加额外串行调用。
+Planner 只能看对话上下文和当前输入，不能看 Persona Pack、作者材料或预测作者
+立场。固定输出：
+
+```json
+{
+  "turn_type": "new_topic|follow_up|explain_previous|casual|unclear",
+  "resolved_question": "...",
+  "retrieval_policy": "new|reuse|none",
+  "evidence_source_turn_id": null,
+  "needs_web": false,
+  "search_queries": [],
+  "response_depth": "brief|normal|deep",
+  "clarification_focus": ""
+}
+```
+
+路由约束：
+
+- `needs_web=true` 必须同时为 `retrieval_policy=new`。
+- `reuse` 和 `none` 不执行 Tavily 与 Query Transform。
+- `reuse` 必须给出当前会话中存在的 `evidence_source_turn_id`；不能验证时降级为
+  `new`。
+- `unclear` 仅在不同理解会改变检索和回答时触发，此时不执行检索，由 Writer
+  根据 `clarification_focus` 用作者语气提出一句简短澄清。
+- `follow_up` 表示同一主题中的新内容问题，包括新的判断、建议、原因和解决办法，
+  必须使用 `new`；话题连续不等于材料仍然适用。
+- `reuse` 仅用于解释、展开或论证已有 assistant 回答中的明确内容。
+- 压缩、改写、翻译、字数或格式纠错只需要已有对话，使用 `none`；闲聊也使用
+  `none`。
+
+### 多轮 Query Transform
+
+`retrieval_policy=new` 时，现有 Background + Query Transform 节点只增加两个
+输入：当前用户原话和 Planner 生成的 `resolved_question`。它还可以看到 Tavily
+结果，但不再读取完整历史。四路含义保持不变：
+
+- `literal_question`：最小补全后的独立问题，不再机械使用“那男的呢”等残缺原话。
+- `event_background`：保留联网确认的实体、事件和客观事实。
+- `mechanism_scene`：转成具体关系机制、行为动机和冲突场景。
+- `colloquial_surface`：转成口语词、网络表达和短词组合。
+
+Writer 不得看到 `resolved_question`、搜索 query 或四路 retrieval query，避免
+技术改写隐含地替作者决定回答角度。
+
+### Writer 消息契约
+
+Writer 使用真实 Chat roles，而不是把历史拼成一段“对话材料”：
+
+```text
+system：身份 Prompt + Persona Pack + 信息优先级
+system：会话摘要 + 客观背景 + 本轮作者 Parent 全文
+user/assistant：选中的历史消息，保持原始顺序
+user：当前用户原话，永远是最后一条
+```
+
+如果 provider 不接受多个 `system` message，adapter 可以在发送前按同样顺序合并，
+但上层数据结构继续保持“稳定身份指令”和“动态参考上下文”分离。
+
+信息冲突优先级：
+
+```text
+当前用户明确要求
+> 当前题目的客观背景
+> 当前 RAG20 作者原文
+> Persona Pack
+> 历史 assistant 回答
+> 模型自身常识
+```
+
+历史 assistant 回答与新 RAG 冲突时，以新 RAG 为准。用户没有追问矛盾时直接给出
+当前回答；用户明确询问“你之前不是说……”时才承认并解释变化。
+
+`response_depth` 控制 prompt 与 `max_tokens`，但具体长度参考当前 RAG 排名前几篇
+相似作者原文的长度分布，而不是给所有作者设置同一字符数。`brief` 明显短于相似
+原文中位数，`normal` 接近中位数，`deep` 接近上四分位，同时设置防失控上限。
+
+`none` 路由仍使用 Persona Pack 与最近对话保持作者感。没有 Persona Pack 时可以
+装载最近一次成功 Turn 的 Parent 作为表达身份参考，但不能把它当作当前事实证据。
+
+### Trace v2 扩展
+
+多轮能力扩展现有 Trace v1，不另建平行 trace。保留现有字段并升级
+`schema_version`，前端必须兼容旧记录缺少新增字段的情况：
+
+```text
+input
+conversation_context
+turn_planner
+history_recall
+query_understanding
+retrieval
+writer
+generation
+memory_update
+```
+
+新增节点记录摘要版本、最近消息 IDs、语义召回 Turn IDs 与分数、Planner JSON、
+复用证据来源、回答深度和最终进入 Writer 的历史消息。它们只进入开发者模式，
+不向普通用户展示。摘要更新在回答后异步执行，可以稍后补写 `memory_update`，
+但不能改写已经冻结的生成输入和输出。
+
+### 功能验收
+
+已冻结并实现 12 条脚本化多轮用例，覆盖指代补全、继续展开、解释上一段、实质性
+新问题、主动换话题、旧话题找回、需要联网的追问、模糊澄清、闲聊、长短控制、
+刷新恢复和失败重试，测试入口为 `tests/test_multiturn_acceptance.py`。
+
+第一轮验收不依赖 LLM Judge，优先验证可客观判断的行为：路由、保义改写、历史
+选择、联网决策、证据复用、话题隔离、数据库恢复和任务幂等。作者相似性继续使用
+现有生成评估体系单独衡量，不能用它掩盖多轮链路错误。
 
 ## Trace v0
 

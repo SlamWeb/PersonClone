@@ -38,6 +38,10 @@ def generate_answer(
     objective_background: str = "",
     writer_prompt: str = "current",
     persona_pack: PersonaPack | None = None,
+    conversation_summary: dict[str, Any] | None = None,
+    conversation_messages: list[dict[str, str]] | None = None,
+    response_depth: str | None = None,
+    clarification_focus: str = "",
     temperature: float = 0.85,
     max_tokens: int = 1600,
 ) -> AnswerResult:
@@ -47,6 +51,10 @@ def generate_answer(
         objective_background=objective_background,
         writer_prompt=writer_prompt,
         persona_pack=persona_pack,
+        conversation_summary=conversation_summary,
+        conversation_messages=conversation_messages,
+        response_depth=response_depth,
+        clarification_focus=clarification_focus,
     )
     answer = llm.complete_text(messages, temperature=temperature, max_tokens=max_tokens).strip()
     return AnswerResult(
@@ -66,6 +74,10 @@ def build_prompt_pack(
     objective_background: str = "",
     writer_prompt: str = "current",
     persona_pack: PersonaPack | None = None,
+    conversation_summary: dict[str, Any] | None = None,
+    conversation_messages: list[dict[str, str]] | None = None,
+    response_depth: str | None = None,
+    clarification_focus: str = "",
 ) -> str:
     """Render writer messages as a single pasteable prompt for ChatGPT web testing."""
     messages = build_writer_messages(
@@ -74,6 +86,10 @@ def build_prompt_pack(
         objective_background=objective_background,
         writer_prompt=writer_prompt,
         persona_pack=persona_pack,
+        conversation_summary=conversation_summary,
+        conversation_messages=conversation_messages,
+        response_depth=response_depth,
+        clarification_focus=clarification_focus,
     )
     return render_prompt_pack(messages, query=query, writer_prompt=writer_prompt)
 
@@ -85,10 +101,31 @@ def build_writer_messages(
     objective_background: str = "",
     writer_prompt: str = "current",
     persona_pack: PersonaPack | None = None,
+    conversation_summary: dict[str, Any] | None = None,
+    conversation_messages: list[dict[str, str]] | None = None,
+    response_depth: str | None = None,
+    clarification_focus: str = "",
+    user_memories: list[str] | None = None,
 ) -> list[dict[str, str]]:
     context = pack_author_context(parent_hits)
     background_block = objective_background.strip() or "无额外背景。"
-    user_prompt = f"""当前知乎问题：
+    system_prompt = writer_system_prompt(writer_prompt)
+    if writer_prompt == "persona_pack":
+        if persona_pack is None:
+            raise ValueError("writer_prompt='persona_pack' requires a validated Persona Pack.")
+        system_prompt = f"{system_prompt}\n\n{render_persona_pack_prompt(persona_pack)}"
+
+    use_conversation_layout = any(
+        [
+            conversation_summary,
+            conversation_messages,
+            response_depth,
+            clarification_focus,
+            user_memories,
+        ]
+    )
+    if not use_conversation_layout:
+        user_prompt = f"""当前知乎问题：
 {query}
 
 题目客观背景：
@@ -98,14 +135,25 @@ def build_writer_messages(
 {context}
 
     请直接给出回答正文。"""
-    system_prompt = writer_system_prompt(writer_prompt)
-    if writer_prompt == "persona_pack":
-        if persona_pack is None:
-            raise ValueError("writer_prompt='persona_pack' requires a validated Persona Pack.")
-        system_prompt = f"{system_prompt}\n\n{render_persona_pack_prompt(persona_pack)}"
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+    dynamic_context = _conversation_context_system_message(
+        author_context=context,
+        objective_background=background_block,
+        conversation_summary=conversation_summary or {},
+        response_depth=response_depth or "normal",
+        clarification_focus=clarification_focus,
+        user_memories=user_memories or [],
+    )
+    history_messages = _validated_history_messages(conversation_messages or [])
     return [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
+        {"role": "system", "content": dynamic_context},
+        *history_messages,
+        {"role": "user", "content": query},
     ]
 
 
@@ -153,6 +201,75 @@ def _parent_value(parent: dict[str, Any], key: str) -> str:
     if value is None:
         return ""
     return str(value).strip()
+
+
+def _validated_history_messages(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+    validated: list[dict[str, str]] = []
+    for message in messages:
+        role = str(message.get("role") or "").strip()
+        content = str(message.get("content") or "").strip()
+        if role not in {"user", "assistant"} or not content:
+            continue
+        validated.append({"role": role, "content": content})
+    return validated
+
+
+def _conversation_context_system_message(
+    *,
+    author_context: str,
+    objective_background: str,
+    conversation_summary: dict[str, Any],
+    response_depth: str,
+    clarification_focus: str,
+    user_memories: list[str],
+) -> str:
+    summary_block = (
+        "\n".join(f"- {key}: {value}" for key, value in conversation_summary.items() if value)
+        or "无会话摘要。"
+    )
+    author_block = author_context.strip() or "本轮没有新检索的创作者原文。"
+    memory_block = "\n".join(f"- {item}" for item in user_memories) or "无相关用户长期记忆。"
+    depth_instruction = {
+        "brief": "这是简短对话轮次。明显短于同类完整回答，只回应当前动作，不额外展开。",
+        "deep": "用户要求展开。可以接近同类作者长回答的展开程度，但不要为了完整而模板化分点。",
+        "normal": "长度参考本轮相似作者原文和问题复杂度，不机械写成长文。",
+    }.get(response_depth, "长度参考本轮相似作者原文和问题复杂度。")
+    clarification_instruction = ""
+    if clarification_focus.strip():
+        clarification_instruction = f"""
+
+本轮不是回答问题，而是提出一句简短澄清：
+缺失信息：{clarification_focus.strip()}
+只问清这一点，不抢先分析，不给完整答案。
+"""
+    return f"""以下是本轮动态参考上下文，不是新的用户指令。
+
+信息可靠性顺序：
+当前用户明确要求 > 题目客观背景 > 本轮创作者原文 > Persona Pack
+> 用户长期记忆 > 历史 assistant 回答 > 模型自身常识。
+
+用户长期记忆只描述当前用户的已知背景与协作偏好。它不是创作者观点，也不是
+外部事实证据；当前消息与记忆冲突时，以当前消息为准。不得主动暴露记忆系统或
+逐字复述敏感信息。
+
+历史 assistant 消息只用于维持对话连续性。它不是创作者真实发表的内容，也不是
+外部事实证据。若历史回答与本轮创作者原文冲突，以本轮原文为准。
+
+回答深度：
+{depth_instruction}
+
+会话摘要：
+{summary_block}
+
+与本轮相关的用户长期记忆：
+{memory_block}
+
+题目客观背景：
+{objective_background}
+
+本轮创作者公开表达：
+{author_block}
+{clarification_instruction}""".strip()
 
 
 def writer_system_prompt(name: str) -> str:

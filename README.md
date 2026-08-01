@@ -13,6 +13,10 @@ crawl public creator content locally
 
 The detailed contract lives in [SPEC.md](SPEC.md).
 
+当前 Web 支持按账号隔离的持久会话与跨会话用户记忆。记忆只从用户消息中异步提取，
+不会把作者生成内容写成用户事实；用户可以在侧栏的“我的记忆”里查看、纠正、置顶、
+遗忘或关闭自动写入。
+
 ## Quick Start
 
 从 GitHub 安装当前开发版：
@@ -103,6 +107,17 @@ Then open:
 ```text
 http://127.0.0.1:8000/
 ```
+
+首次打开时，网页会要求创建第一位管理员，并自动接管升级前已有的本地历史会话。
+以后只显示登录页，不开放公共注册。给协作者增加独立账号：
+
+```powershell
+pf user create collaborator
+pf user list
+```
+
+密码通过终端隐藏输入。作者语料与索引在账号间共享；聊天记录、生成任务和 Trace
+按账号隔离。Tailscale 可以限制哪些设备能够访问服务，但多人使用时仍需分别登录。
 
 页面左侧可以切换已就绪作者；“管理作者库”进入 `/authors`。添加作者时输入
 知乎用户名或主页 URL，确认后可以关闭弹窗或继续打开其他对话。服务端会把

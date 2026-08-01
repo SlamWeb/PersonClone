@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import threading
 from time import perf_counter
 
+import personaforge.web.service as web_service
+from fastapi.testclient import TestClient
 from personaforge.ingest.query_understanding import RetrievalQuery
 from personaforge.ingest.retrieve import ChildHit, ParentHit, RetrieveResult
 from personaforge.persona.suggestions import validate_suggestions
@@ -17,6 +20,50 @@ from personaforge.web.service import (
 )
 from personaforge.web.schemas import ChatStreamRequest
 from personaforge.web.streaming import sse_event
+
+
+class _RecordingEncoder:
+    def __init__(self) -> None:
+        self.calls: list[tuple[list[str], int]] = []
+
+    def encode_texts(self, texts: list[str], *, batch_size: int = 12):
+        self.calls.append((texts, batch_size))
+        return []
+
+
+def test_encoder_warmup_runs_once_and_reports_ready(tmp_path) -> None:
+    encoder = _RecordingEncoder()
+    service = PersonaChatService(WebConfig(data_dir=tmp_path, embedding_device="cpu"), encoder=encoder)
+
+    assert service.start_encoder_warmup() is False
+    assert service.encoder_status() == {
+        "state": "ready",
+        "device": "cpu",
+        "duration_ms": 0,
+        "error": None,
+    }
+    assert encoder.calls == []
+
+
+def test_encoder_warmup_loads_lazy_encoder_in_background(tmp_path, monkeypatch) -> None:
+    loaded = threading.Event()
+    encoder = _RecordingEncoder()
+
+    def fake_encoder(*args, **kwargs):
+        loaded.set()
+        return encoder
+
+    monkeypatch.setattr(web_service, "BgeM3Encoder", fake_encoder)
+    service = PersonaChatService(WebConfig(data_dir=tmp_path, embedding_device="cpu"))
+
+    assert service.start_encoder_warmup() is True
+    assert loaded.wait(timeout=2)
+    assert service._encoder_warmup_thread is not None
+    service._encoder_warmup_thread.join(timeout=2)
+
+    assert service.encoder_status()["state"] == "ready"
+    assert encoder.calls == [(["PersonaForge 启动预热"], 1)]
+    assert service.start_encoder_warmup() is False
 
 
 def test_list_local_personas_finds_indexed_authors(tmp_path) -> None:
@@ -138,7 +185,7 @@ def test_trace_records_retrieval_without_copying_parent_full_text(tmp_path) -> N
     assert trace["retrieval"]["parents"][0]["first_hits"][0]["route"] == "literal_question:dense"
     assert trace["generation"]["answer_characters"] == 2
     assert "完整正文" not in json.dumps(trace, ensure_ascii=False)
-    assert trace["schema_version"] == "personaforge.web.trace.v1"
+    assert trace["schema_version"] == "personaforge.web.trace.v2"
     assert trace["capture"]["mode"] == "summary"
 
 
@@ -291,6 +338,36 @@ def test_create_app_registers_trace_endpoint(tmp_path) -> None:
     assert "/api/personas/preview" in paths
     assert "/api/author-jobs" in paths
     assert "/api/author-jobs/{job_id}/cancel" in paths
+    assert "/api/chat/turns" in paths
+    assert "/api/chat/turns/{turn_id}" in paths
+    assert "/api/memories" in paths
+    assert "/api/memories/{memory_id}" in paths
+    assert "/api/memory-settings" in paths
+
+
+def test_memory_api_is_user_scoped_and_supports_correction(tmp_path) -> None:
+    config = WebConfig(data_dir=tmp_path, auth_required=False)
+    service = PersonaChatService(config)
+    memory = service.user_memories.save_revision(
+        "local-user", kind="semantic", memory_key="user.preference.detail",
+        content="用户喜欢简短回答。", sensitivity="normal", importance=3,
+        confidence=0.95, event_status="stable", source_author="alice",
+        source_conversation_id="s1", source_message_ids=["m1"],
+        evidence_quotes=["简短回答"],
+    )
+    client = TestClient(create_app(config, service=service))
+
+    listed = client.get("/api/memories")
+    corrected = client.patch(
+        f"/api/memories/{memory.id}",
+        json={"content": "用户喜欢先讲结论，再按需展开。", "pinned": True},
+    )
+
+    assert listed.status_code == 200
+    assert listed.json()["memories"][0]["id"] == memory.id
+    assert corrected.status_code == 200
+    assert corrected.json()["content"] == "用户喜欢先讲结论，再按需展开。"
+    assert corrected.json()["pinned"] is True
 
 
 def test_frontend_dist_dir_accepts_deployment_override(tmp_path, monkeypatch) -> None:

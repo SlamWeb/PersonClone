@@ -165,18 +165,27 @@ def build_background_and_retrieval_queries(
     *,
     search_results: list[SearchResult],
     llm: JsonChatClient,
+    resolved_query: str | None = None,
 ) -> QueryTransformResult:
     has_search_results = bool(search_results)
     payload = llm.complete_json(
         [
             {"role": "system", "content": BACKGROUND_TRANSFORM_SYSTEM_PROMPT},
-            {"role": "user", "content": _background_transform_user_prompt(query, search_results)},
+            {
+                "role": "user",
+                "content": _background_transform_user_prompt(
+                    query,
+                    search_results,
+                    resolved_query=resolved_query,
+                ),
+            },
         ],
         temperature=0.0,
         max_tokens=1400,
     )
     background = str(payload.get("objective_background") or "").strip() if has_search_results else ""
-    queries = _parse_retrieval_queries(payload.get("retrieval_queries"), original_query=query)
+    fallback_query = (resolved_query or query).strip() or query
+    queries = _parse_retrieval_queries(payload.get("retrieval_queries"), original_query=fallback_query)
     return QueryTransformResult(objective_background=background, retrieval_queries=queries)
 
 
@@ -202,7 +211,12 @@ def plan_to_trace(plan: GroundedQueryPlan) -> dict[str, object]:
     }
 
 
-def _background_transform_user_prompt(query: str, search_results: list[SearchResult]) -> str:
+def _background_transform_user_prompt(
+    query: str,
+    search_results: list[SearchResult],
+    *,
+    resolved_query: str | None = None,
+) -> str:
     if search_results:
         rows = []
         for index, result in enumerate(search_results, start=1):
@@ -219,7 +233,16 @@ def _background_transform_user_prompt(query: str, search_results: list[SearchRes
         search_block = "\n\n".join(rows)
     else:
         search_block = "无联网搜索结果。objective_background 必须输出空字符串。仍需生成 4 路 retrieval_queries。"
-    return f"知乎问题：{query}\n\n搜索结果：\n{search_block}"
+    resolved_block = (resolved_query or "").strip()
+    if resolved_block and resolved_block != query.strip():
+        question_block = (
+            f"当前用户原话：{query}\n"
+            f"为检索补全后的独立问题：{resolved_block}\n"
+            "独立问题只用于消除对话中的指代和省略，不代表作者立场。"
+        )
+    else:
+        question_block = f"知乎问题：{query}"
+    return f"{question_block}\n\n搜索结果：\n{search_block}"
 
 
 def _parse_retrieval_queries(value: object, *, original_query: str) -> list[RetrievalQuery]:
@@ -307,7 +330,8 @@ BACKGROUND_TRANSFORM_SYSTEM_PROMPT = """你是 PersonaForge 的 Background + Que
 - retrieval_queries 应优先使用具体场景、人物关系、行为动机、冲突模式、日常说法。
 - 已通过搜索消歧的词，四路 retrieval query 都必须服从新义。除 `literal_question` 可保留原词外，其余路线应带入消歧后的具体人物和行为，不得继续围绕被排除的字面义检索。
 - 四个 route 必须都输出，含义如下：
-  1. literal_question：保留题目字面意思，不扩展，不抽象。
+  1. literal_question：保留题目字面意思，不扩展，不抽象。多轮追问存在指代或省略时，
+     使用输入中已经最小补全的独立问题，不能退回“那男的呢”一类残缺原话。
   2. event_background：如果有联网背景，保留事件实体、关键词和关键事实；没有背景时接近 literal_question。
   3. mechanism_scene：把题目转成具体关系机制、行为动机、冲突场景和日常动作，不写成公共价值框架。
   4. colloquial_surface：换成知乎常见口语表达、网络表达和短词组合，利于 sparse lexical 命中。

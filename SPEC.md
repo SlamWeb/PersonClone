@@ -2,6 +2,10 @@
 
 这是从 `C:\PersonaForge` research 工作区拆出来的开源产品版规格。research 版继续保留实验、真实语料、消融和论文探索；开源版只保留可交付、可运行、可面试讲清楚的工程闭环。
 
+## 0. 仓库分工
+
+本仓库 `C:\PersonaForge-OpenSource` 是默认工程主线，承载面向简历、面试和开源交付的前后端、RAG、记忆、用户系统、部署、性能与工程质量建设。`C:\PersonaForge` 只用于论文、实验设计、评估研究和研究原型。用户未特别说明且任务偏工程时，默认在本仓库工作。
+
 ## 1. 产品定位
 
 PersonaForge Open Source 是一个 local-first 的创作者风格 RAG 工程项目：
@@ -353,6 +357,11 @@ Input
 - User config memory：用户配置、provider、index 路径、质量模式。
 
 第一版先实现 corpus memory 和最小 session memory。
+
+跨会话用户记忆开始前，Web 必须先完成账号隔离。当前采用首次网页创建管理员、
+后续 `pf user create` 邀请建号的方式；作者语料和索引共享，会话、消息、生成任务
+与 Trace 绑定服务端 Session 对应的 `user_id`。不开放公共注册，不接受前端传入的
+`owner_id`。后续用户语义记忆必须沿用同一隔离边界。
 
 ## 13. Web MVP
 

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import logging
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from statistics import median
 from time import perf_counter
 from typing import Any, Iterator
 from uuid import uuid4
@@ -13,6 +16,8 @@ from uuid import uuid4
 from personaforge.ingest.embeddings import BgeM3Encoder, TextEncoder
 from personaforge.ingest.query_understanding import (
     GroundedQueryPlan,
+    RetrievalQuery,
+    SearchResult,
     TavilySearchClient,
     build_background_and_retrieval_queries,
     plan_to_trace,
@@ -22,6 +27,15 @@ from personaforge.ingest.retrieve import ParentHit, RetrieveResult, retrieve_par
 from personaforge.llm import DeepSeekJsonClient, JsonChatClient
 from personaforge.persona.pack import load_persona_pack_for_index
 from personaforge.persona.writer import build_writer_messages
+from personaforge.web.conversations import ConversationStore
+from personaforge.web.multiturn import (
+    SelectedConversationContext,
+    TurnPlan,
+    plan_conversation_turn,
+    raw_turn_plan,
+    select_conversation_context,
+    turns_to_chat_messages,
+)
 from personaforge.web.trace import (
     DEFAULT_TRACE_RETENTION,
     TRACE_SCHEMA_VERSION,
@@ -32,6 +46,14 @@ from personaforge.web.trace import (
     read_trace,
     write_trace,
 )
+from personaforge.web.user_memory import (
+    MemoryRecallHit,
+    UserMemory,
+    UserMemoryStore,
+    recall_user_memories,
+)
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -51,6 +73,9 @@ class WebConfig:
     max_tokens: int = 1600
     trace_retention: int = DEFAULT_TRACE_RETENTION
     index_batch_size: int = 12
+    auth_required: bool = True
+    secure_cookies: bool | None = None
+    session_days: int = 30
 
 
 @dataclass(slots=True)
@@ -95,6 +120,14 @@ class PreparedChat:
     persona_pack_id: str | None = None
     persona_pack_sha256: str | None = None
     persona_pack_claim_count: int = 0
+    turn_id: str | None = None
+    turn_plan: dict[str, Any] | None = None
+    conversation_context: dict[str, Any] | None = None
+    response_max_tokens: int | None = None
+    memory_update: dict[str, Any] | None = None
+    owner_id: str = "local-user"
+    recalled_memories: list[UserMemory] | None = None
+    selected_memory_ids: list[str] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +138,18 @@ class ChatProgress:
     label: str
 
 
+class _SynchronizedEncoder:
+    """Serialize access to one shared local embedding model across chat workers."""
+
+    def __init__(self, encoder: TextEncoder, lock: threading.RLock) -> None:
+        self.encoder = encoder
+        self.lock = lock
+
+    def encode_texts(self, texts: list[str], *, batch_size: int = 12):
+        with self.lock:
+            return self.encoder.encode_texts(texts, batch_size=batch_size)
+
+
 class PersonaChatService:
     def __init__(
         self,
@@ -112,10 +157,71 @@ class PersonaChatService:
         *,
         encoder: TextEncoder | None = None,
         llm: JsonChatClient | None = None,
+        conversation_store: ConversationStore | None = None,
+        user_memory_store: UserMemoryStore | None = None,
     ) -> None:
         self.config = config
         self._encoder = encoder
+        self._encoder_proxy: TextEncoder | None = None
+        self._encoder_lock = threading.RLock()
+        self._encoder_warmup_thread: threading.Thread | None = None
+        self._encoder_warmup_state = "ready" if encoder is not None else "idle"
+        self._encoder_warmup_duration_ms: int | None = 0 if encoder is not None else None
+        self._encoder_warmup_error: str | None = None
         self._llm = llm
+        self._llm_local = threading.local()
+        self.conversations = conversation_store or ConversationStore(config.data_dir)
+        self.user_memories = user_memory_store or UserMemoryStore(config.data_dir)
+
+    def start_encoder_warmup(self) -> bool:
+        """Load the shared embedding model off the first user request."""
+
+        with self._encoder_lock:
+            if self._encoder_warmup_state == "ready":
+                return False
+            if self._encoder_warmup_thread is not None and self._encoder_warmup_thread.is_alive():
+                return False
+            self._encoder_warmup_state = "loading"
+            self._encoder_warmup_duration_ms = None
+            self._encoder_warmup_error = None
+            thread = threading.Thread(
+                target=self._warm_encoder,
+                name="personaforge-embedding-warmup",
+                daemon=True,
+            )
+            self._encoder_warmup_thread = thread
+            thread.start()
+            return True
+
+    def encoder_status(self) -> dict[str, Any]:
+        with self._encoder_lock:
+            return {
+                "state": self._encoder_warmup_state,
+                "device": self.config.embedding_device,
+                "duration_ms": self._encoder_warmup_duration_ms,
+                "error": self._encoder_warmup_error,
+            }
+
+    def _warm_encoder(self) -> None:
+        started_at = perf_counter()
+        try:
+            encoder = self._get_encoder()
+            encoder.encode_texts(["PersonaForge 启动预热"], batch_size=1)
+        except Exception as exc:  # pragma: no cover - depends on local CUDA/model state.
+            duration_ms = round((perf_counter() - started_at) * 1000)
+            with self._encoder_lock:
+                self._encoder_warmup_state = "failed"
+                self._encoder_warmup_duration_ms = duration_ms
+                self._encoder_warmup_error = f"{type(exc).__name__}: {exc}"
+            logger.exception("BGE-M3 background warmup failed")
+            return
+
+        duration_ms = round((perf_counter() - started_at) * 1000)
+        with self._encoder_lock:
+            self._encoder_warmup_state = "ready"
+            self._encoder_warmup_duration_ms = duration_ms
+            self._encoder_warmup_error = None
+        logger.info("BGE-M3 background warmup completed in %.2f s", duration_ms / 1000)
 
     def list_personas(self) -> list[LocalPersona]:
         return list_local_personas(self.config.data_dir)
@@ -163,7 +269,442 @@ class PersonaChatService:
         writer_prompt: str,
         parent_top_k: int | None = None,
         trace_capture: str = "summary",
+        turn_id: str | None = None,
     ) -> Iterator[ChatProgress | PreparedChat]:
+        selected_author = (author or self.default_author() or "").strip()
+        if not selected_author:
+            raise ValueError("No local persona index found. Run `pf build` and `pf index` first.")
+
+        if turn_id:
+            run = self.conversations.get_turn(turn_id)
+            if run.author != selected_author:
+                raise ValueError("Turn belongs to a different author.")
+            if session_id and run.conversation_id != session_id:
+                raise ValueError("Turn belongs to a different conversation.")
+            session_id = run.conversation_id
+            query = run.query
+            query_mode = run.query_mode
+            writer_prompt = run.writer_prompt
+            parent_top_k = run.parent_top_k
+            trace_capture = run.trace_capture
+
+        selected_session_id = session_id or new_session_id()
+        trace_id = new_trace_id()
+        trace_created_at = utc_now()
+        trace_started_at = perf_counter()
+        resolved_parent_top_k = parent_top_k or self.config.parent_top_k
+        if trace_capture not in {"summary", "full"}:
+            raise ValueError(f"Unknown trace_capture: {trace_capture}")
+
+        try:
+            index_dir = self.config.data_dir / "authors" / "zhihu" / selected_author / "index"
+            qdrant_path = index_dir / "qdrant"
+            persona_pack = (
+                load_persona_pack_for_index(index_dir, required=True)
+                if writer_prompt == "persona_pack"
+                else None
+            )
+            stages: list[dict[str, Any]] = []
+            llm = self._get_llm()
+            completed_turns = self.conversations.get_completed_turns(selected_session_id)
+            try:
+                owner_id = self.conversations.get_conversation_owner(selected_session_id)
+            except FileNotFoundError:
+                owner_id = "local-user"
+            try:
+                summary_state = self.conversations.get_summary(selected_session_id)
+            except FileNotFoundError:
+                summary_state = {"summary": {}, "through_sequence": 0, "version": 0}
+
+            yield ChatProgress(stage="conversation_context", label="正在理解对话")
+            context_started_at = perf_counter()
+            recent_turns = completed_turns[-3:]
+            stages.append(
+                self._stage(
+                    "conversation_context",
+                    "读取会话上下文",
+                    context_started_at,
+                    details={
+                        "completed_turn_count": len(completed_turns),
+                        "recent_turn_ids": [item.id for item in recent_turns],
+                        "summary_version": int(summary_state.get("version") or 0),
+                    },
+                )
+            )
+
+            planner_started_at = perf_counter()
+            memory_hits: list[MemoryRecallHit] = []
+            memory_candidates: list[UserMemory] = []
+            if query_mode == "grounded":
+                memory_started_at = perf_counter()
+                memory_hits = recall_user_memories(
+                    self.user_memories,
+                    owner_id,
+                    query,
+                    encoder=self._get_encoder(),
+                    model=self.config.model_name,
+                    limit=8,
+                )
+                memory_candidates = [hit.memory for hit in memory_hits]
+                stages.append(
+                    self._stage(
+                        "user_memory_recall",
+                        "召回跨会话用户记忆",
+                        memory_started_at,
+                        details={
+                            "candidate_count": len(memory_hits),
+                            "candidates": [hit.trace_payload() for hit in memory_hits],
+                        },
+                    )
+                )
+                plan = plan_conversation_turn(
+                    query,
+                    summary=dict(summary_state.get("summary") or {}),
+                    recent_turns=recent_turns,
+                    available_turns=completed_turns,
+                    memory_candidates=memory_candidates,
+                    llm=llm,
+                )
+                planner_usage = self._usage_or_estimate(
+                    llm,
+                    query,
+                    json.dumps(summary_state.get("summary") or {}, ensure_ascii=False),
+                    *(turn.memory_text for turn in recent_turns),
+                )
+            elif query_mode == "raw":
+                plan = raw_turn_plan(query)
+                planner_usage = None
+            else:
+                raise ValueError(f"Unknown query_mode: {query_mode}")
+            stages.append(
+                self._stage(
+                    "turn_planner",
+                    "判断当前对话动作",
+                    planner_started_at,
+                    details={
+                        "turn_type": plan.turn_type,
+                        "retrieval_policy": plan.retrieval_policy,
+                        "needs_web": plan.needs_web,
+                        "response_depth": plan.response_depth,
+                        "evidence_source_turn_id": plan.evidence_source_turn_id,
+                        "memory_ids": plan.memory_ids,
+                    },
+                    usage=planner_usage,
+                )
+            )
+            planner_duration_ms = elapsed_ms(planner_started_at)
+            selected_memories = [
+                memory for memory in memory_candidates if memory.id in set(plan.memory_ids)
+            ]
+            if selected_memories:
+                self.user_memories.mark_accessed(owner_id, [memory.id for memory in selected_memories])
+            if turn_id:
+                self.conversations.set_turn_plan(turn_id, plan.to_dict())
+
+            history_started_at = perf_counter()
+            if self._conversation_exists(selected_session_id):
+                conversation_context = select_conversation_context(
+                    self.conversations,
+                    selected_session_id,
+                    resolved_question=plan.resolved_question,
+                    turn_type=plan.turn_type,
+                    encoder=self._get_encoder() if len(completed_turns) > 6 and plan.turn_type != "new_topic" else None,
+                    embedding_model=self.config.model_name,
+                )
+            else:
+                conversation_context = _empty_conversation_context()
+            stages.append(
+                self._stage(
+                    "history_recall",
+                    "选择相关历史对话",
+                    history_started_at,
+                    details=conversation_context.trace_payload(),
+                )
+            )
+
+            source_turn = None
+            if plan.retrieval_policy == "reuse":
+                source_turn = next(
+                    (item for item in completed_turns if item.id == plan.evidence_source_turn_id),
+                    None,
+                )
+                if source_turn is None or not source_turn.parent_ids:
+                    plan = _fallback_to_new_retrieval(plan)
+                    if turn_id:
+                        self.conversations.set_turn_plan(turn_id, plan.to_dict())
+
+            search_results: list[SearchResult] = []
+            objective_background = ""
+            retrieval_queries: list[RetrievalQuery] = []
+            query_trace: dict[str, Any] | None = None
+            understanding_started_at = perf_counter()
+
+            if plan.retrieval_policy == "new" and query_mode == "grounded":
+                grounding_error: dict[str, str] | None = None
+                if plan.needs_web:
+                    yield ChatProgress(stage="web_grounding", label="正在查询相关背景")
+                    stage_started_at = perf_counter()
+                    try:
+                        search_results = TavilySearchClient.from_env().search_many(
+                            plan.search_queries,
+                            max_results=self.config.max_search_results,
+                        )
+                        stages.append(
+                            self._stage(
+                                "tavily_search",
+                                "获取公开背景资料",
+                                stage_started_at,
+                                details={
+                                    "search_query_count": len(plan.search_queries),
+                                    "result_count": len(search_results),
+                                },
+                            )
+                        )
+                    except Exception as exc:
+                        grounding_error = trace_error(exc)
+                        stages.append(
+                            self._stage(
+                                "tavily_search",
+                                "获取公开背景资料",
+                                stage_started_at,
+                                status="fallback",
+                                details={
+                                    "search_query_count": len(plan.search_queries),
+                                    "error": grounding_error,
+                                },
+                            )
+                        )
+                        yield ChatProgress(
+                            stage="web_fallback",
+                            label="未获得额外背景，继续检索作者历史表达",
+                        )
+                yield ChatProgress(stage="query_transform", label="正在整理检索线索")
+                stage_started_at = perf_counter()
+                transform = build_background_and_retrieval_queries(
+                    query,
+                    resolved_query=plan.resolved_question,
+                    search_results=search_results,
+                    llm=llm,
+                )
+                objective_background = transform.objective_background
+                retrieval_queries = transform.retrieval_queries
+                stages.append(
+                    self._stage(
+                        "query_transform",
+                        "生成多路检索表达",
+                        stage_started_at,
+                        details={
+                            "retrieval_query_count": len(retrieval_queries),
+                            "has_background": bool(objective_background),
+                        },
+                        usage=self._usage_or_estimate(
+                            llm,
+                            query,
+                            plan.resolved_question,
+                            *(item.content for item in search_results),
+                        ),
+                    )
+                )
+                query_trace = _multiturn_query_trace(
+                    query=query,
+                    plan=plan,
+                    search_results=search_results,
+                    objective_background=objective_background,
+                    retrieval_queries=retrieval_queries,
+                    grounding_error=grounding_error,
+                )
+            elif plan.retrieval_policy == "new":
+                query_trace = _multiturn_query_trace(
+                    query=query,
+                    plan=plan,
+                    search_results=[],
+                    objective_background="",
+                    retrieval_queries=[],
+                )
+            else:
+                query_trace = _multiturn_query_trace(
+                    query=query,
+                    plan=plan,
+                    search_results=[],
+                    objective_background="",
+                    retrieval_queries=[],
+                )
+            understanding_ms = elapsed_ms(understanding_started_at) + planner_duration_ms
+
+            retrieval_started_at = perf_counter()
+            if plan.retrieval_policy == "new":
+                yield ChatProgress(stage="retrieval", label="正在检索历史表达")
+                if query_mode == "raw":
+                    retrieve_result = retrieve_parents(
+                        plan.resolved_question,
+                        author=selected_author,
+                        index_dir=index_dir,
+                        qdrant_path=qdrant_path,
+                        encoder=self._get_encoder(),
+                        child_top_k=self.config.child_top_k,
+                        parent_top_k=resolved_parent_top_k,
+                    )
+                else:
+                    retrieve_result = retrieve_parents_for_queries(
+                        plan.resolved_question,
+                        retrieval_queries,
+                        author=selected_author,
+                        index_dir=index_dir,
+                        qdrant_path=qdrant_path,
+                        encoder=self._get_encoder(),
+                        child_top_k=self.config.child_top_k,
+                        per_query_parent_k=self.config.per_query_parent_k,
+                        parent_top_k=resolved_parent_top_k,
+                    )
+                stages.extend(self._retrieval_stages(retrieve_result, retrieval_started_at))
+            elif plan.retrieval_policy == "reuse" and source_turn is not None:
+                yield ChatProgress(stage="retrieval_reuse", label="正在延续上次回答")
+                retrieve_result = _retrieve_result_from_parent_ids(
+                    query=plan.resolved_question,
+                    author=selected_author,
+                    parent_ids=source_turn.parent_ids,
+                    parents_path=index_dir / "parents.jsonl",
+                    child_top_k=self.config.child_top_k,
+                )
+                stages.append(
+                    self._stage(
+                        "retrieval_reuse",
+                        "复用既有作者证据",
+                        retrieval_started_at,
+                        details={
+                            "source_turn_id": source_turn.id,
+                            "parent_count": len(retrieve_result.parents),
+                        },
+                    )
+                )
+            else:
+                retrieve_result = _empty_retrieve_result(
+                    query=plan.resolved_question,
+                    author=selected_author,
+                    child_top_k=self.config.child_top_k,
+                )
+                stages.append(
+                    self._stage(
+                        "retrieval_skipped",
+                        "跳过作者材料检索",
+                        retrieval_started_at,
+                        details={"reason": plan.turn_type},
+                    )
+                )
+            retrieval_ms = elapsed_ms(retrieval_started_at)
+
+            selected_turns = list(conversation_context.selected_turns)
+            if source_turn is not None and source_turn.id not in {item.id for item in selected_turns}:
+                selected_turns.append(source_turn)
+                selected_turns.sort(key=lambda item: item.sequence)
+
+            yield ChatProgress(stage="writer", label="正在准备回答")
+            writer_started_at = perf_counter()
+            messages = build_writer_messages(
+                query=query,
+                parent_hits=retrieve_result.parents,
+                objective_background=objective_background,
+                writer_prompt=writer_prompt,
+                persona_pack=persona_pack,
+                conversation_summary=conversation_context.summary,
+                conversation_messages=turns_to_chat_messages(selected_turns),
+                response_depth=plan.response_depth,
+                clarification_focus=plan.clarification_focus if plan.turn_type == "unclear" else "",
+                user_memories=[memory.content for memory in selected_memories],
+            )
+            response_max_tokens = response_token_limit(
+                plan.response_depth,
+                retrieve_result.parents,
+                configured_max=self.config.max_tokens,
+            )
+            stages.append(
+                self._stage(
+                    "writer_pack",
+                    "组织作者身份、证据与对话",
+                    writer_started_at,
+                    details={
+                        "parent_count": len(retrieve_result.parents),
+                        "history_turn_count": len(selected_turns),
+                        "message_count": len(messages),
+                        "context_characters": sum(
+                            len(message.get("content", "")) for message in messages
+                        ),
+                        "response_depth": plan.response_depth,
+                        "response_max_tokens": response_max_tokens,
+                        "persona_pack_id": persona_pack.pack_id if persona_pack else None,
+                        "persona_pack_sha256": persona_pack.sha256 if persona_pack else None,
+                        "persona_pack_claim_count": persona_pack.claim_count if persona_pack else 0,
+                        "selected_user_memory_count": len(selected_memories),
+                    },
+                    usage=estimated_usage_for_text(
+                        *(message.get("content", "") for message in messages)
+                    ),
+                )
+            )
+        except Exception as exc:
+            self._write_prepare_failure_trace(
+                author=selected_author,
+                session_id=selected_session_id,
+                trace_id=trace_id,
+                created_at=trace_created_at,
+                query=query,
+                query_mode=query_mode,
+                writer_prompt=writer_prompt,
+                parent_top_k=resolved_parent_top_k,
+                error=exc,
+            )
+            raise
+
+        prepared = PreparedChat(
+            session_id=selected_session_id,
+            author=selected_author,
+            query=query,
+            query_mode=query_mode,
+            writer_prompt=writer_prompt,
+            trace_capture=trace_capture,
+            objective_background=objective_background,
+            query_trace=query_trace,
+            retrieve_result=retrieve_result,
+            messages=messages,
+            trace_id=trace_id,
+            trace_created_at=trace_created_at,
+            trace_started_at=trace_started_at,
+            query_understanding_duration_ms=understanding_ms,
+            retrieval_duration_ms=retrieval_ms,
+            writer_build_duration_ms=elapsed_ms(writer_started_at),
+            stages=stages,
+            persona_pack_id=persona_pack.pack_id if persona_pack else None,
+            persona_pack_sha256=persona_pack.sha256 if persona_pack else None,
+            persona_pack_claim_count=persona_pack.claim_count if persona_pack else 0,
+            turn_id=turn_id,
+            turn_plan=plan.to_dict(),
+            conversation_context=conversation_context.trace_payload(),
+            response_max_tokens=response_max_tokens,
+            owner_id=owner_id,
+            recalled_memories=memory_candidates,
+            selected_memory_ids=[memory.id for memory in selected_memories],
+        )
+        if turn_id:
+            self.conversations.set_turn_evidence(
+                turn_id,
+                [hit.parent_id for hit in retrieve_result.parents],
+                trace_id,
+            )
+        self.record_prepared_trace(prepared)
+        yield prepared
+
+    def _iter_prepare_chat_v1(
+        self,
+        *,
+        author: str | None,
+        session_id: str | None,
+        query: str,
+        query_mode: str,
+        writer_prompt: str,
+        parent_top_k: int | None = None,
+        trace_capture: str = "summary",
+    ) -> Iterator[ChatProgress | PreparedChat]:
+        """Keep the pre-multiturn pipeline available for fixture compatibility."""
         selected_author = (author or self.default_author() or "").strip()
         if not selected_author:
             raise ValueError("No local persona index found. Run `pf build` and `pf index` first.")
@@ -375,14 +916,14 @@ class PersonaChatService:
                 stream = stream_with_usage(
                     prepared.messages,
                     temperature=self.config.temperature,
-                    max_tokens=self.config.max_tokens,
+                    max_tokens=prepared.response_max_tokens or self.config.max_tokens,
                     on_usage=receive_usage,
                 )
             else:
                 stream = llm.stream_text(
                     prepared.messages,
                     temperature=self.config.temperature,
-                    max_tokens=self.config.max_tokens,
+                    max_tokens=prepared.response_max_tokens or self.config.max_tokens,
                 )
             for token in stream:
                 if first_token_at is None:
@@ -405,6 +946,53 @@ class PersonaChatService:
     def fail_trace(self, prepared: PreparedChat, error: Exception) -> Path:
         return self._write_trace(prepared, status="failed", error=error)
 
+    def update_memory_trace(
+        self,
+        *,
+        author: str,
+        trace_id: str,
+        memory_update: dict[str, Any],
+        answer: str,
+    ) -> Path:
+        payload = read_trace(self.config.data_dir, author, trace_id)
+        payload["memory_update"] = memory_update
+        payload["updated_at"] = utc_now()
+        stages = payload.get("stages") if isinstance(payload.get("stages"), list) else []
+        stages = [stage for stage in stages if isinstance(stage, dict) and stage.get("id") != "memory_update"]
+        stages.append(
+            new_stage(
+                stage_id="memory_update",
+                label="更新会话记忆",
+                started_at=0.0,
+                duration_ms=int(memory_update.get("duration_ms") or 0),
+                status="failed" if memory_update.get("status") == "failed" else "completed",
+                details={
+                    "outcome": str(memory_update.get("status") or "completed"),
+                    **{
+                        key: value
+                        for key, value in memory_update.items()
+                        if key not in {"duration_ms", "status"}
+                    },
+                },
+            )
+        )
+        offset_ms = 0
+        for index, stage in enumerate(stages, start=1):
+            stage["order"] = index
+            stage["started_offset_ms"] = offset_ms
+            offset_ms += int(stage.get("duration_ms") or 0)
+        payload["stages"] = stages
+        generation = payload.get("generation")
+        if isinstance(generation, dict):
+            generation["answer_characters"] = len(answer)
+        return write_trace(
+            self.config.data_dir,
+            author,
+            trace_id,
+            payload,
+            retention=self.config.trace_retention,
+        )
+
     def get_trace(self, author: str, trace_id: str) -> dict[str, Any]:
         payload = read_trace(self.config.data_dir, author, trace_id)
         enrich_trace_source_urls(
@@ -413,45 +1001,37 @@ class PersonaChatService:
         )
         return payload
 
-    def list_sessions(self, author: str) -> list[dict[str, Any]]:
-        sessions: list[dict[str, Any]] = []
-        for path in sorted(session_dir(self.config.data_dir, author).glob("*.json"), reverse=True):
-            try:
-                payload = read_json(path)
-            except json.JSONDecodeError:
-                continue
-            messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
-            sessions.append(
-                {
-                    "id": str(payload.get("id") or path.stem),
-                    "author": author,
-                    "title": str(payload.get("title") or "未命名对话"),
-                    "created_at": str(payload.get("created_at") or ""),
-                    "updated_at": str(payload.get("updated_at") or ""),
-                    "message_count": len(messages),
-                }
-            )
-        return sessions
+    def list_sessions(self, author: str, *, owner_id: str | None = None) -> list[dict[str, Any]]:
+        return self.conversations.list_conversations(author, owner_id=owner_id)
 
-    def get_session(self, author: str, session_id: str) -> dict[str, Any]:
-        path = session_path(self.config.data_dir, author, session_id)
-        if not path.exists():
-            raise FileNotFoundError(f"Session not found: {session_id}")
-        payload = read_json(path)
-        payload.setdefault("id", session_id)
-        payload.setdefault("author", author)
-        payload.setdefault("title", "未命名对话")
-        payload.setdefault("messages", [])
+    def get_session(
+        self,
+        author: str,
+        session_id: str,
+        *,
+        owner_id: str | None = None,
+    ) -> dict[str, Any]:
+        payload = self.conversations.get_conversation(author, session_id, owner_id=owner_id)
         enrich_session_source_urls(
             payload,
             self.config.data_dir / "authors" / "zhihu" / author / "index" / "parents.jsonl",
         )
         return payload
 
-    def delete_session(self, author: str, session_id: str) -> None:
-        path = session_path(self.config.data_dir, author, session_id)
-        if path.exists():
-            path.unlink()
+    def delete_session(
+        self,
+        author: str,
+        session_id: str,
+        *,
+        owner_id: str | None = None,
+    ) -> None:
+        trace_ids = self.conversations.delete_conversation(author, session_id, owner_id=owner_id)
+        for trace_id in trace_ids:
+            path = self.config.data_dir / "authors" / "zhihu" / author / "traces" / f"{trace_id}.json"
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                continue
 
     def list_suggestions(self, author: str) -> list[str]:
         path = suggestions_path(self.config.data_dir, author)
@@ -467,46 +1047,58 @@ class PersonaChatService:
         return [str(item) for item in suggestions if isinstance(item, str)]
 
     def save_turn(self, prepared: PreparedChat, answer: str, sources: list[dict[str, Any]]) -> dict[str, Any]:
-        now = utc_now()
-        path = session_path(self.config.data_dir, prepared.author, prepared.session_id)
-        if path.exists():
-            payload = read_json(path)
+        if prepared.turn_id:
+            self.conversations.complete_turn(
+                prepared.turn_id,
+                answer=answer,
+                sources=sources,
+                trace_id=prepared.trace_id or None,
+            )
         else:
-            payload = {
-                "id": prepared.session_id,
-                "author": prepared.author,
-                "title": session_title(prepared.query),
-                "created_at": now,
-                "messages": [],
-            }
-        payload["updated_at"] = now
-        messages = payload.setdefault("messages", [])
-        messages.append({"role": "user", "text": prepared.query})
-        messages.append(
-            {
-                "role": "assistant",
-                "text": answer,
-                "sources": sources,
-                "trace_id": prepared.trace_id or None,
-            }
-        )
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        return payload
+            self.conversations.save_completed_turn(
+                conversation_id=prepared.session_id,
+                author=prepared.author,
+                query=prepared.query,
+                answer=answer,
+                sources=sources,
+                trace_id=prepared.trace_id or None,
+                query_mode=prepared.query_mode,
+                writer_prompt=prepared.writer_prompt,
+                parent_top_k=prepared.retrieve_result.parent_top_k or self.config.parent_top_k,
+                trace_capture=prepared.trace_capture,
+            )
+        return self.get_session(prepared.author, prepared.session_id)
+
+    def _conversation_exists(self, conversation_id: str) -> bool:
+        try:
+            self.conversations.get_summary(conversation_id)
+        except FileNotFoundError:
+            return False
+        return True
 
     def _get_encoder(self) -> TextEncoder:
-        if self._encoder is None:
-            self._encoder = BgeM3Encoder(
-                self.config.model_name,
-                device=self.config.embedding_device,
-                use_fp16=self.config.use_fp16,
-            )
-        return self._encoder
+        with self._encoder_lock:
+            if self._encoder is None:
+                self._encoder = BgeM3Encoder(
+                    self.config.model_name,
+                    device=self.config.embedding_device,
+                    use_fp16=self.config.use_fp16,
+                )
+            if self._encoder_proxy is None:
+                self._encoder_proxy = _SynchronizedEncoder(self._encoder, self._encoder_lock)
+            return self._encoder_proxy
 
     def _get_llm(self) -> JsonChatClient:
-        if self._llm is None:
-            self._llm = DeepSeekJsonClient.from_env()
-        return self._llm
+        if self._llm is not None:
+            return self._llm
+        client = getattr(self._llm_local, "client", None)
+        if client is None:
+            client = DeepSeekJsonClient.from_env()
+            self._llm_local.client = client
+        return client
+
+    def llm_client(self) -> JsonChatClient:
+        return self._get_llm()
 
     def _write_trace(
         self,
@@ -525,6 +1117,7 @@ class PersonaChatService:
             "input": {
                 "author": prepared.author,
                 "session_id": prepared.session_id,
+                "turn_id": prepared.turn_id,
                 "query": prepared.query,
                 "query_mode": prepared.query_mode,
                 "writer_prompt": prepared.writer_prompt,
@@ -536,6 +1129,12 @@ class PersonaChatService:
             },
             "capture": {"mode": prepared.trace_capture, "retention": self.config.trace_retention},
             "stages": self._finalized_stages(prepared, status=status, answer=answer, error=error),
+            "conversation_context": prepared.conversation_context,
+            "user_memory_recall": {
+                "candidate_ids": [memory.id for memory in (prepared.recalled_memories or [])],
+                "selected_ids": prepared.selected_memory_ids or [],
+            },
+            "turn_planner": prepared.turn_plan,
             "query_understanding": {
                 "duration_ms": prepared.query_understanding_duration_ms,
                 "trace": prepared.query_trace,
@@ -562,12 +1161,13 @@ class PersonaChatService:
                 "provider": type(self._get_llm()).__name__ if self._llm is not None else "DeepSeekJsonClient",
                 "model": str(getattr(self._llm, "model", "")) if self._llm is not None else "",
                 "temperature": self.config.temperature,
-                "max_tokens": self.config.max_tokens,
+                "max_tokens": prepared.response_max_tokens or self.config.max_tokens,
                 "duration_ms": prepared.generation_duration_ms,
                 "time_to_first_token_ms": prepared.generation_ttft_ms,
                 "usage": prepared.generation_usage,
                 "answer_characters": len(answer) if answer is not None else 0,
             },
+            "memory_update": prepared.memory_update,
             "timing": {"total_duration_ms": elapsed_ms(prepared.trace_started_at)},
         }
         if error is not None:
@@ -614,11 +1214,14 @@ class PersonaChatService:
                 "retrieval_parameters": {"parent_top_k": parent_top_k},
             },
             "query_understanding": None,
+            "conversation_context": None,
+            "turn_planner": None,
             "capture": {"mode": "summary", "retention": self.config.trace_retention},
             "stages": [],
             "retrieval": None,
             "writer": None,
             "generation": None,
+            "memory_update": None,
             "error": trace_error(error),
         }
         return write_trace(
@@ -715,6 +1318,135 @@ class PersonaChatService:
             stage["started_offset_ms"] = offset_ms
             offset_ms += int(stage.get("duration_ms") or 0)
         return stages
+
+
+def _empty_conversation_context() -> SelectedConversationContext:
+    return SelectedConversationContext(
+        summary={},
+        summary_version=0,
+        summary_through_sequence=0,
+        recent_turns=[],
+        relevant_turns=[],
+        selected_turns=[],
+        history_matches=[],
+        used_full_short_history=True,
+    )
+
+
+def _fallback_to_new_retrieval(plan: TurnPlan) -> TurnPlan:
+    return TurnPlan(
+        turn_type=plan.turn_type,
+        resolved_question=plan.resolved_question,
+        retrieval_policy="new",
+        evidence_source_turn_id=None,
+        needs_web=plan.needs_web,
+        search_queries=plan.search_queries,
+        response_depth=plan.response_depth,
+        clarification_focus=plan.clarification_focus,
+        memory_ids=plan.memory_ids,
+    )
+
+
+def _empty_retrieve_result(*, query: str, author: str, child_top_k: int) -> RetrieveResult:
+    return RetrieveResult(
+        query=query,
+        collection_name=f"zhihu__{author}",
+        child_top_k=child_top_k,
+        parent_top_k=0,
+        routes={},
+        parents=[],
+        retrieval_queries=[],
+        timing={},
+    )
+
+
+def _retrieve_result_from_parent_ids(
+    *,
+    query: str,
+    author: str,
+    parent_ids: list[str],
+    parents_path: Path,
+    child_top_k: int,
+) -> RetrieveResult:
+    records = load_parents_by_id(parents_path, set(parent_ids))
+    parent_hits: list[ParentHit] = []
+    for rank, parent_id in enumerate(parent_ids, start=1):
+        parent = records.get(parent_id)
+        if parent is None:
+            continue
+        parent_hits.append(
+            ParentHit(
+                rank=rank,
+                parent_id=parent_id,
+                score=1.0 / (60 + rank),
+                title=str(parent.get("title") or parent_id),
+                path=str(parent.get("path") or ""),
+                first_hits=[],
+                parent=parent,
+            )
+        )
+    return RetrieveResult(
+        query=query,
+        collection_name=f"zhihu__{author}",
+        child_top_k=child_top_k,
+        parent_top_k=len(parent_hits),
+        routes={},
+        parents=parent_hits,
+        retrieval_queries=[],
+        timing={"parent_load": 0},
+    )
+
+
+def _multiturn_query_trace(
+    *,
+    query: str,
+    plan: TurnPlan,
+    search_results: list[SearchResult],
+    objective_background: str,
+    retrieval_queries: list[RetrievalQuery],
+    grounding_error: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "original_query": query,
+        "resolved_question": plan.resolved_question,
+        "turn_plan": plan.to_dict(),
+        "search_plan": {
+            "needs_web": plan.needs_web,
+            "search_queries": plan.search_queries,
+        },
+        "search_results": [
+            {"query": item.query, "title": item.title, "url": item.url}
+            for item in search_results
+        ],
+        "objective_background": objective_background,
+        "retrieval_queries": [
+            {"route": item.route, "query": item.query}
+            for item in retrieval_queries
+        ],
+    }
+    if grounding_error is not None:
+        payload["web_grounding_error"] = grounding_error
+    return payload
+
+
+def response_token_limit(
+    depth: str,
+    parent_hits: list[ParentHit],
+    *,
+    configured_max: int,
+) -> int:
+    configured_max = max(128, configured_max)
+    parent_token_estimates = [
+        int(estimated_usage_for_text(str((hit.parent or {}).get("text") or "")).get("estimated_tokens", 0))
+        for hit in parent_hits[:5]
+        if str((hit.parent or {}).get("text") or "").strip()
+    ]
+    typical = int(median(parent_token_estimates)) if parent_token_estimates else min(900, configured_max)
+    if depth == "brief":
+        return min(configured_max, max(192, min(512, round(typical * 0.55))))
+    if depth == "deep":
+        return min(configured_max, max(900, round(typical * 1.35)))
+    return min(configured_max, max(600, typical))
 
 
 def list_local_personas(data_dir: Path = Path("data")) -> list[LocalPersona]:

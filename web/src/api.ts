@@ -1,3 +1,37 @@
+export type AuthUser = {
+  id: string;
+  username: string;
+  display_name: string;
+  role: 'admin' | 'member';
+};
+
+export type AuthState = {
+  configured: boolean;
+  authenticated: boolean;
+  user?: AuthUser | null;
+};
+
+export type UserMemory = {
+  id: string;
+  kind: 'semantic' | 'episodic' | 'procedural';
+  memory_key: string;
+  content: string;
+  status: string;
+  pinned: boolean;
+  sensitivity: 'normal' | 'private' | 'restricted';
+  importance: number;
+  confidence: number;
+  event_status: 'ongoing' | 'historical' | 'stable';
+  source_author?: string | null;
+  source_conversation_id?: string | null;
+  updated_at: string;
+};
+
+export type UserMemorySettings = {
+  enabled: boolean;
+  auto_write: boolean;
+};
+
 export type PersonaInfo = {
   author: string;
   source: string;
@@ -76,10 +110,13 @@ export type ChatStreamRequest = {
 };
 
 export type ChatMessage = {
+  id?: string | null;
   role: 'user' | 'assistant' | 'error';
   text: string;
+  status?: 'queued' | 'running' | 'completed' | 'failed' | 'interrupted';
   sources?: Source[] | null;
   trace_id?: string | null;
+  turn_id?: string | null;
 };
 
 export type ChatSessionSummary = {
@@ -101,11 +138,43 @@ export type ChatSession = {
 };
 
 export type ChatCallbacks = {
+  onAccepted?: (payload: {
+    session_id: string;
+    turn_id: string;
+    status: string;
+    stage: string;
+    label: string;
+  }) => void;
   onMeta?: (payload: Record<string, unknown>) => void;
   onStatus?: (payload: { stage: string; label: string }) => void;
   onToken?: (text: string) => void;
-  onDone?: (payload: { session_id: string; trace_id?: string; answer: string; sources: Source[] }) => void;
+  onDone?: (payload: {
+    session_id: string;
+    turn_id?: string;
+    trace_id?: string;
+    answer: string;
+    sources: Source[];
+  }) => void;
   onError?: (message: string) => void;
+};
+
+export type TurnRun = {
+  id: string;
+  conversation_id: string;
+  author: string;
+  query: string;
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'interrupted';
+  stage: string;
+  label: string;
+  partial_answer: string;
+  error?: { message?: string } | null;
+  planner?: Record<string, unknown> | null;
+  response_depth?: string | null;
+  trace_id?: string | null;
+  created_at: string;
+  updated_at: string;
+  started_at?: string | null;
+  completed_at?: string | null;
 };
 
 export type TraceChildHit = {
@@ -130,12 +199,51 @@ export type TraceParent = {
 };
 
 export type TracePayload = {
+  schema_version?: string;
   trace_id: string;
   status: 'prepared' | 'completed' | 'failed';
   created_at: string;
   updated_at: string;
   capture?: { mode: 'summary' | 'full'; retention: number };
   stages?: TraceStage[];
+  conversation_context?: {
+    summary_version?: number;
+    summary_through_sequence?: number;
+    recent_turn_ids?: string[];
+    relevant_turn_ids?: string[];
+    selected_turn_ids?: string[];
+    history_matches?: Array<{ turn_id: string; score: number }>;
+    used_full_short_history?: boolean;
+  } | null;
+  turn_planner?: {
+    turn_type?: 'new_topic' | 'follow_up' | 'explain_previous' | 'casual' | 'unclear';
+    resolved_question?: string;
+    retrieval_policy?: 'new' | 'reuse' | 'none';
+    evidence_source_turn_id?: string | null;
+    needs_web?: boolean;
+    search_queries?: string[];
+    response_depth?: 'brief' | 'normal' | 'deep';
+    clarification_focus?: string;
+    memory_ids?: string[];
+  } | null;
+  user_memory_recall?: {
+    candidate_ids?: string[];
+    selected_ids?: string[];
+  } | null;
+  memory_update?: {
+    status?: 'completed' | 'skipped' | 'failed';
+    duration_ms?: number;
+    conversation_summary?: {
+      status?: 'completed' | 'skipped' | 'failed';
+      summary_version?: number | null;
+      through_sequence?: number | null;
+    };
+    user_memory?: {
+      status?: 'completed' | 'skipped' | 'failed';
+      operations?: Array<{ operation?: string; memory_id?: string; memory_key?: string }>;
+      rejections?: Array<{ reason?: string }>;
+    };
+  } | null;
   input: {
     author: string;
     session_id: string;
@@ -208,8 +316,93 @@ export type TraceStage = {
   usage?: TraceUsage | null;
 };
 
+export async function fetchAuthState(): Promise<AuthState> {
+  const response = await apiFetch('/api/auth/state');
+  if (!response.ok) throw new Error(await apiError(response, '无法读取登录状态'));
+  return response.json();
+}
+
+export async function bootstrapAuth(request: {
+  username: string;
+  password: string;
+  display_name?: string;
+}): Promise<AuthState> {
+  const response = await apiFetch('/api/auth/bootstrap', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(request)
+  });
+  if (!response.ok) throw new Error(await apiError(response, '无法创建管理员'));
+  return response.json();
+}
+
+export async function loginAuth(username: string, password: string): Promise<AuthState> {
+  const response = await apiFetch('/api/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password })
+  });
+  if (!response.ok) throw new Error(await apiError(response, '无法登录'));
+  return response.json();
+}
+
+export async function logoutAuth(): Promise<void> {
+  const response = await apiFetch('/api/auth/logout', { method: 'POST' });
+  if (!response.ok) throw new Error(await apiError(response, '无法退出登录'));
+}
+
+export async function fetchMemories(): Promise<UserMemory[]> {
+  const response = await apiFetch('/api/memories');
+  if (!response.ok) throw new Error(await apiError(response, '无法读取记忆'));
+  const payload = await response.json();
+  return payload.memories || [];
+}
+
+export async function fetchMemorySettings(): Promise<UserMemorySettings> {
+  const response = await apiFetch('/api/memory-settings');
+  if (!response.ok) throw new Error(await apiError(response, '无法读取记忆设置'));
+  return response.json();
+}
+
+export async function updateMemorySettings(
+  patch: Partial<UserMemorySettings>
+): Promise<UserMemorySettings> {
+  const response = await apiFetch('/api/memory-settings', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch)
+  });
+  if (!response.ok) throw new Error(await apiError(response, '无法更新记忆设置'));
+  return response.json();
+}
+
+export async function updateMemory(
+  memoryId: string,
+  patch: { content?: string; pinned?: boolean }
+): Promise<UserMemory> {
+  const response = await apiFetch(`/api/memories/${encodeURIComponent(memoryId)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch)
+  });
+  if (!response.ok) throw new Error(await apiError(response, '无法更新记忆'));
+  return response.json();
+}
+
+export async function forgetMemory(memoryId: string): Promise<void> {
+  const response = await apiFetch(`/api/memories/${encodeURIComponent(memoryId)}`, {
+    method: 'DELETE'
+  });
+  if (!response.ok) throw new Error(await apiError(response, '无法遗忘记忆'));
+}
+
+export async function clearMemories(): Promise<void> {
+  const response = await apiFetch('/api/memories', { method: 'DELETE' });
+  if (!response.ok) throw new Error(await apiError(response, '无法清空记忆'));
+}
+
 export async function fetchPersonas(): Promise<{ personas: PersonaInfo[]; default_author?: string }> {
-  const response = await fetch('/api/personas');
+  const response = await apiFetch('/api/personas');
   if (!response.ok) {
     throw new Error(`Failed to load personas: ${response.status}`);
   }
@@ -217,7 +410,7 @@ export async function fetchPersonas(): Promise<{ personas: PersonaInfo[]; defaul
 }
 
 export async function previewAuthor(value: string): Promise<AuthorPreview> {
-  const response = await fetch('/api/personas/preview', {
+  const response = await apiFetch('/api/personas/preview', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ value })
@@ -229,7 +422,7 @@ export async function previewAuthor(value: string): Promise<AuthorPreview> {
 }
 
 export async function fetchAuthorJobs(): Promise<AuthorJob[]> {
-  const response = await fetch('/api/author-jobs');
+  const response = await apiFetch('/api/author-jobs');
   if (!response.ok) {
     throw new Error(await apiError(response, '无法读取作者任务'));
   }
@@ -242,7 +435,7 @@ export async function createAuthorJob(request: {
   kinds: Array<'answer' | 'article' | 'pin'>;
   max_items?: number | null;
 }): Promise<AuthorJob> {
-  const response = await fetch('/api/author-jobs', {
+  const response = await apiFetch('/api/author-jobs', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(request)
@@ -254,7 +447,7 @@ export async function createAuthorJob(request: {
 }
 
 export async function cancelAuthorJob(jobId: string): Promise<AuthorJob> {
-  const response = await fetch(`/api/author-jobs/${encodeURIComponent(jobId)}/cancel`, { method: 'POST' });
+  const response = await apiFetch(`/api/author-jobs/${encodeURIComponent(jobId)}/cancel`, { method: 'POST' });
   if (!response.ok) {
     throw new Error(await apiError(response, '无法取消任务'));
   }
@@ -262,7 +455,7 @@ export async function cancelAuthorJob(jobId: string): Promise<AuthorJob> {
 }
 
 export async function retryAuthorJob(jobId: string): Promise<AuthorJob> {
-  const response = await fetch(`/api/author-jobs/${encodeURIComponent(jobId)}/retry`, { method: 'POST' });
+  const response = await apiFetch(`/api/author-jobs/${encodeURIComponent(jobId)}/retry`, { method: 'POST' });
   if (!response.ok) {
     throw new Error(await apiError(response, '无法重试任务'));
   }
@@ -270,7 +463,7 @@ export async function retryAuthorJob(jobId: string): Promise<AuthorJob> {
 }
 
 export async function fetchSessions(author: string): Promise<ChatSessionSummary[]> {
-  const response = await fetch(`/api/personas/${encodeURIComponent(author)}/sessions`);
+  const response = await apiFetch(`/api/personas/${encodeURIComponent(author)}/sessions`);
   if (!response.ok) {
     throw new Error(`Failed to load sessions: ${response.status}`);
   }
@@ -279,7 +472,7 @@ export async function fetchSessions(author: string): Promise<ChatSessionSummary[
 }
 
 export async function fetchSuggestions(author: string): Promise<string[]> {
-  const response = await fetch(`/api/personas/${encodeURIComponent(author)}/suggestions`);
+  const response = await apiFetch(`/api/personas/${encodeURIComponent(author)}/suggestions`);
   if (!response.ok) {
     throw new Error(`Failed to load suggestions: ${response.status}`);
   }
@@ -288,7 +481,7 @@ export async function fetchSuggestions(author: string): Promise<string[]> {
 }
 
 export async function fetchSession(author: string, sessionId: string): Promise<ChatSession> {
-  const response = await fetch(
+  const response = await apiFetch(
     `/api/personas/${encodeURIComponent(author)}/sessions/${encodeURIComponent(sessionId)}`
   );
   if (!response.ok) {
@@ -298,7 +491,7 @@ export async function fetchSession(author: string, sessionId: string): Promise<C
 }
 
 export async function deleteSession(author: string, sessionId: string): Promise<void> {
-  const response = await fetch(
+  const response = await apiFetch(
     `/api/personas/${encodeURIComponent(author)}/sessions/${encodeURIComponent(sessionId)}`,
     { method: 'DELETE' }
   );
@@ -308,7 +501,7 @@ export async function deleteSession(author: string, sessionId: string): Promise<
 }
 
 export async function fetchTrace(author: string, traceId: string): Promise<TracePayload> {
-  const response = await fetch(
+  const response = await apiFetch(
     `/api/personas/${encodeURIComponent(author)}/traces/${encodeURIComponent(traceId)}`
   );
   if (!response.ok) {
@@ -317,14 +510,32 @@ export async function fetchTrace(author: string, traceId: string): Promise<Trace
   return response.json();
 }
 
+export async function fetchTurn(turnId: string): Promise<TurnRun> {
+  const response = await apiFetch(`/api/chat/turns/${encodeURIComponent(turnId)}`);
+  if (!response.ok) {
+    throw new Error(await apiError(response, '无法读取生成任务'));
+  }
+  return response.json();
+}
+
+export async function retryTurn(turnId: string): Promise<TurnRun> {
+  const response = await apiFetch(`/api/chat/turns/${encodeURIComponent(turnId)}/retry`, {
+    method: 'POST'
+  });
+  if (!response.ok) {
+    throw new Error(await apiError(response, '无法重试生成任务'));
+  }
+  return response.json();
+}
+
 export async function streamChat(request: ChatStreamRequest, callbacks: ChatCallbacks): Promise<void> {
-  const response = await fetch('/api/chat/stream', {
+  const response = await apiFetch('/api/chat/stream', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(request)
   });
   if (!response.ok || !response.body) {
-    throw new Error(`Chat request failed: ${response.status}`);
+    throw new Error(await apiError(response, '无法创建回答任务'));
   }
 
   const reader = response.body.getReader();
@@ -358,6 +569,7 @@ function dispatchSse(raw: string, callbacks: ChatCallbacks): void {
     .join('\n');
   if (!event || !data) return;
   const payload = JSON.parse(data);
+  if (event === 'accepted') callbacks.onAccepted?.(payload);
   if (event === 'meta') callbacks.onMeta?.(payload);
   if (event === 'status') callbacks.onStatus?.({ stage: String(payload.stage || ''), label: String(payload.label || '') });
   if (event === 'token') callbacks.onToken?.(String(payload.text || ''));
@@ -372,4 +584,13 @@ async function apiError(response: Response, fallback: string): Promise<string> {
   } catch {
     return `${fallback}（${response.status}）`;
   }
+}
+
+async function apiFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
+  const response = await fetch(input, { ...init, credentials: 'include' });
+  const url = typeof input === 'string' ? input : input.toString();
+  if (response.status === 401 && !url.includes('/api/auth/')) {
+    window.dispatchEvent(new CustomEvent('pf-auth-expired'));
+  }
+  return response;
 }

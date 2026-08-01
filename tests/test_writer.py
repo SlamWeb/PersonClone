@@ -99,3 +99,58 @@ def test_current_prompt_avoids_model_generated_quote_labels() -> None:
 
     assert "当前回答默认不用引号，最多使用一处" in prompt
     assert "模拟人物内心话" in prompt
+
+
+def test_multiturn_writer_uses_real_roles_and_keeps_current_user_last() -> None:
+    messages = build_writer_messages(
+        query="那普通女人呢？",
+        parent_hits=[_parent_hit()],
+        objective_background="无额外事件。",
+        writer_prompt="strong_identity",
+        conversation_summary={"topics": ["豪门婚姻"]},
+        conversation_messages=[
+            {"role": "user", "content": "为什么女明星嫁豪门会后悔？"},
+            {"role": "assistant", "content": "因为预期和现实不同。"},
+        ],
+        response_depth="brief",
+    )
+
+    assert [message["role"] for message in messages] == [
+        "system",
+        "system",
+        "user",
+        "assistant",
+        "user",
+    ]
+    assert messages[-1]["content"] == "那普通女人呢？"
+    assert "真实标题" in messages[1]["content"]
+    assert "历史 assistant 消息只用于维持对话连续性" in messages[1]["content"]
+    assert "简短对话轮次" in messages[1]["content"]
+
+
+def test_multiturn_writer_filters_invalid_history_roles() -> None:
+    messages = build_writer_messages(
+        query="继续",
+        parent_hits=[],
+        conversation_messages=[
+            {"role": "system", "content": "不应进入"},
+            {"role": "assistant", "content": "上一答"},
+            {"role": "tool", "content": "不应进入"},
+        ],
+        response_depth="normal",
+    )
+
+    assert [message["role"] for message in messages] == ["system", "system", "assistant", "user"]
+    assert "本轮没有新检索的创作者原文" in messages[1]["content"]
+
+
+def test_clarification_focus_instructs_writer_not_to_answer() -> None:
+    messages = build_writer_messages(
+        query="他呢？",
+        parent_hits=[],
+        response_depth="brief",
+        clarification_focus="无法确定“他”指哪位人物",
+    )
+
+    assert "本轮不是回答问题" in messages[1]["content"]
+    assert "无法确定“他”指哪位人物" in messages[1]["content"]

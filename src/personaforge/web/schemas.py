@@ -7,6 +7,30 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
+class AuthUserInfo(BaseModel):
+    id: str
+    username: str
+    display_name: str
+    role: Literal["admin", "member"]
+
+
+class AuthStateResponse(BaseModel):
+    configured: bool
+    authenticated: bool
+    user: AuthUserInfo | None = None
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=256)
+
+
+class BootstrapRequest(BaseModel):
+    username: str = Field(min_length=2, max_length=32)
+    password: str = Field(min_length=8, max_length=256)
+    display_name: str | None = Field(default=None, max_length=80)
+
+
 class PersonaInfo(BaseModel):
     author: str
     source: str
@@ -35,10 +59,13 @@ class SessionSummary(BaseModel):
 
 
 class ChatMessage(BaseModel):
+    id: str | None = None
     role: Literal["user", "assistant", "error"]
     text: str
+    status: str = "completed"
     sources: list[dict] | None = None
     trace_id: str | None = None
+    turn_id: str | None = None
 
 
 class ChatSession(BaseModel):
@@ -118,3 +145,63 @@ class ChatStreamRequest(BaseModel):
     writer_prompt: Literal["current", "strong_identity", "persona_pack"] = "strong_identity"
     parent_top_k: int = Field(default=20, ge=1, le=40)
     trace_capture: Literal["summary", "full"] = "summary"
+
+
+class TurnRunResponse(BaseModel):
+    id: str
+    conversation_id: str
+    author: str
+    query: str
+    status: Literal["queued", "running", "completed", "failed", "interrupted"]
+    stage: str
+    label: str
+    partial_answer: str = ""
+    error: dict | None = None
+    planner: dict | None = None
+    response_depth: str | None = None
+    trace_id: str | None = None
+    created_at: str
+    updated_at: str
+    started_at: str | None = None
+    completed_at: str | None = None
+
+
+class UserMemoryInfo(BaseModel):
+    id: str
+    kind: str
+    memory_key: str
+    content: str
+    status: str
+    pinned: bool
+    sensitivity: str
+    importance: int
+    confidence: float
+    event_status: str
+    source_author: str | None = None
+    source_conversation_id: str | None = None
+    source_message_ids: list[str] = Field(default_factory=list)
+    evidence_quotes: list[str] = Field(default_factory=list)
+    supersedes_id: str | None = None
+    created_at: str
+    updated_at: str
+    last_accessed_at: str | None = None
+    access_count: int = 0
+
+
+class UserMemoriesResponse(BaseModel):
+    memories: list[UserMemoryInfo]
+
+
+class UserMemoryPatchRequest(BaseModel):
+    content: str | None = Field(default=None, min_length=1, max_length=1000)
+    pinned: bool | None = None
+
+
+class UserMemorySettingsResponse(BaseModel):
+    enabled: bool
+    auto_write: bool
+
+
+class UserMemorySettingsPatchRequest(BaseModel):
+    enabled: bool | None = None
+    auto_write: bool | None = None

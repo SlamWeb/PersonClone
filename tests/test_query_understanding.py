@@ -81,6 +81,32 @@ def test_background_transform_returns_fixed_four_routes() -> None:
     ]
 
 
+def test_background_transform_accepts_resolved_multiturn_question() -> None:
+    llm = FakeJsonClient(
+        [
+            {
+                "objective_background": "",
+                "retrieval_queries": [],
+            }
+        ]
+    )
+
+    result = build_background_and_retrieval_queries(
+        "那普通女人呢？",
+        resolved_query="普通女性嫁给有钱男人后为什么也可能觉得上当？",
+        search_results=[],
+        llm=llm,
+    )
+
+    assert all(
+        item.query == "普通女性嫁给有钱男人后为什么也可能觉得上当？"
+        for item in result.retrieval_queries
+    )
+    user_prompt = llm.messages[0][1]["content"]
+    assert "当前用户原话：那普通女人呢？" in user_prompt
+    assert "为检索补全后的独立问题" in user_prompt
+
+
 def test_background_transform_prompt_requires_resolved_meaning_in_retrieval() -> None:
     llm = FakeJsonClient(
         [

@@ -13,7 +13,7 @@ from time import perf_counter
 from typing import Any, Iterator
 from uuid import uuid4
 
-from personaforge.ingest.embeddings import BgeM3Encoder, TextEncoder
+from personaforge.ingest.embeddings import BgeM3Encoder, TextEncoder, prepare_bge_m3_runtime
 from personaforge.ingest.query_understanding import (
     GroundedQueryPlan,
     RetrievalQuery,
@@ -173,9 +173,24 @@ class PersonaChatService:
         self.conversations = conversation_store or ConversationStore(config.data_dir)
         self.user_memories = user_memory_store or UserMemoryStore(config.data_dir)
 
+    def prepare_encoder_runtime(self) -> None:
+        """Load native embedding dependencies before any app worker threads start."""
+
+        if self._encoder_warmup_state != "ready":
+            prepare_bge_m3_runtime()
+
     def start_encoder_warmup(self) -> bool:
         """Load the shared embedding model off the first user request."""
 
+        with self._encoder_lock:
+            if self._encoder_warmup_state == "ready":
+                return False
+            if self._encoder_warmup_thread is not None and self._encoder_warmup_thread.is_alive():
+                return False
+
+        # FlagEmbedding imports pyarrow through datasets. Importing that native
+        # stack for the first time in a worker thread can crash CPython on Windows.
+        self.prepare_encoder_runtime()
         with self._encoder_lock:
             if self._encoder_warmup_state == "ready":
                 return False
@@ -1026,6 +1041,10 @@ class PersonaChatService:
         owner_id: str | None = None,
     ) -> None:
         trace_ids = self.conversations.delete_conversation(author, session_id, owner_id=owner_id)
+        self.user_memories.delete_window_checkpoint(
+            owner_id or self.conversations.owner_id,
+            session_id,
+        )
         for trace_id in trace_ids:
             path = self.config.data_dir / "authors" / "zhihu" / author / "traces" / f"{trace_id}.json"
             try:
@@ -1066,8 +1085,13 @@ class PersonaChatService:
                 writer_prompt=prepared.writer_prompt,
                 parent_top_k=prepared.retrieve_result.parent_top_k or self.config.parent_top_k,
                 trace_capture=prepared.trace_capture,
+                owner_id=prepared.owner_id,
             )
-        return self.get_session(prepared.author, prepared.session_id)
+        return self.get_session(
+            prepared.author,
+            prepared.session_id,
+            owner_id=prepared.owner_id,
+        )
 
     def _conversation_exists(self, conversation_id: str) -> bool:
         try:
@@ -1344,6 +1368,7 @@ def _fallback_to_new_retrieval(plan: TurnPlan) -> TurnPlan:
         response_depth=plan.response_depth,
         clarification_focus=plan.clarification_focus,
         memory_ids=plan.memory_ids,
+        memory_write_policy=plan.memory_write_policy,
     )
 
 

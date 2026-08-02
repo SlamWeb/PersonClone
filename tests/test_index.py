@@ -111,3 +111,20 @@ def test_index_corpus_orchestrates_embedding_and_upload(tmp_path) -> None:
     manifest = json.loads((index_dir / "qdrant_manifest.json").read_text(encoding="utf-8"))
     assert manifest["collection_policy"] == "one collection per author"
 
+
+def test_index_manifest_uses_portable_path_for_qdrant_inside_index(tmp_path) -> None:
+    index_dir = tmp_path / "staging" / "index"
+    write_nodes(index_dir)
+
+    result = index_corpus(
+        index_dir,
+        author="alice",
+        encoder=FakeEncoder(),
+        client=object(),
+        recreate_collection_fn=lambda *_args: None,
+        make_point_fn=lambda node, _embedding: node,
+        upload_points_fn=lambda _client, _collection, points: len(points),
+    )
+
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["qdrant_path"] == "qdrant"

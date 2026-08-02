@@ -22,6 +22,7 @@ crawler = [
 ]
 index = [
   "FlagEmbedding>=1.2.10",
+  "pyarrow>=21,<24",
   "qdrant-client>=1.10",
 ]
 web = [
@@ -32,6 +33,7 @@ web = [
 all = [
   "playwright>=1.45",
   "FlagEmbedding>=1.2.10",
+  "pyarrow>=21,<24",
   "qdrant-client>=1.10",
   "fastapi>=0.115",
   "uvicorn[standard]>=0.30",

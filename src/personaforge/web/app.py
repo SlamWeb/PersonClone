@@ -82,9 +82,12 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        has_personas = bool(service.list_personas())
+        if has_personas:
+            service.prepare_encoder_runtime()
         job_manager.start()
         chat_manager.start()
-        if service.list_personas():
+        if has_personas:
             service.start_encoder_warmup()
         try:
             yield
@@ -632,5 +635,9 @@ def run_web(config: WebConfig) -> None:
     except ImportError as exc:  # pragma: no cover - missing optional dependency.
         raise RuntimeError('Web server requires optional dependencies: pip install -e ".[web]"') from exc
 
-    app = create_app(config)
+    service = PersonaChatService(config)
+    if service.list_personas():
+        print("Preparing BGE-M3 runtime before starting Web workers...", flush=True)
+        service.prepare_encoder_runtime()
+    app = create_app(config, service=service)
     uvicorn.run(app, host=config.host, port=config.port)

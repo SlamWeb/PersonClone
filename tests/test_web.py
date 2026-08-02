@@ -54,6 +54,7 @@ def test_encoder_warmup_loads_lazy_encoder_in_background(tmp_path, monkeypatch) 
         return encoder
 
     monkeypatch.setattr(web_service, "BgeM3Encoder", fake_encoder)
+    monkeypatch.setattr(web_service, "prepare_bge_m3_runtime", lambda: None)
     service = PersonaChatService(WebConfig(data_dir=tmp_path, embedding_device="cpu"))
 
     assert service.start_encoder_warmup() is True
@@ -126,6 +127,97 @@ def test_save_turn_creates_author_scoped_session(tmp_path) -> None:
     assert session["title"] == "问题？"
     assert [message["role"] for message in session["messages"]] == ["user", "assistant"]
     assert service.list_sessions("alice")[0]["message_count"] == 2
+
+
+def test_save_turn_returns_session_for_authenticated_owner(tmp_path) -> None:
+    service = PersonaChatService(WebConfig(data_dir=tmp_path))
+    turn = service.conversations.create_turn(
+        author="alice",
+        conversation_id=None,
+        query="问题？",
+        query_mode="raw",
+        writer_prompt="strong_identity",
+        parent_top_k=20,
+        trace_capture="summary",
+        owner_id="user-1",
+    )
+    service.conversations.claim_turn(turn.id)
+    prepared = PreparedChat(
+        session_id=turn.conversation_id,
+        author="alice",
+        query="问题？",
+        query_mode="raw",
+        writer_prompt="strong_identity",
+        objective_background="",
+        query_trace=None,
+        retrieve_result=RetrieveResult(
+            query="问题？",
+            collection_name="zhihu__alice",
+            child_top_k=100,
+            parent_top_k=20,
+            routes={},
+            parents=[],
+            retrieval_queries=[],
+        ),
+        messages=[],
+        trace_id="trace-1",
+        turn_id=turn.id,
+        owner_id="user-1",
+    )
+
+    session = service.save_turn(prepared, "回答", [])
+
+    assert session["id"] == turn.conversation_id
+    assert session["messages"][1]["text"] == "回答"
+    assert service.conversations.get_turn(turn.id).status == "completed"
+
+
+def test_completed_turn_cannot_be_downgraded_to_failed(tmp_path) -> None:
+    service = PersonaChatService(WebConfig(data_dir=tmp_path))
+    turn = service.conversations.save_completed_turn(
+        conversation_id="session-1",
+        author="alice",
+        query="问题？",
+        answer="完整回答",
+        sources=[],
+        trace_id="trace-1",
+        owner_id="user-1",
+    )
+
+    result = service.conversations.fail_turn(turn.id, {"message": "收尾失败"})
+    session = service.get_session("alice", "session-1", owner_id="user-1")
+
+    assert result.status == "completed"
+    assert session["messages"][1]["role"] == "assistant"
+    assert session["messages"][1]["text"] == "完整回答"
+
+
+def test_successful_retry_restores_failed_message_role(tmp_path) -> None:
+    service = PersonaChatService(WebConfig(data_dir=tmp_path))
+    turn = service.conversations.create_turn(
+        author="alice",
+        conversation_id=None,
+        query="问题？",
+        query_mode="raw",
+        writer_prompt="strong_identity",
+        parent_top_k=20,
+        trace_capture="summary",
+        owner_id="user-1",
+    )
+    service.conversations.claim_turn(turn.id)
+    service.conversations.fail_turn(turn.id, {"message": "第一次失败"})
+
+    service.conversations.complete_turn(
+        turn.id,
+        answer="重试后的完整回答",
+        sources=[],
+        trace_id="trace-2",
+    )
+    session = service.get_session("alice", turn.conversation_id, owner_id="user-1")
+
+    assert session["messages"][1]["role"] == "assistant"
+    assert session["messages"][1]["status"] == "completed"
+    assert session["messages"][1]["text"] == "重试后的完整回答"
 
 
 def test_trace_records_retrieval_without_copying_parent_full_text(tmp_path) -> None:

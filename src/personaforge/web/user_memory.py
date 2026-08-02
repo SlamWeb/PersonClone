@@ -353,6 +353,44 @@ class UserMemoryStore:
                 (utc_now_iso(), owner_id, *memory_ids),
             )
 
+    def window_checkpoint(self, owner_id: str, conversation_id: str) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT through_sequence FROM user_memory_checkpoints
+                   WHERE owner_id = ? AND conversation_id = ?""",
+                (owner_id, conversation_id),
+            ).fetchone()
+        return int(row["through_sequence"]) if row is not None else 0
+
+    def advance_window_checkpoint(
+        self,
+        owner_id: str,
+        conversation_id: str,
+        through_sequence: int,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO user_memory_checkpoints (
+                    owner_id, conversation_id, through_sequence, updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(owner_id, conversation_id) DO UPDATE SET
+                    through_sequence = MAX(
+                        user_memory_checkpoints.through_sequence,
+                        excluded.through_sequence
+                    ),
+                    updated_at = excluded.updated_at
+                """,
+                (owner_id, conversation_id, max(0, int(through_sequence)), utc_now_iso()),
+            )
+
+    def delete_window_checkpoint(self, owner_id: str, conversation_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM user_memory_checkpoints WHERE owner_id = ? AND conversation_id = ?",
+                (owner_id, conversation_id),
+            )
+
     def _initialize(self) -> None:
         with self._connect() as connection:
             connection.executescript(
@@ -394,6 +432,13 @@ class UserMemoryStore:
                     enabled INTEGER NOT NULL DEFAULT 1,
                     auto_write INTEGER NOT NULL DEFAULT 1,
                     updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS user_memory_checkpoints (
+                    owner_id TEXT NOT NULL,
+                    conversation_id TEXT NOT NULL,
+                    through_sequence INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(owner_id, conversation_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_user_memories_owner_status
                     ON user_memories(owner_id, status, pinned DESC, importance DESC);
@@ -479,12 +524,42 @@ def update_user_memories(
     user_turns: list[ConversationTurn],
     llm: JsonChatClient,
     related_memories: list[UserMemory] | None = None,
+    force_flush: bool = False,
+    window_size: int = 3,
 ) -> dict[str, Any]:
     started_at = time.perf_counter()
     settings = store.settings(owner_id)
     if not settings["enabled"] or not settings["auto_write"] or not user_turns:
         return {"status": "skipped", "duration_ms": 0, "operations": [], "rejections": []}
-    source_turns = user_turns[-3:]
+    window_size = max(1, int(window_size))
+    checkpoint = store.window_checkpoint(owner_id, conversation_id)
+    pending_turns = [turn for turn in user_turns if turn.sequence > checkpoint]
+    if not pending_turns:
+        return {
+            "status": "skipped",
+            "reason": "no_pending_turns",
+            "duration_ms": 0,
+            "pending_turns": 0,
+            "operations": [],
+            "rejections": [],
+        }
+    latest_query = pending_turns[-1].query.strip()
+    explicit_flush = any(
+        predicate(latest_query)
+        for predicate in (_is_explicit_remember, _is_explicit_forget, _is_explicit_correction)
+    )
+    if not force_flush and not explicit_flush and len(pending_turns) < window_size:
+        return {
+            "status": "deferred",
+            "reason": "window_not_full",
+            "duration_ms": round((time.perf_counter() - started_at) * 1000),
+            "pending_turns": len(pending_turns),
+            "window_size": window_size,
+            "operations": [],
+            "rejections": [],
+        }
+    source_turns = pending_turns[-window_size:]
+    through_sequence = max(turn.sequence for turn in source_turns)
     latest_query = source_turns[-1].query.strip()
     if _is_explicit_forget(latest_query) and related_memories:
         operations = []
@@ -493,12 +568,15 @@ def update_user_memories(
             operations.append(
                 {"operation": "forget", "memory_id": memory.id, "memory_key": memory.memory_key}
             )
+        store.advance_window_checkpoint(owner_id, conversation_id, through_sequence)
         return {
             "status": "completed",
             "duration_ms": round((time.perf_counter() - started_at) * 1000),
             "operations": operations,
             "rejections": [],
             "source_message_ids": [source_turns[-1].user_message_id],
+            "through_sequence": through_sequence,
+            "flush_reason": "explicit",
         }
     source_text = {turn.user_message_id: turn.query for turn in source_turns}
     source_context = "\n".join(source_text.values())
@@ -509,14 +587,37 @@ def update_user_memories(
         message_id: redact_sensitive_text(text, force_finance=force_finance_redaction)
         for message_id, text in source_text.items()
     }
-    existing = related_memories if related_memories is not None else store.list_active(owner_id)
+    context_messages: list[dict[str, str]] = []
+    for turn in source_turns:
+        context_messages.extend(
+            [
+                {
+                    "role": "user",
+                    "message_id": turn.user_message_id,
+                    "content": sanitized[turn.user_message_id],
+                },
+                {
+                    "role": "assistant",
+                    "message_id": turn.assistant_message_id,
+                    "content": redact_sensitive_text(
+                        turn.assistant_text,
+                        force_finance=force_finance_redaction,
+                    ),
+                },
+            ]
+        )
+    selected_existing = related_memories or []
 
     extraction = llm.complete_json(
         [
             {"role": "system", "content": MEMORY_EXTRACTOR_PROMPT},
             {
                 "role": "user",
-                "content": _memory_write_prompt(sanitized, existing),
+                "content": _memory_write_prompt(
+                    context_messages=context_messages,
+                    source_messages=sanitized,
+                    existing=selected_existing,
+                ),
             },
         ],
         temperature=0.0,
@@ -526,6 +627,31 @@ def update_user_memories(
     if not isinstance(candidates, list):
         candidates = []
     candidates = _canonicalize_extracted_candidates(candidates, sanitized)
+    if not candidates:
+        store.advance_window_checkpoint(owner_id, conversation_id, through_sequence)
+        return {
+            "status": "completed",
+            "duration_ms": round((time.perf_counter() - started_at) * 1000),
+            "pending_turns": len(source_turns),
+            "through_sequence": through_sequence,
+            "flush_reason": "explicit" if explicit_flush else "planner" if force_flush else "window_full",
+            "critic_skipped": True,
+            "operations": [],
+            "rejections": [],
+            "source_message_ids": list(sanitized),
+        }
+    candidate_keys = {
+        _normalize_key(str(candidate.get("memory_key") or "user.context"))
+        for candidate in candidates if isinstance(candidate, dict)
+    }
+    matching_existing = [
+        memory for memory in store.list_active(owner_id)
+        if memory.memory_key in candidate_keys
+    ]
+    existing_by_id = {
+        memory.id: memory for memory in [*selected_existing, *matching_existing]
+    }
+    existing = list(existing_by_id.values())
     critique = llm.complete_json(
         [
             {"role": "system", "content": MEMORY_CRITIC_PROMPT},
@@ -533,9 +659,15 @@ def update_user_memories(
                 "role": "user",
                 "content": json.dumps(
                     {
+                        "context_messages": context_messages,
                         "source_messages": sanitized,
                         "existing_memories": [
-                            {"id": memory.id, "memory_key": memory.memory_key, "content": memory.content}
+                            {
+                                "id": memory.id,
+                                "memory_key": memory.memory_key,
+                                "content": memory.content,
+                                "updated_at": memory.updated_at,
+                            }
                             for memory in existing
                         ],
                         "candidates": candidates,
@@ -565,6 +697,15 @@ def update_user_memories(
         supersedes_id = str(item.get("supersedes_id") or "").strip() or None
         if supersedes_id and supersedes_id not in {memory.id for memory in existing}:
             supersedes_id = None
+        if supersedes_id is None:
+            supersedes_id = next(
+                (
+                    memory.id for memory in existing
+                    if memory.memory_key == normalized["memory_key"]
+                ),
+                None,
+            )
+        revision_mode = str(item.get("revision_mode") or "extend").strip()
         pinned = bool(normalized.pop("pinned")) or _is_explicit_remember(latest_query)
         memory = store.save_revision(
             owner_id,
@@ -573,7 +714,9 @@ def update_user_memories(
             source_conversation_id=conversation_id,
             supersedes_id=supersedes_id,
             pinned=pinned,
-            preserve_previous=not _is_explicit_correction(latest_query),
+            preserve_previous=(
+                revision_mode != "replace" and not _is_explicit_correction(latest_query)
+            ),
         )
         operations.append(
             {
@@ -582,11 +725,17 @@ def update_user_memories(
                 "memory_key": memory.memory_key,
                 "kind": memory.kind,
                 "sensitivity": memory.sensitivity,
+                "revision_mode": revision_mode if memory.supersedes_id else "new",
             }
         )
+    store.advance_window_checkpoint(owner_id, conversation_id, through_sequence)
     return {
         "status": "completed",
         "duration_ms": round((time.perf_counter() - started_at) * 1000),
+        "pending_turns": len(source_turns),
+        "through_sequence": through_sequence,
+        "flush_reason": "explicit" if explicit_flush else "planner" if force_flush else "window_full",
+        "critic_skipped": False,
         "operations": operations,
         "rejections": rejections,
         "source_message_ids": list(sanitized),
@@ -671,7 +820,7 @@ def _validated_candidate(
         memory_key = f"family.{relation}.high_risk_finance"
         importance = 5
     else:
-        memory_key = str(item.get("memory_key") or "user.context").strip()
+        memory_key = _normalize_key(str(item.get("memory_key") or "user.context"))
         importance = max(1, min(5, int(_float(item.get("importance"), 3))))
     return {
         "kind": kind,
@@ -687,12 +836,24 @@ def _validated_candidate(
     }, ""
 
 
-def _memory_write_prompt(messages: dict[str, str], existing: list[UserMemory]) -> str:
+def _memory_write_prompt(
+    *,
+    context_messages: list[dict[str, str]],
+    source_messages: dict[str, str],
+    existing: list[UserMemory],
+) -> str:
     return json.dumps(
         {
-            "source_messages": messages,
+            "context_messages": context_messages,
+            "eligible_evidence_message_ids": list(source_messages),
+            "source_messages": source_messages,
             "existing_memories": [
-                {"id": memory.id, "memory_key": memory.memory_key, "content": memory.content}
+                {
+                    "id": memory.id,
+                    "memory_key": memory.memory_key,
+                    "content": memory.content,
+                    "updated_at": memory.updated_at,
+                }
                 for memory in existing
             ],
         },
@@ -836,7 +997,9 @@ def _sparse_dot(left: SparseEmbedding, right: SparseEmbedding) -> float:
 
 MEMORY_EXTRACTOR_PROMPT = """你是 PersonaForge 的用户长期记忆候选提取器。
 
-只从 source_messages 中的用户原话提取未来跨会话确实有帮助的信息。不要使用或推断助手回答。
+context_messages 包含完整的用户与助手对话，只用于理解代词、指代和用户在回应什么。
+只有 source_messages 和 eligible_evidence_message_ids 中的用户原话可以作为记忆事实依据。
+助手回答不能独立支持任何记忆，也不能因为助手提出了某个说法就推断用户认可。
 可提取 semantic（稳定事实/偏好）、episodic（仍可能延续的重要事件）、procedural（用户明确要求以后如何协作）。
 
 严格约束：
@@ -848,21 +1011,23 @@ MEMORY_EXTRACTOR_PROMPT = """你是 PersonaForge 的用户长期记忆候选提�
 - procedural 只有用户明确表达长期要求时才允许。
 
 只能输出 JSON：
-{"candidates":[{"kind":"semantic|episodic|procedural","memory_key":"稳定英文点号键","content":"第三人称中文事实","sensitivity":"normal|private|restricted","importance":1,"confidence":0.0,"event_status":"ongoing|historical|stable","source_message_ids":[],"evidence_quotes":[],"supersedes_id":null,"pinned":false}]}
+{"candidates":[{"kind":"semantic|episodic|procedural","memory_key":"稳定英文点号键","content":"第三人称中文事实","sensitivity":"normal|private|restricted","importance":1,"confidence":0.0,"event_status":"ongoing|historical|stable","source_message_ids":[],"context_message_ids":[],"evidence_quotes":[],"supersedes_id":null,"revision_mode":"new|extend|replace","pinned":false}]}
 没有值得长期保存的信息时输出 {"candidates":[]}。
 """
 
 
-MEMORY_CRITIC_PROMPT = """你是用户长期记忆的保守审查器。逐条核对候选是否被用户原话直接支持、主语是否正确、是否值得跨会话保存，以及是否与已有记忆重复或修订。
+MEMORY_CRITIC_PROMPT = """你是用户长期记忆的保守审查器。逐条核对候选是否被用户原话直接支持、主语是否正确、是否值得跨会话保存，以及是否与已有记忆重复或修订。context_messages 中的助手消息只能帮助消解指代，不能作为事实证据。
 
 特别拒绝：把疑问当信念；把亲友经历当用户经历；从助手建议推断用户接受；精确敏感财务数值；普通提问；低置信度推断。敏感事件应概括但保留关键人物关系与用户真正担忧。若是同一事实的新状态，填写已有 memory id 为 supersedes_id。
 同一人物、同一持续事件的多个候选应合并成一条完整但克制的 episodic 记忆，不要把
 “亏损事实、风险行为、用户担忧”机械拆成多条。最终内容不得恢复或保留金额、比例、
 余额、杠杆倍数等精确数值。只要批准，confidence 应表示经过本轮审查后的置信度。
-若多个候选具有相同 memory_key，只能输出一条合并后的记忆；若已有相同 key，合并
-已有内容与新证据，并将已有 id 写入 supersedes_id。不得把隐喻扩写成具体事实，例如
+若多个候选具有相同 memory_key，只能输出一条。若已有相同 key，将已有 id 写入
+supersedes_id：新证据与旧内容兼容时 revision_mode=extend；出现冲突、状态改变或用户纠正
+时 revision_mode=replace，内容必须以时间更近的用户证据为准，不能把矛盾的新旧事实并列。
+不得把隐喻扩写成具体事实，例如
 “没递拐杖”本身不能推出“没有提供资金支持”。
 
 只能输出 JSON：
-{"memories":[{"decision":"approve|reject","reason":"简短原因","kind":"semantic|episodic|procedural","memory_key":"...","content":"...","sensitivity":"normal|private|restricted","importance":1,"confidence":0.0,"event_status":"ongoing|historical|stable","source_message_ids":[],"evidence_quotes":[],"supersedes_id":null,"pinned":false}]}
+{"memories":[{"decision":"approve|reject","reason":"简短原因","kind":"semantic|episodic|procedural","memory_key":"...","content":"...","sensitivity":"normal|private|restricted","importance":1,"confidence":0.0,"event_status":"ongoing|historical|stable","source_message_ids":[],"context_message_ids":[],"evidence_quotes":[],"supersedes_id":null,"revision_mode":"new|extend|replace","pinned":false}]}
 """

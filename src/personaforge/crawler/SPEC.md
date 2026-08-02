@@ -172,8 +172,12 @@ data/authors/zhihu/<author>/staging/<job-id>/raw/
 - 接受知乎用户名或主页 URL。
 - 抓取全部可达的 answer、article 和 pin。
 - 先使用公开策略。
-- 如果公开策略没有获得内容，再读取服务端本地
+- 对 answer、article、pin 分别判断公开策略结果；某一类型为空时，不能因为另一类型
+  已经有结果而跳过 fallback。
+- 如果任一请求类型没有获得内容，再读取服务端本地
   `data/auth/zhihu_storage_state.json` 作为浏览器 fallback。
+- Playwright 自带 Chromium 未安装时，优先复用宿主机已有 Chrome，其次 Edge；都不可用
+  才提示运行 `playwright install chromium`。
 - Cookie 只存在于服务宿主机，不能由前端上传、读取或下载。
 - 抓取任务失败时不能破坏作者当前正式 `raw/`。
 

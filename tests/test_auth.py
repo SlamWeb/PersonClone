@@ -6,10 +6,12 @@ from personaforge.web.app import create_app
 from personaforge.web.auth import AuthStore
 from personaforge.web.conversations import ConversationStore
 from personaforge.web.service import WebConfig
+from personaforge.web.user_memory import UserMemoryStore
 
 
 def test_bootstrap_claims_existing_local_conversations(tmp_path) -> None:
     conversations = ConversationStore(tmp_path)
+    memories = UserMemoryStore(tmp_path)
     turn = conversations.save_completed_turn(
         conversation_id="legacy-conversation",
         author="alice",
@@ -18,6 +20,7 @@ def test_bootstrap_claims_existing_local_conversations(tmp_path) -> None:
         sources=[],
         trace_id=None,
     )
+    memories.advance_window_checkpoint("local-user", turn.conversation_id, 4)
     auth = AuthStore(tmp_path)
 
     user = auth.bootstrap_admin(username="owner", password="password-123")
@@ -28,6 +31,8 @@ def test_bootstrap_claims_existing_local_conversations(tmp_path) -> None:
         owner_id=user.id,
     )["title"] == "旧问题"
     assert conversations.list_conversations("alice", owner_id="local-user") == []
+    assert memories.window_checkpoint(user.id, turn.conversation_id) == 4
+    assert memories.window_checkpoint("local-user", turn.conversation_id) == 0
 
 
 def test_browser_session_bootstrap_login_and_logout(tmp_path) -> None:

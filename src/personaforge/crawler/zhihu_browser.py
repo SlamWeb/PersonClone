@@ -22,6 +22,7 @@ from personaforge.crawler.zhihu import (
     PIN_API,
     PIN_INCLUDE,
     PROFILE_API,
+    PROFILE_INCLUDE,
     ZH_DOMAIN,
     answer_payload_to_item,
     article_payload_to_item,
@@ -112,7 +113,7 @@ class ZhihuBrowserCrawler:
                 payload = self._api_get_json(
                     context,
                     PROFILE_API.format(token=token),
-                    params=None,
+                    params={"include": PROFILE_INCLUDE},
                     referer=f"{ZH_DOMAIN}/people/{token}",
                 )
                 return profile_payload_to_profile(payload, author_token=token)
@@ -134,6 +135,7 @@ class ZhihuBrowserCrawler:
         with self._playwright_context() as context:
             page = context.new_page()
             for kind in tuple(kinds):
+                kind_start_count = len(items)
                 remaining = None if max_items is None else max_items - len(items)
                 if remaining is not None and remaining <= 0:
                     break
@@ -148,7 +150,7 @@ class ZhihuBrowserCrawler:
                             items.append(item)
                             if max_items is not None and len(items) >= max_items:
                                 return items
-                        if remaining is None or len(items) > 0:
+                        if len(items) > kind_start_count:
                             continue
                     except CrawlError as exc:
                         errors.append(f"{kind} api: {exc}")
@@ -200,8 +202,13 @@ class ZhihuBrowserCrawler:
                     item = answer_payload_to_item(item_payload, author_token=token)
                 elif kind == "article":
                     if not item_payload.get("content") and item_payload.get("id"):
-                        detail = self._fetch_article_detail_api(context, str(item_payload["id"]))
-                        item_payload = {**item_payload, **detail}
+                        try:
+                            detail = self._fetch_article_detail_api(context, str(item_payload["id"]))
+                            item_payload = {**item_payload, **detail}
+                        except CrawlError:
+                            # The article list often contains enough content even
+                            # when the separate detail endpoint is rate-limited.
+                            pass
                     item = article_payload_to_item(item_payload, author_token=token)
                 elif kind == "pin":
                     item = pin_payload_to_item(item_payload, author_token=token)
@@ -395,12 +402,18 @@ class _PlaywrightContextManager:
 
     def __enter__(self) -> Any:
         self.playwright = self.sync_playwright().start()
-        self.browser = self.playwright.chromium.launch(headless=self.headless)
-        options: dict[str, Any] = {"viewport": {"width": 1920, "height": 1080}}
-        if self.storage_state:
-            options["storage_state"] = load_storage_state(self.storage_state)
-        self.context = self.browser.new_context(**options)
-        return self.context
+        try:
+            self.browser = launch_chromium(self.playwright, headless=self.headless)
+            options: dict[str, Any] = {"viewport": {"width": 1920, "height": 1080}}
+            if self.storage_state:
+                options["storage_state"] = load_storage_state(self.storage_state)
+            self.context = self.browser.new_context(**options)
+            return self.context
+        except Exception:
+            if self.browser is not None:
+                self.browser.close()
+            self.playwright.stop()
+            raise
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         if self.context is not None:
@@ -409,6 +422,26 @@ class _PlaywrightContextManager:
             self.browser.close()
         if self.playwright is not None:
             self.playwright.stop()
+
+
+def launch_chromium(playwright: Any, *, headless: bool) -> Any:
+    """Use Playwright Chromium, then installed Chrome/Edge when it is absent."""
+
+    try:
+        return playwright.chromium.launch(headless=headless)
+    except Exception as exc:
+        if "Executable doesn't exist" not in str(exc):
+            raise
+        errors = [str(exc)]
+        for channel in ("chrome", "msedge"):
+            try:
+                return playwright.chromium.launch(channel=channel, headless=headless)
+            except Exception as channel_exc:
+                errors.append(f"{channel}: {channel_exc}")
+        raise CrawlError(
+            "No usable Chromium browser was found. Install Chrome/Edge or run `playwright install chromium`. "
+            + " | ".join(errors[-2:])
+        ) from exc
 
 
 def save_zhihu_session(
@@ -425,7 +458,7 @@ def save_zhihu_session(
 
     storage_state.parent.mkdir(parents=True, exist_ok=True)
     playwright = sync_playwright().start()
-    browser = playwright.chromium.launch(headless=False)
+    browser = launch_chromium(playwright, headless=False)
     context = browser.new_context(viewport={"width": 1920, "height": 1080})
     try:
         page = context.new_page()

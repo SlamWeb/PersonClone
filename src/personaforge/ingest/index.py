@@ -72,7 +72,7 @@ def index_corpus(
     manifest = {
         "indexed_at": utc_now_iso(),
         "collection_name": collection_name,
-        "qdrant_path": str(qdrant_path),
+        "qdrant_path": _manifest_qdrant_path(index_dir, qdrant_path),
         "node_count": indexed_count,
         "dense_size": dense_size,
         "vectors": {
@@ -114,6 +114,14 @@ def index_result_to_dict(result: IndexResult) -> dict[str, object]:
     for key in ("index_dir", "qdrant_path", "manifest_path"):
         value[key] = str(value[key])
     return value
+
+
+def _manifest_qdrant_path(index_dir: Path, qdrant_path: Path) -> str:
+    """Keep the default local Qdrant path valid when an index directory moves."""
+    try:
+        return str(qdrant_path.resolve().relative_to(index_dir.resolve()))
+    except ValueError:
+        return str(qdrant_path)
 
 
 def _batched(items: list[dict[str, Any]], batch_size: int) -> list[list[dict[str, Any]]]:

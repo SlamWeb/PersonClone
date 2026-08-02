@@ -102,6 +102,11 @@ encoder。FastAPI 不等待模型加载即可先提供页面和 API，但首个�
 情况下约几十秒的模型冷启动成本。预热只改变加载时机，不改变 query transform、召回
 路线、排序或生成 prompt。
 
+Windows 下 `FlagEmbedding -> datasets -> pyarrow` 的首次原生依赖导入必须发生在
+Uvicorn 和应用 worker 启动之前，随后才允许后台加载模型权重。当前环境约束
+`pyarrow>=21,<24`；已验证 PyArrow 24 在本项目 Windows 进程中可能触发无法被 Python
+异常捕获的 access violation，表现为服务没有 shutdown 日志便直接退出。
+
 ### `GET /api/personas`
 
 扫描本地：
@@ -412,6 +417,10 @@ data/system/personaforge.sqlite3
 会话或刷新页面后任务仍继续；进程重启时，未完成任务标为 `interrupted`，允许
 在不重复插入 user message 的前提下重新生成。
 
+生成完成后的会话回读必须继续携带 `owner_id`，不能退回 `local-user`。一旦 Turn 和
+assistant 消息已经原子写为 `completed`，后续会话回读、Trace 或记忆维护失败均不得
+把该 Turn 降级为 `failed`，更不能用收尾错误覆盖已经保存的完整回答。
+
 ### SQLite 数据模型
 
 会话从作者目录下的 JSON 文件迁入现有数据库：
@@ -487,6 +496,8 @@ dense+sparse 双路召回和 RRF 融合。表结构包括：
   置信度、来源 message IDs、版本关系和软删除状态。
 - `user_memory_embeddings`：BGE-M3 dense 与 sparse 表征缓存。
 - `user_memory_settings`：每个用户的总开关和自动写入开关。
+- `user_memory_checkpoints`：每个用户、每个会话已经完成长期记忆审查的消息序号；只有
+  checkpoint 之后的新 Turn 会进入下一批窗口。
 
 读取链路仅在 `grounded` 模式启用：
 
@@ -501,24 +512,32 @@ dense+sparse 双路召回和 RRF 融合。表结构包括：
 冲突时当前消息优先。Query Transform 使用 Planner 完成必要指代消解后的问题，不把
 全部用户记忆直接拼进作者 RAG query。
 
-写入在回答保存完成后异步执行，不影响首 token 延迟：
+写入在回答保存完成后进入独立后台维护队列，不占用聊天 worker，不影响下一条回答，
+也不使用定时轮询。每个会话维护
+最多 3 个尚未审查的完整 Turn：未达到阈值时只返回 `deferred`，不调用记忆 LLM；累计
+3 Turn，或 Planner 判断当前消息明确值得长期记忆、用户主动要求记住/忘记/纠正时，
+立即刷新整个窗口。无新 Turn 时永远不会重复执行。
 
 ```text
-最近用户原话（不含 assistant）
+checkpoint 之后最多 3 个完整 user + assistant Turn
 -> 候选提取 LLM
--> 保守审查 LLM
+-> 无候选：推进 checkpoint，跳过 Critic
+-> 有候选：保守审查 LLM
 -> 确定性证据、主语、疑问、敏感信息和 schema 校验
--> append / supersede / reject
+-> create / extend / replace / reject
+-> 推进 checkpoint，窗口清零
 ```
 
 关键安全边界：
 
-- assistant 和创作者生成内容永远不是用户记忆来源。
+- assistant 和创作者生成内容可以作为代词与对话动作的 `context_messages`，但永远不能
+  出现在可信证据白名单中，也不能独立支持一条用户记忆；最终证据只能引用 user message。
 - 疑问、假设和担忧不得提升为用户信念；担忧本身可以作为 episodic 事件保存。
 - 必须区分用户与哥哥、朋友等第三方，不得把第三方经历归到用户本人。
 - API key、密码、Cookie、token 永不进入候选；第三方财务事件只存必要概括，不保存
   金额、比例、余额和杠杆倍数。
-- 自动修订以新版本 supersede 旧版本，保留审计链；人工纠正直接替换语义，避免旧错误
+- 自动修订以新版本 supersede 旧版本，保留审计链；兼容的新证据使用 `extend`，发生
+  冲突、状态变化或用户纠正时使用 `replace`，以时间更近的用户证据为准，避免旧错误
   被拼回新版本。
 - 删除单个会话不会自动删除已经独立形成的长期记忆；用户可在“我的记忆”中纠正、
   置顶、遗忘或全部清空。遗忘是软删除，后续召回只读取 active 状态。
@@ -561,7 +580,8 @@ BGE-M3 向量缓存在 SQLite，不为会话记忆新增 Qdrant collection。
 或尚未摘要的历史超过约 8000 tokens
 ```
 
-以后每新增 3 个完整 Turn 再更新一次。摘要使用 DeepSeek V4 Flash、
+摘要只覆盖最近 3 个完整 Turn 以前的内容，不把仍会以原文进入 Writer 的三轮重复压入
+摘要。以后每累计 3 个可摘要的旧 Turn 再更新一次。摘要使用 DeepSeek V4 Flash、
 `temperature=0` 和结构化 JSON，至少包含：
 
 ```json
@@ -593,7 +613,9 @@ Planner 只能看对话上下文和当前输入，不能看 Persona Pack、作�
   "needs_web": false,
   "search_queries": [],
   "response_depth": "brief|normal|deep",
-  "clarification_focus": ""
+  "clarification_focus": "",
+  "memory_ids": [],
+  "memory_write_policy": "defer|flush"
 }
 ```
 
@@ -608,6 +630,8 @@ Planner 只能看对话上下文和当前输入，不能看 Persona Pack、作�
 - `follow_up` 表示同一主题中的新内容问题，包括新的判断、建议、原因和解决办法，
   必须使用 `new`；话题连续不等于材料仍然适用。
 - `reuse` 仅用于解释、展开或论证已有 assistant 回答中的明确内容。
+- `memory_write_policy` 默认 `defer`；只有明确的记忆操作，或当前消息披露了未来跨会话
+  仍有价值的稳定偏好、个人事实和持续事件时才为 `flush`。普通问题不会触发提前写入。
 - 压缩、改写、翻译、字数或格式纠错只需要已有对话，使用 `none`；闲聊也使用
   `none`。
 

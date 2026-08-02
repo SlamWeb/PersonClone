@@ -16,10 +16,12 @@ from personaforge.web.user_memory import UserMemory
 TurnType = Literal["new_topic", "follow_up", "explain_previous", "casual", "unclear"]
 RetrievalPolicy = Literal["new", "reuse", "none"]
 ResponseDepth = Literal["brief", "normal", "deep"]
+MemoryWritePolicy = Literal["defer", "flush"]
 
 TURN_TYPES = {"new_topic", "follow_up", "explain_previous", "casual", "unclear"}
 RETRIEVAL_POLICIES = {"new", "reuse", "none"}
 RESPONSE_DEPTHS = {"brief", "normal", "deep"}
+MEMORY_WRITE_POLICIES = {"defer", "flush"}
 SUMMARY_FIELDS = (
     "topics",
     "entities",
@@ -40,6 +42,7 @@ class TurnPlan:
     response_depth: ResponseDepth = "normal"
     clarification_focus: str = ""
     memory_ids: list[str] = field(default_factory=list)
+    memory_write_policy: MemoryWritePolicy = "defer"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -128,6 +131,7 @@ def raw_turn_plan(query: str) -> TurnPlan:
         response_depth="normal",
         clarification_focus="",
         memory_ids=[],
+        memory_write_policy=_explicit_memory_write_policy(query),
     )
 
 
@@ -153,6 +157,9 @@ def parse_turn_plan(
     needs_web = bool(payload.get("needs_web"))
     search_queries = _string_list(payload.get("search_queries"))[:3]
     clarification_focus = str(payload.get("clarification_focus") or "").strip()
+    memory_write_policy = str(payload.get("memory_write_policy") or "defer").strip()
+    if memory_write_policy not in MEMORY_WRITE_POLICIES:
+        memory_write_policy = "defer"
     memory_ids = [
         memory_id
         for memory_id in _string_list(payload.get("memory_ids"))
@@ -200,6 +207,7 @@ def parse_turn_plan(
         response_depth=response_depth,  # type: ignore[arg-type]
         clarification_focus=clarification_focus,
         memory_ids=memory_ids,
+        memory_write_policy=memory_write_policy,  # type: ignore[arg-type]
     )
 
 
@@ -285,7 +293,7 @@ def should_update_summary(
     turns: list[ConversationTurn],
     summary_state: dict[str, Any],
     *,
-    short_history_turns: int = 6,
+    short_history_turns: int = 3,
     token_threshold: int = 8000,
     update_every_turns: int = 3,
 ) -> bool:
@@ -293,7 +301,10 @@ def should_update_summary(
         return False
     through_sequence = int(summary_state.get("through_sequence") or 0)
     version = int(summary_state.get("version") or 0)
-    unsummarized = [turn for turn in turns if turn.sequence > through_sequence]
+    eligible = turns[:-short_history_turns] if len(turns) > short_history_turns else []
+    unsummarized = [turn for turn in eligible if turn.sequence > through_sequence]
+    if not unsummarized:
+        return False
     if version > 0:
         return len(unsummarized) >= update_every_turns
     estimated_tokens = int(
@@ -301,7 +312,7 @@ def should_update_summary(
             "estimated_tokens", 0
         )
     )
-    return len(turns) > short_history_turns or estimated_tokens >= token_threshold
+    return len(unsummarized) >= update_every_turns or estimated_tokens >= token_threshold
 
 
 def update_conversation_summary(
@@ -315,7 +326,10 @@ def update_conversation_summary(
     if not should_update_summary(turns, summary_state):
         return None
     through_sequence = int(summary_state.get("through_sequence") or 0)
-    unsummarized = [turn for turn in turns if turn.sequence > through_sequence]
+    eligible = turns[:-3] if len(turns) > 3 else []
+    unsummarized = [turn for turn in eligible if turn.sequence > through_sequence]
+    if not unsummarized:
+        return None
     payload = llm.complete_json(
         [
             {"role": "system", "content": CONVERSATION_SUMMARY_SYSTEM_PROMPT},
@@ -331,7 +345,7 @@ def update_conversation_summary(
         max_tokens=1200,
     )
     summary = normalize_summary(payload)
-    latest_sequence = max(turn.sequence for turn in turns)
+    latest_sequence = max(turn.sequence for turn in unsummarized)
     return store.save_summary(
         conversation_id,
         summary,
@@ -472,6 +486,15 @@ def _string_list(value: object) -> list[str]:
     return [str(item).strip() for item in value if str(item).strip()]
 
 
+def _explicit_memory_write_policy(query: str) -> MemoryWritePolicy:
+    compact = "".join(query.split())
+    markers = (
+        "请记住", "帮我记住", "以后记得", "忘掉这件事", "忘记这件事",
+        "不要记住这个", "删除这条记忆", "刚才记错了", "纠正一下",
+    )
+    return "flush" if any(marker in compact for marker in markers) else "defer"
+
+
 TURN_PLANNER_SYSTEM_PROMPT = """你是 PersonaForge 的 Conversation-aware Turn Planner。
 
 你只负责理解当前用户在延续什么话题、把残缺追问补成可独立检索的问题，并决定
@@ -487,7 +510,8 @@ TURN_PLANNER_SYSTEM_PROMPT = """你是 PersonaForge 的 Conversation-aware Turn 
   "search_queries": [],
   "response_depth": "brief|normal|deep",
   "clarification_focus": "",
-  "memory_ids": []
+  "memory_ids": [],
+  "memory_write_policy": "defer|flush"
 }
 
 分类和路由规则：
@@ -509,6 +533,9 @@ TURN_PLANNER_SYSTEM_PROMPT = """你是 PersonaForge 的 Conversation-aware Turn 
 - 历史 assistant 的说法只是对话上下文，不是作者真实观点或可靠外部事实。
 - memory_ids 最多选择 4 个候选 id。它们只用于理解用户本人和延续跨会话上下文；
   不相关时必须返回空数组，不能把用户记忆当作作者观点或外部事实。
+- memory_write_policy 默认 defer。只有用户明确要求记住、忘记或纠正长期记忆，或者
+  当前消息明确披露了未来跨会话仍有帮助的稳定偏好、个人事实或持续事件时才使用 flush。
+  普通知识问题、假设、一次性要求、闲聊和仅由助手提出的信息必须 defer。
 
 典型边界：
 - 前文讨论婚姻博弈，用户问“那当代年轻人有必要结婚吗”：

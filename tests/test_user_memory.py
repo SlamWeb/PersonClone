@@ -30,12 +30,20 @@ class FakeEncoder:
 class FakeLlm:
     def __init__(self, payloads: list[dict]) -> None:
         self.payloads = list(payloads)
+        self.calls = []
 
     def complete_json(self, messages, *, temperature, max_tokens):
+        self.calls.append(messages)
         return self.payloads.pop(0)
 
 
-def make_turn(message_id: str, query: str, sequence: int = 1) -> ConversationTurn:
+def make_turn(
+    message_id: str,
+    query: str,
+    sequence: int = 1,
+    *,
+    assistant_text: str = "irrelevant generated answer",
+) -> ConversationTurn:
     return ConversationTurn(
         id=f"turn-{sequence}",
         conversation_id="conversation-1",
@@ -43,7 +51,7 @@ def make_turn(message_id: str, query: str, sequence: int = 1) -> ConversationTur
         user_message_id=message_id,
         assistant_message_id=f"assistant-{sequence}",
         query=query,
-        assistant_text="irrelevant generated answer",
+        assistant_text=assistant_text,
         assistant_status="completed",
         trace_id=None,
         parent_ids=[],
@@ -168,6 +176,7 @@ def test_two_stage_write_rejects_question_promoted_to_belief(tmp_path: Path) -> 
         conversation_id="conversation-1",
         user_turns=[turn],
         llm=llm,
+        force_flush=True,
     )
 
     assert store.list_active("owner-1") == []
@@ -202,6 +211,7 @@ def test_two_stage_write_generalizes_third_party_finance(tmp_path: Path) -> None
         conversation_id="conversation-1",
         user_turns=[turn],
         llm=llm,
+        force_flush=True,
     )
 
     memories = store.list_active("owner-1")
@@ -211,6 +221,89 @@ def test_two_stage_write_generalizes_third_party_finance(tmp_path: Path) -> None
     assert "20" not in memories[0].content
     assert result["operations"][0]["operation"] == "create"
     assert "20w" not in redact_sensitive_text(query)
+
+
+def test_memory_window_defers_until_three_turns_and_advances_checkpoint(tmp_path: Path) -> None:
+    store = UserMemoryStore(tmp_path)
+    turns = [make_turn(f"message-{index}", f"普通问题{index}", index) for index in range(1, 4)]
+    llm = FakeLlm([{"candidates": []}])
+
+    first = update_user_memories(
+        store, "owner-1", author="author-1", conversation_id="conversation-1",
+        user_turns=turns[:1], llm=llm,
+    )
+    second = update_user_memories(
+        store, "owner-1", author="author-1", conversation_id="conversation-1",
+        user_turns=turns[:2], llm=llm,
+    )
+    third = update_user_memories(
+        store, "owner-1", author="author-1", conversation_id="conversation-1",
+        user_turns=turns, llm=llm,
+    )
+
+    assert first["status"] == second["status"] == "deferred"
+    assert len(llm.calls) == 1
+    assert third["status"] == "completed"
+    assert third["critic_skipped"] is True
+    assert store.window_checkpoint("owner-1", "conversation-1") == 3
+    repeated = update_user_memories(
+        store, "owner-1", author="author-1", conversation_id="conversation-1",
+        user_turns=turns, llm=llm,
+    )
+    assert repeated["reason"] == "no_pending_turns"
+    assert len(llm.calls) == 1
+
+
+def test_assistant_messages_are_context_but_never_eligible_evidence(tmp_path: Path) -> None:
+    store = UserMemoryStore(tmp_path)
+    llm = FakeLlm([{"candidates": []}])
+    turn = make_turn(
+        "message-1",
+        "对，他又开始了。",
+        assistant_text="你是说你哥哥又开始高风险交易了吗？",
+    )
+
+    update_user_memories(
+        store, "owner-1", author="author-1", conversation_id="conversation-1",
+        user_turns=[turn], llm=llm, force_flush=True,
+    )
+
+    prompt = llm.calls[0][1]["content"]
+    assert "你哥哥又开始高风险交易" in prompt
+    assert '"eligible_evidence_message_ids": [\n    "message-1"' in prompt
+    assert "assistant-1" not in prompt.split('"eligible_evidence_message_ids"', 1)[1].split("]", 1)[0]
+
+
+def test_newer_conflicting_memory_replaces_older_content(tmp_path: Path) -> None:
+    store = UserMemoryStore(tmp_path)
+    old = store.save_revision(
+        "owner-1", kind="semantic", memory_key="user.preference.answer_length",
+        content="用户喜欢详细回答。", sensitivity="normal", importance=3,
+        confidence=0.95, event_status="stable", source_author="author-1",
+        source_conversation_id="conversation-0", source_message_ids=["old-message"],
+        evidence_quotes=["详细回答"],
+    )
+    replacement = {
+        "decision": "approve", "reason": "用户更新了偏好", "kind": "semantic",
+        "memory_key": "user.preference.answer_length", "content": "用户现在喜欢简短回答。",
+        "sensitivity": "normal", "importance": 3, "confidence": 0.98,
+        "event_status": "stable", "source_message_ids": ["message-1"],
+        "evidence_quotes": ["现在喜欢简短回答"], "supersedes_id": old.id,
+        "revision_mode": "replace", "pinned": False,
+    }
+    llm = FakeLlm([{"candidates": [replacement]}, {"memories": [replacement]}])
+
+    result = update_user_memories(
+        store, "owner-1", author="author-1", conversation_id="conversation-1",
+        user_turns=[make_turn("message-1", "我现在喜欢简短回答。")],
+        llm=llm, force_flush=True, related_memories=[old],
+    )
+
+    active = store.list_active("owner-1")
+    assert len(active) == 1
+    assert active[0].content == "用户现在喜欢简短回答。"
+    assert active[0].supersedes_id == old.id
+    assert result["operations"][0]["revision_mode"] == "replace"
 
 
 def test_explicit_forget_soft_deletes_selected_memory_without_llm(tmp_path: Path) -> None:

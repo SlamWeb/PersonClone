@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import getpass
 from pathlib import Path
 from typing import Iterable
@@ -438,7 +439,17 @@ def _run_crawl(args: argparse.Namespace) -> int:
 
     profile: CreatorProfile | None = None
     items: list[ContentItem] = []
+    seen: set[tuple[str, str]] = set()
     errors: list[str] = []
+    missing_kinds: list[str] = []
+
+    def add_items(found: list[ContentItem]) -> None:
+        for item in found:
+            key = (item.kind, item.id)
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(item)
 
     if not args.no_api:
         public = ZhihuPublicCrawler(
@@ -450,12 +461,22 @@ def _run_crawl(args: argparse.Namespace) -> int:
             profile = public.crawl_profile(token)
         except CrawlError as exc:
             errors.append(f"public profile: {exc}")
-        try:
-            items.extend(public.crawl_user(token, kinds=_content_kinds(kinds), max_items=max_items))
-        except CrawlError as exc:
-            errors.append(f"public crawl: {exc}")
+        for kind in _content_kinds(kinds):
+            remaining = None if max_items is None else max_items - len(items)
+            if remaining is not None and remaining <= 0:
+                break
+            try:
+                found = public.crawl_user(token, kinds=(kind,), max_items=remaining)
+            except CrawlError as exc:
+                errors.append(f"public {kind}: {exc}")
+                found = []
+            add_items(found)
+            if not found:
+                missing_kinds.append(kind)
+    else:
+        missing_kinds.extend(_content_kinds(kinds))
 
-    if not items and not args.no_browser:
+    if missing_kinds and not args.no_browser and (max_items is None or len(items) < max_items):
         browser = ZhihuBrowserCrawler(
             headless=not args.headed,
             storage_state=args.storage_state,
@@ -468,10 +489,14 @@ def _run_crawl(args: argparse.Namespace) -> int:
             profile = profile or browser.crawl_profile(token)
         except CrawlError as exc:
             errors.append(f"browser profile: {exc}")
-        try:
-            items.extend(browser.crawl_user(token, kinds=_content_kinds(kinds), max_items=max_items))
-        except CrawlError as exc:
-            errors.append(f"browser crawl: {exc}")
+        for kind in missing_kinds:
+            remaining = None if max_items is None else max_items - len(items)
+            if remaining is not None and remaining <= 0:
+                break
+            try:
+                add_items(browser.crawl_user(token, kinds=(kind,), max_items=remaining))
+            except (CrawlError, RuntimeError) as exc:
+                errors.append(f"browser {kind}: {exc}")
 
     if not items:
         print("No items were crawled.")
@@ -492,7 +517,9 @@ def _run_crawl(args: argparse.Namespace) -> int:
     write_profile(profile, out_dir)
     paths = write_markdown_corpus(items, out_dir)
 
-    print(f"Saved {len(paths)} item(s) to {out_dir}")
+    kind_counts = Counter(item.kind for item in items)
+    count_detail = ", ".join(f"{kind}={kind_counts.get(kind, 0)}" for kind in kinds)
+    print(f"Saved {len(paths)} item(s) ({count_detail}) to {out_dir}")
     print(f"Profile: {out_dir / 'profile.json'}")
     print(f"Manifest: {out_dir / 'manifest.jsonl'}")
     return 0

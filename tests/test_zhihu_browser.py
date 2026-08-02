@@ -6,6 +6,7 @@ from personaforge.crawler.zhihu_browser import (
     content_id_from_url,
     has_zhihu_login_cookie,
     link_matches_kind,
+    launch_chromium,
     load_storage_state,
     normalize_zhihu_link,
     question_id_from_answer_url,
@@ -56,3 +57,23 @@ def test_browser_selectors_cover_answer_article_and_pin() -> None:
     assert ".RichContent-inner" in content_selectors_for_kind("answer")
     assert ".Post-RichText" in content_selectors_for_kind("article")
     assert ".PinItem-content" in content_selectors_for_kind("pin")
+
+
+def test_launch_chromium_uses_installed_chrome_when_bundled_browser_is_missing() -> None:
+    launched: list[dict[str, object]] = []
+    expected = object()
+
+    class Chromium:
+        def launch(self, **kwargs):
+            launched.append(kwargs)
+            if "channel" not in kwargs:
+                raise RuntimeError("Executable doesn't exist")
+            if kwargs["channel"] == "chrome":
+                return expected
+            raise AssertionError("Edge should not be needed")
+
+    class Playwright:
+        chromium = Chromium()
+
+    assert launch_chromium(Playwright(), headless=True) is expected
+    assert launched == [{"headless": True}, {"channel": "chrome", "headless": True}]

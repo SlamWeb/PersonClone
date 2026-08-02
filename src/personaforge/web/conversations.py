@@ -478,7 +478,8 @@ class ConversationStore:
             connection.execute(
                 """
                 UPDATE messages
-                SET text = ?, status = 'completed', sources_json = ?, trace_id = ?, updated_at = ?
+                SET role = 'assistant', text = ?, status = 'completed',
+                    sources_json = ?, trace_id = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -508,11 +509,13 @@ class ConversationStore:
         error_json = json.dumps(error, ensure_ascii=False)
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT assistant_message_id, selected_attempt_id FROM turn_runs WHERE id = ?",
+                "SELECT status, assistant_message_id, selected_attempt_id FROM turn_runs WHERE id = ?",
                 (turn_id,),
             ).fetchone()
             if row is None:
                 raise KeyError(turn_id)
+            if str(row["status"]) == "completed":
+                return self.get_turn(turn_id)
             connection.execute(
                 """
                 UPDATE turn_runs

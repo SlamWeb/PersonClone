@@ -298,6 +298,8 @@ zhihu:answer:123:passage:0
 - `index_corpus(index_dir, author=...)`：读取 nodes，调用 BGE-M3 编码，创建每作者 collection，写入 Qdrant，并输出 `qdrant_manifest.json`。
 - `IndexResult`：记录 collection 名、节点数、dense 维度、Qdrant 本地路径和 manifest 路径。
 
+默认 Qdrant 位于 `index/qdrant/` 时，manifest 中使用相对路径 `qdrant`。这样网页后台任务先在 staging 建库、再原子切换到正式作者目录后，清单不会残留 staging 的绝对路径。显式指定 index 目录外的 Qdrant 路径时才保留调用方传入的路径。
+
 单元测试通过 fake encoder 和 fake client 验证编排逻辑，不要求 CI 下载 BGE-M3 或启动真实 Qdrant。
 
 ### `cli.py`

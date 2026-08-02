@@ -37,8 +37,10 @@ class ChatTaskManager:
         self.token_flush_characters = max(1, token_flush_characters)
         self.token_flush_seconds = max(0.01, token_flush_seconds)
         self._queue: queue.Queue[str | None] = queue.Queue()
+        self._maintenance_queue: queue.Queue[tuple[PreparedChat, str] | None] = queue.Queue()
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
+        self._maintenance_thread: threading.Thread | None = None
         self._queued_ids: set[str] = set()
         self._queued_lock = threading.Lock()
 
@@ -46,6 +48,12 @@ class ChatTaskManager:
         if self._threads:
             return
         self._stop.clear()
+        self._maintenance_thread = threading.Thread(
+            target=self._maintenance_loop,
+            name="personaforge-memory-maintenance",
+            daemon=True,
+        )
+        self._maintenance_thread.start()
         for index in range(self.worker_count):
             thread = threading.Thread(
                 target=self._worker_loop,
@@ -64,6 +72,10 @@ class ChatTaskManager:
         for thread in self._threads:
             thread.join(timeout=5)
         self._threads.clear()
+        self._maintenance_queue.put(None)
+        if self._maintenance_thread is not None:
+            self._maintenance_thread.join(timeout=5)
+            self._maintenance_thread = None
 
     def create_turn(
         self,
@@ -107,6 +119,7 @@ class ChatTaskManager:
         if not queued:
             return False
         self._run_turn(queued[0].id)
+        self._run_maintenance_once()
         return True
 
     def _worker_loop(self) -> None:
@@ -123,6 +136,32 @@ class ChatTaskManager:
                 with self._queued_lock:
                     self._queued_ids.discard(turn_id)
                 self._queue.task_done()
+
+    def _maintenance_loop(self) -> None:
+        while True:
+            try:
+                item = self._maintenance_queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if item is None:
+                return
+            try:
+                self._update_memory_after_done(*item)
+            finally:
+                self._maintenance_queue.task_done()
+
+    def _run_maintenance_once(self) -> bool:
+        try:
+            item = self._maintenance_queue.get_nowait()
+        except queue.Empty:
+            return False
+        if item is None:
+            return False
+        try:
+            self._update_memory_after_done(*item)
+        finally:
+            self._maintenance_queue.task_done()
+        return True
 
     def _run_turn(self, turn_id: str) -> None:
         if not self.store.claim_turn(turn_id):
@@ -198,7 +237,7 @@ class ChatTaskManager:
                     "sources": sources,
                 },
             )
-            self._update_memory_after_done(prepared, answer)
+            self._maintenance_queue.put((prepared, answer))
         except Exception as exc:
             error = trace_error(exc)
             if prepared is not None:
@@ -253,14 +292,18 @@ class ChatTaskManager:
                     prepared.owner_id,
                     author=prepared.author,
                     conversation_id=prepared.session_id,
-                user_turns=self.store.get_completed_turns(prepared.session_id),
-                llm=self.service.llm_client(),
-                related_memories=[
-                    memory
-                    for memory in (prepared.recalled_memories or [])
-                    if memory.id in set(prepared.selected_memory_ids or [])
-                ],
-            )
+                    user_turns=self.store.get_completed_turns(prepared.session_id),
+                    llm=self.service.llm_client(),
+                    related_memories=[
+                        memory
+                        for memory in (prepared.recalled_memories or [])
+                        if memory.id in set(prepared.selected_memory_ids or [])
+                    ],
+                    force_flush=bool(
+                        prepared.turn_plan
+                        and prepared.turn_plan.get("memory_write_policy") == "flush"
+                    ),
+                )
             except Exception as exc:
                 user_memory_payload = {
                     "status": "failed",

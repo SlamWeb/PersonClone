@@ -108,6 +108,22 @@ def test_turn_planner_can_select_only_available_memory_ids(tmp_path) -> None:
     assert plan.memory_ids == [memory.id]
 
 
+def test_turn_planner_can_request_early_memory_flush() -> None:
+    plan = parse_turn_plan(
+        {
+            "turn_type": "casual",
+            "resolved_question": "请记住我以后喜欢先看结论",
+            "retrieval_policy": "none",
+            "needs_web": False,
+            "memory_write_policy": "flush",
+        },
+        query="请记住我以后喜欢先看结论",
+        available_turn_ids=set(),
+    )
+
+    assert plan.memory_write_policy == "flush"
+
+
 def test_turn_plan_enforces_web_and_invalid_reuse_invariants() -> None:
     web = parse_turn_plan(
         {
@@ -254,7 +270,7 @@ def test_new_topic_does_not_feed_old_dialogue_to_writer(tmp_path) -> None:
     assert context.summary == {}
 
 
-def test_summary_updates_after_more_than_six_turns(tmp_path) -> None:
+def test_summary_updates_only_turns_older_than_recent_three(tmp_path) -> None:
     store = ConversationStore(tmp_path)
     for index in range(7):
         complete_turn(store, "s1", f"问题{index}", f"回答{index}")
@@ -278,6 +294,7 @@ def test_summary_updates_after_more_than_six_turns(tmp_path) -> None:
     assert updated is not None
     assert updated["version"] == 1
     assert updated["summary"]["topics"] == ["婚恋"]
+    assert updated["through_sequence"] == turns[-4].sequence
     assert should_update_summary(turns, updated) is False
 
 

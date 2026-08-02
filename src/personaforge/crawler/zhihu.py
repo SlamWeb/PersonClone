@@ -18,6 +18,7 @@ from personaforge.crawler.models import ContentItem, ContentKind, CreatorProfile
 
 ZH_DOMAIN = "https://www.zhihu.com"
 PROFILE_API = f"{ZH_DOMAIN}/api/v4/members/{{token}}"
+PROFILE_INCLUDE = "answer_count,articles_count,pins_count"
 ANSWER_API = f"{ZH_DOMAIN}/api/v4/members/{{token}}/answers"
 ARTICLE_API = f"{ZH_DOMAIN}/api/v4/members/{{token}}/articles"
 ARTICLE_DETAIL_API = f"{ZH_DOMAIN}/api/v4/articles/{{article_id}}"
@@ -225,6 +226,9 @@ def profile_payload_to_profile(
                 "gender": payload.get("gender"),
                 "url": payload.get("url"),
                 "avatar_url_template": payload.get("avatar_url_template"),
+                "answer_count": payload.get("answer_count"),
+                "articles_count": payload.get("articles_count"),
+                "pins_count": payload.get("pins_count"),
             }
         ),
     )
@@ -340,7 +344,11 @@ class ZhihuPublicCrawler:
 
     def crawl_profile(self, user: str) -> CreatorProfile:
         token = parse_user_token(user)
-        payload = self._get_json(PROFILE_API.format(token=token), referer=f"{ZH_DOMAIN}/people/{token}")
+        payload = self._get_json(
+            PROFILE_API.format(token=token),
+            params={"include": PROFILE_INCLUDE},
+            referer=f"{ZH_DOMAIN}/people/{token}",
+        )
         return profile_payload_to_profile(payload, author_token=token)
 
     def crawl_user(

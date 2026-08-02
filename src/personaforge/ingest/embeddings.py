@@ -6,6 +6,26 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 
+_BGE_M3_MODEL_CLASS: Any | None = None
+
+
+def prepare_bge_m3_runtime() -> Any:
+    """Import FlagEmbedding on the caller thread before background model loading."""
+
+    global _BGE_M3_MODEL_CLASS
+    if _BGE_M3_MODEL_CLASS is not None:
+        return _BGE_M3_MODEL_CLASS
+    try:
+        from FlagEmbedding import BGEM3FlagModel
+    except ImportError as exc:  # pragma: no cover - exercised only without optional dependency.
+        raise RuntimeError(
+            "BGE-M3 indexing requires optional dependency `FlagEmbedding`. "
+            "Install with: pip install -e \".[index]\""
+        ) from exc
+    _BGE_M3_MODEL_CLASS = BGEM3FlagModel
+    return _BGE_M3_MODEL_CLASS
+
+
 @dataclass(slots=True)
 class SparseEmbedding:
     indices: list[int]
@@ -33,18 +53,11 @@ class BgeM3Encoder:
         use_fp16: bool = True,
         max_length: int = 8192,
     ) -> None:
-        try:
-            from FlagEmbedding import BGEM3FlagModel
-        except ImportError as exc:  # pragma: no cover - exercised only without optional dependency.
-            raise RuntimeError(
-                "BGE-M3 indexing requires optional dependency `FlagEmbedding`. "
-                "Install with: pip install -e \".[index]\""
-            ) from exc
-
+        model_class = prepare_bge_m3_runtime()
         kwargs: dict[str, Any] = {"use_fp16": use_fp16}
         if device and device != "auto":
             kwargs["devices"] = device
-        self.model = BGEM3FlagModel(model_name, **kwargs)
+        self.model = model_class(model_name, **kwargs)
         self.max_length = max_length
 
     def encode_texts(self, texts: list[str], *, batch_size: int = 12) -> list[TextEmbedding]:
@@ -81,4 +94,3 @@ def _lexical_weights_to_sparse(value: dict[Any, Any]) -> SparseEmbedding:
         indices=[index for index, _ in pairs],
         values=[weight for _, weight in pairs],
     )
-

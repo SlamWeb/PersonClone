@@ -122,6 +122,11 @@ class AuthStore:
                         "UPDATE OR IGNORE user_memory_settings SET owner_id = ? WHERE owner_id = 'local-user'",
                         (user.id,),
                     )
+                if "user_memory_checkpoints" in table_names:
+                    connection.execute(
+                        "UPDATE user_memory_checkpoints SET owner_id = ? WHERE owner_id = 'local-user'",
+                        (user.id,),
+                    )
         return user
 
     def bootstrap_admin(

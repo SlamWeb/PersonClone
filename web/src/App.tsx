@@ -1,5 +1,5 @@
-import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
-import { Activity, Brain, Check, Clock3, Copy, ExternalLink, LogOut, Pencil, Pin, Plus, Save, Settings2, SlidersHorizontal, Trash2, X } from 'lucide-react';
+import { CSSProperties, FormEvent, useEffect, useMemo, useRef, useState } from 'react';
+import { Activity, ArrowDown, ArrowUp, Brain, Check, Clock3, Copy, ExternalLink, Pencil, Pin, Save, SlidersHorizontal, Trash2, X } from 'lucide-react';
 import {
   AuthState,
   AuthorJob,
@@ -14,7 +14,6 @@ import {
   fetchPersonas,
   fetchSession,
   fetchSessions,
-  fetchSuggestions,
   fetchTurn,
   fetchTrace,
   logoutAuth,
@@ -35,9 +34,9 @@ import {
 import { AuthScreen } from './AuthScreen';
 import {
   AddAuthorModal,
-  AuthorLibraryPage,
-  PersonaSwitcher
+  AuthorLibraryPage
 } from './AuthorManager';
+import { ConversationSidebar, PersonaDock, personaTheme } from './PersonaWorkspace';
 
 type Message = {
   id: string;
@@ -51,7 +50,6 @@ type Message = {
 
 type WriterPrompt = 'current' | 'strong_identity' | 'persona_pack';
 
-const USER_AVATAR = '你';
 const OPENING_LINE = '今天想聊点什么？';
 
 function initialWriterPrompt(): WriterPrompt {
@@ -66,7 +64,6 @@ export default function App() {
   const [personas, setPersonas] = useState<PersonaInfo[]>([]);
   const [author, setAuthor] = useState('');
   const [sessions, setSessions] = useState<ChatSessionSummary[]>([]);
-  const [suggestions, setSuggestions] = useState<string[]>([]);
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
   const [queryMode, setQueryMode] = useState<'raw' | 'grounded'>('grounded');
   const [writerPrompt, setWriterPrompt] = useState<WriterPrompt>(initialWriterPrompt);
@@ -89,10 +86,13 @@ export default function App() {
   const [authorLibraryOpen, setAuthorLibraryOpen] = useState(() => window.location.pathname === '/authors');
   const [addAuthorOpen, setAddAuthorOpen] = useState(false);
   const [memoryOpen, setMemoryOpen] = useState(false);
+  const [conversationSidebarOpen, setConversationSidebarOpen] = useState(false);
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false);
   const currentSessionRef = useRef<string | null>(null);
   const currentAuthorRef = useRef('');
   const pollingTurnsRef = useRef<Set<string>>(new Set());
   const messagesRef = useRef<HTMLElement | null>(null);
+  const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
   const keepMessagesPinnedRef = useRef(true);
 
   const selectedPersona = useMemo(
@@ -104,6 +104,12 @@ export default function App() {
     : pendingNewConversation
       ? '正在创建回答任务'
       : null;
+  const hasVisibleStreamingAnswer = messages.some(
+    (message) =>
+      message.role === 'assistant' &&
+      (message.status === 'queued' || message.status === 'running') &&
+      Boolean(message.text.trim())
+  );
   const busy = Boolean(currentRunLabel);
   const canSend = useMemo(() => Boolean(author && input.trim() && !busy), [author, input, busy]);
 
@@ -139,6 +145,20 @@ export default function App() {
     });
     return () => window.cancelAnimationFrame(frame);
   }, [messages, liveStatus, currentSessionId]);
+
+  useEffect(() => {
+    const node = composerInputRef.current;
+    if (!node) return;
+    const maxHeight = window.innerWidth <= 900 ? 180 : 220;
+    node.style.height = '0px';
+    const nextHeight = Math.min(node.scrollHeight, maxHeight);
+    node.style.height = `${Math.max(nextHeight, 42)}px`;
+    node.style.overflowY = node.scrollHeight > maxHeight ? 'auto' : 'hidden';
+    if (keepMessagesPinnedRef.current && messagesRef.current) {
+      messagesRef.current.scrollTop = messagesRef.current.scrollHeight;
+      setShowScrollToBottom(false);
+    }
+  }, [input]);
 
   useEffect(() => {
     if (!authState?.authenticated) return;
@@ -199,7 +219,6 @@ export default function App() {
   useEffect(() => {
     if (!author) return;
     refreshSessions(author);
-    refreshSuggestions(author);
     setCurrentSessionId(null);
     setMessages([]);
     setLiveStatus(null);
@@ -211,15 +230,6 @@ export default function App() {
       setSessions(await fetchSessions(targetAuthor));
     } catch (error) {
       setStatus(String((error as Error).message || error));
-    }
-  }
-
-  async function refreshSuggestions(targetAuthor = author) {
-    if (!targetAuthor) return;
-    try {
-      setSuggestions(await fetchSuggestions(targetAuthor));
-    } catch {
-      setSuggestions([]);
     }
   }
 
@@ -274,6 +284,15 @@ export default function App() {
     setTrace(null);
     setTraceOpen(false);
     setLiveStatus(null);
+    setShowScrollToBottom(false);
+  }
+
+  function scrollToLatest() {
+    const node = messagesRef.current;
+    if (!node) return;
+    keepMessagesPinnedRef.current = true;
+    setShowScrollToBottom(false);
+    node.scrollTo({ top: node.scrollHeight, behavior: 'smooth' });
   }
 
   async function watchTurn(targetAuthor: string, sessionId: string, turnId: string) {
@@ -348,6 +367,7 @@ export default function App() {
 
   function selectAuthor(nextAuthor: string) {
     setAuthor(nextAuthor);
+    setConversationSidebarOpen(false);
     showChat();
   }
 
@@ -589,113 +609,83 @@ export default function App() {
   }
 
   return (
-    <div className="app-shell">
-      <aside className="sidebar">
-        <PersonaSwitcher
-          personas={personas}
-          jobs={authorJobs}
-          selectedPersona={selectedPersona}
-          onSelect={setAuthor}
-          onAdd={() => setAddAuthorOpen(true)}
-          onManage={showAuthorLibrary}
-        />
-
-        <button className="new-chat-button" type="button" onClick={newChat}>
-          <Plus size={16} />
-          新对话
-        </button>
-
-        <section className="session-section">
-          <div className="section-label">历史对话</div>
-          <div className="session-list">
-            {sessions.length === 0 ? (
-              <div className="muted-empty">暂无历史会话</div>
-            ) : (
-              sessions.map((session) => (
-                <div className={`session-item ${session.id === currentSessionId ? 'active' : ''}`} key={session.id}>
-                  <button className="session-open" type="button" onClick={() => openSession(session.id)}>
-                    <span>{session.title}</span>
-                    <small>
-                      {runningConversations[session.id]
-                        ? '正在生成'
-                        : `${session.message_count} 条消息`}
-                    </small>
-                  </button>
-                  <button
-                    className="delete-session"
-                    type="button"
-                    title="删除会话"
-                    onClick={() => removeSession(session.id)}
-                  >
-                    <Trash2 size={14} />
-                  </button>
-                </div>
-              ))
-            )}
-          </div>
-        </section>
-
-        <details className="advanced-settings">
-          <summary>
-            <Settings2 size={15} />
-            检索与生成设置
-          </summary>
-          <div className="control-grid">
-            <label>
-              RAG
-              <select value={queryMode} onChange={(event) => setQueryMode(event.target.value as 'raw' | 'grounded')}>
-                <option value="grounded">Grounded</option>
-                <option value="raw">Raw</option>
-              </select>
-            </label>
-            <label>
-              TopK
-              <input
-                type="number"
-                min={1}
-                max={40}
-                value={parentTopK}
-                onChange={(event) => setParentTopK(Number(event.target.value) || 20)}
-              />
-            </label>
-          </div>
-
-          {developerMode ? (
-            <label>
-              Trace 记录
-              <select value={traceCapture} onChange={(event) => setTraceCapture(event.target.value as 'summary' | 'full')}>
-                <option value="summary">摘要</option>
-                <option value="full">完整本地记录</option>
-              </select>
-            </label>
-          ) : null}
-        </details>
-
-        <button
-          className={`developer-mode-toggle ${developerMode ? 'enabled' : ''}`}
-          type="button"
-          onClick={() => setDeveloperMode((enabled) => !enabled)}
-          aria-pressed={developerMode}
-        >
-          <SlidersHorizontal size={15} />
-          {developerMode ? '开发者模式已开启' : '开发者模式'}
-        </button>
-
-        <div className="sidebar-footer">
-          <button
-            className="memory-entry"
-            type="button"
-            title="管理我的记忆"
-            onClick={() => setMemoryOpen(true)}
-          >
-            <Brain size={14} />
-            <span className="signed-in-user">{authState.user?.display_name || authState.user?.username}</span>
-          </button>
-          <button className="logout-button" type="button" title="退出登录" onClick={signOut}>
-            <LogOut size={14} />
-          </button>
-        </div>
-      </aside>
+    <div className="app-shell" style={personaTheme(selectedPersona) as CSSProperties}>
+      <PersonaDock
+        personas={personas}
+        selectedAuthor={author}
+        hasActiveJobs={authorJobs.some((job) => job.status === 'queued' || job.status === 'running')}
+        onSelect={selectAuthor}
+        onAdd={() => setAddAuthorOpen(true)}
+        onManage={showAuthorLibrary}
+        onOpenSessions={() => setConversationSidebarOpen(true)}
+      />
+      <ConversationSidebar
+        open={conversationSidebarOpen}
+        persona={selectedPersona}
+        sessions={sessions}
+        currentSessionId={currentSessionId}
+        runningConversations={runningConversations}
+        userName={authState.user?.display_name || authState.user?.username || '用户'}
+        onClose={() => setConversationSidebarOpen(false)}
+        onNewChat={() => {
+          newChat();
+          setConversationSidebarOpen(false);
+        }}
+        onOpenSession={(sessionId) => {
+          void openSession(sessionId);
+          setConversationSidebarOpen(false);
+        }}
+        onDeleteSession={(sessionId) => void removeSession(sessionId)}
+        onOpenMemory={() => setMemoryOpen(true)}
+        onLogout={() => void signOut()}
+        experimentPanel={(
+          <>
+            <WriterModeSelector
+              value={writerPrompt}
+              onChange={setWriterPrompt}
+              personaPackAvailable={Boolean(selectedPersona?.persona_pack_available)}
+              disabled={busy}
+            />
+            <div className="control-grid">
+              <label>
+                RAG
+                <select value={queryMode} onChange={(event) => setQueryMode(event.target.value as 'raw' | 'grounded')}>
+                  <option value="grounded">Grounded</option>
+                  <option value="raw">Raw</option>
+                </select>
+              </label>
+              <label>
+                TopK
+                <input
+                  type="number"
+                  min={1}
+                  max={40}
+                  value={parentTopK}
+                  onChange={(event) => setParentTopK(Number(event.target.value) || 20)}
+                />
+              </label>
+            </div>
+            <button
+              className={`developer-mode-toggle ${developerMode ? 'enabled' : ''}`}
+              type="button"
+              onClick={() => setDeveloperMode((enabled) => !enabled)}
+              aria-pressed={developerMode}
+            >
+              <SlidersHorizontal size={15} />
+              {developerMode ? '开发者模式已开启' : '开发者模式'}
+            </button>
+            {developerMode ? (
+              <label>
+                Trace 记录
+                <select value={traceCapture} onChange={(event) => setTraceCapture(event.target.value as 'summary' | 'full')}>
+                  <option value="summary">摘要</option>
+                  <option value="full">完整本地记录</option>
+                </select>
+              </label>
+            ) : null}
+          </>
+        )}
+      />
 
       <main className="chat-panel">
         <section
@@ -703,8 +693,9 @@ export default function App() {
           ref={messagesRef}
           onScroll={(event) => {
             const node = event.currentTarget;
-            keepMessagesPinnedRef.current =
-              node.scrollHeight - node.scrollTop - node.clientHeight < 120;
+            const distanceFromBottom = node.scrollHeight - node.scrollTop - node.clientHeight;
+            keepMessagesPinnedRef.current = distanceFromBottom < 120;
+            setShowScrollToBottom(distanceFromBottom >= 120);
           }}
         >
           {messages.length === 0 ? (
@@ -722,28 +713,35 @@ export default function App() {
             ))
           )}
           {liveStatus || currentRunLabel ? (
-            <LiveStatus persona={selectedPersona} label={liveStatus || currentRunLabel || '正在生成'} />
+            <LiveStatus
+              persona={selectedPersona}
+              label={liveStatus || currentRunLabel || '正在生成'}
+              continuation={hasVisibleStreamingAnswer}
+            />
           ) : null}
         </section>
 
         <div className="composer-area">
-          <WriterModeSelector
-            value={writerPrompt}
-            onChange={setWriterPrompt}
-            personaPackAvailable={Boolean(selectedPersona?.persona_pack_available)}
-            disabled={busy}
-          />
-          {messages.length === 0 && suggestions.length ? (
-            <SuggestionChips suggestions={suggestions} onPickSuggestion={setInput} />
+          {showScrollToBottom ? (
+            <button className="scroll-to-bottom" type="button" title="回到最新消息" onClick={scrollToLatest}>
+              <ArrowDown size={19} />
+            </button>
           ) : null}
           <form className="composer" onSubmit={handleSubmit}>
             <textarea
+              ref={composerInputRef}
+              rows={1}
               value={input}
               onChange={(event) => setInput(event.target.value)}
-              placeholder="例如：如何看待女生常说的配得感？"
+              onKeyDown={(event) => {
+                if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing) return;
+                event.preventDefault();
+                event.currentTarget.form?.requestSubmit();
+              }}
+              placeholder={`和${selectedPersona?.display_name || '这个分身'}聊点什么`}
             />
-            <button type="submit" disabled={!canSend}>
-              {busy ? '生成中' : '发送'}
+            <button type="submit" disabled={!canSend} title={busy ? '正在生成' : '发送'} aria-label={busy ? '正在生成' : '发送'}>
+              <ArrowUp size={19} />
             </button>
           </form>
         </div>
@@ -847,44 +845,36 @@ function MemoryDrawer({ open, onClose }: { open: boolean; onClose: () => void })
 
   return (
     <div className="trace-overlay" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <aside className="memory-drawer" aria-label="我的记忆">
+      <aside className="memory-drawer" aria-label="记忆">
         <header className="memory-header">
-          <div>
-            <span className="memory-eyebrow">跨会话上下文</span>
-            <h2>我的记忆</h2>
-            <p>只保存你的信息，不会把作者回答写成你的事实。</p>
-          </div>
+          <h2>记忆</h2>
           <button className="icon-button" type="button" onClick={onClose} title="关闭"><X size={18} /></button>
         </header>
 
         <section className="memory-settings">
           <label>
-            <span><strong>使用记忆</strong><small>在相关的新对话中召回</small></span>
+            <span><strong>使用记忆</strong><small>在新对话中使用</small></span>
             <input type="checkbox" checked={settings.enabled} onChange={(event) => patchSettings({ enabled: event.target.checked })} />
           </label>
           <label>
-            <span><strong>自动形成记忆</strong><small>回答完成后异步审查写入</small></span>
+            <span><strong>自动记忆</strong><small>从对话中记住重要信息</small></span>
             <input type="checkbox" checked={settings.auto_write} disabled={!settings.enabled} onChange={(event) => patchSettings({ auto_write: event.target.checked })} />
           </label>
         </section>
 
         <div className="memory-toolbar">
-          <span>{memories.length} 条有效记忆</span>
+          <span>{memories.length} 条记忆</span>
           {memories.length ? <button type="button" onClick={clearAll}>全部清空</button> : null}
         </div>
         {error ? <div className="memory-error">{error}</div> : null}
         <section className="memory-list">
           {loading ? <div className="memory-empty">正在读取记忆</div> : null}
           {!loading && memories.length === 0 ? (
-            <div className="memory-empty"><Brain size={22} /><strong>还没有长期记忆</strong><span>有价值的用户信息会在回答完成后异步形成。</span></div>
+            <div className="memory-empty"><Brain size={22} /><strong>还没有记忆</strong><span>聊天中值得记住的信息会出现在这里。</span></div>
           ) : null}
           {memories.map((memory) => (
             <article className="memory-item" key={memory.id}>
-              <div className="memory-meta">
-                <span>{memoryKindLabel(memory.kind)}</span>
-                {memory.sensitivity === 'restricted' ? <span>敏感概括</span> : null}
-                {memory.pinned ? <span>已置顶</span> : null}
-              </div>
+              {memory.pinned ? <div className="memory-meta"><span>已置顶</span></div> : null}
               {editingId === memory.id ? (
                 <textarea value={draft} onChange={(event) => setDraft(event.target.value)} autoFocus />
               ) : <p>{memory.content}</p>}
@@ -903,12 +893,6 @@ function MemoryDrawer({ open, onClose }: { open: boolean; onClose: () => void })
       </aside>
     </div>
   );
-}
-
-function memoryKindLabel(kind: UserMemory['kind']): string {
-  if (kind === 'semantic') return '个人信息';
-  if (kind === 'procedural') return '协作偏好';
-  return '持续事件';
 }
 
 function WriterModeSelector({
@@ -976,42 +960,31 @@ function WriterModeSelector({
 function OpeningMessage({ persona }: { persona: PersonaInfo | null }) {
   return (
     <div className="opening-wrap">
-      <article className="chat-row from-persona opening-message">
+      <article className="opening-message">
         <Avatar label={persona?.display_name || 'PF'} src={persona?.avatar_url || undefined} />
-        <div className="bubble-stack">
-          <div className="chat-bubble">
-            <div className="message-text">{OPENING_LINE}</div>
-          </div>
+        <div className="opening-copy">
+          <span>{persona?.display_name || 'PersonaForge'}</span>
+          <p>{OPENING_LINE}</p>
         </div>
       </article>
     </div>
   );
 }
 
-function LiveStatus({ persona, label }: { persona: PersonaInfo | null; label: string }) {
-  return (
-    <article className="live-status-row" aria-live="polite">
-      <Avatar label={persona?.display_name || 'PF'} src={persona?.avatar_url || undefined} />
-      <span className="live-status-text">{label}</span>
-    </article>
-  );
-}
-
-function SuggestionChips({
-  suggestions,
-  onPickSuggestion
+function LiveStatus({
+  persona,
+  label,
+  continuation
 }: {
-  suggestions: string[];
-  onPickSuggestion: (question: string) => void;
+  persona: PersonaInfo | null;
+  label: string;
+  continuation: boolean;
 }) {
   return (
-    <div className="suggestion-list" aria-label="建议问题">
-      {suggestions.slice(0, 4).map((item) => (
-        <button className="suggestion-chip" type="button" key={item} onClick={() => onPickSuggestion(item)}>
-          {item}
-        </button>
-      ))}
-    </div>
+    <article className={`live-status-row ${continuation ? 'continuation' : ''}`} aria-live="polite">
+      {!continuation ? <Avatar label={persona?.display_name || 'PF'} src={persona?.avatar_url || undefined} /> : null}
+      <span className="live-status-text">{label}</span>
+    </article>
   );
 }
 
@@ -1044,27 +1017,28 @@ function ChatBubble({
       {!isUser ? <Avatar label={persona?.display_name || 'PF'} src={persona?.avatar_url || undefined} /> : null}
       <div className="bubble-stack">
         <div className="chat-bubble">
-          <CopyButton text={displayText} />
           <div className="message-text">{displayText}</div>
-          {message.sources ? <Sources sources={message.sources} /> : null}
+          {message.sources?.length ? <Sources sources={message.sources} /> : null}
         </div>
-        {canRetry ? (
-          <button
-            className="retry-turn-button"
-            type="button"
-            onClick={() => onRetryTurn(message.turnId || '')}
-          >
-            重新生成
-          </button>
-        ) : null}
-        {!isUser && !isError && message.traceId && showTrace ? (
-          <button className="trace-button" type="button" onClick={() => onOpenTrace(message.traceId || '')}>
-            <Activity size={14} />
-            查看过程
-          </button>
-        ) : null}
+        <div className="message-actions">
+          <CopyButton text={displayText} />
+          {canRetry ? (
+            <button
+              className="retry-turn-button"
+              type="button"
+              onClick={() => onRetryTurn(message.turnId || '')}
+            >
+              重新生成
+            </button>
+          ) : null}
+          {!isUser && !isError && message.traceId && showTrace ? (
+            <button className="trace-button" type="button" onClick={() => onOpenTrace(message.traceId || '')}>
+              <Activity size={14} />
+              查看过程
+            </button>
+          ) : null}
+        </div>
       </div>
-      {isUser ? <Avatar label={USER_AVATAR} /> : null}
     </article>
   );
 }

@@ -41,6 +41,9 @@ node_modules/
 web/node_modules/
 web/dist/
 
+# Local visual QA captures
+docs/ui-preview/
+
 # Editors and OS
 .idea/
 .vscode/

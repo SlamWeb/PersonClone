@@ -159,6 +159,13 @@ Query Transform、两级 Parent RRF、MRPrompt 消息数组、流式生成和回
 - [`retrieval-detail.svg`](docs/architecture/generation/retrieval-detail.svg)：四路 Dense/Sparse 与 Parent 聚合。
 - [`mrprompt-context.svg`](docs/architecture/generation/mrprompt-context.svg)：最终 Writer 上下文窗口。
 
+RAG 与 Generate 的完整评估口径也已整理成可读图，包含候选池分支、双轴标签、
+Hit/MRR/nDCG/Precision/Recall/MAP、六维 Gold Judge、三次稳定性和人工 AB：
+
+- [`docs/architecture/evaluation/README.md`](docs/architecture/evaluation/README.md)：评估链路总说明与变量解释。
+- [`rag-evaluation.svg`](docs/architecture/evaluation/rag-evaluation.svg)：RAG 候选池、标注与指标。
+- [`generation-evaluation.svg`](docs/architecture/evaluation/generation-evaluation.svg)：生成质量与 Judge 稳定性。
+
 ## 4. Web 后端与前端
 
 ### 4.1 后端入口

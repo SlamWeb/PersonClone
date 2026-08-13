@@ -30,10 +30,13 @@ flowchart LR
 | 端到端生成链路 | React、FastAPI、Turn Planner、联网、检索、SSE 与记忆维护 | [架构图](docs/architecture/generation/generation-overview.svg) |
 | 四路检索链路 | Query Transform、Dense/Sparse Child 召回、两级 Parent RRF | [架构图](docs/architecture/generation/retrieval-detail.svg) |
 | MRPrompt 上下文 | Narrative Schema、用户记忆、会话历史与最终 messages 数组 | [架构图](docs/architecture/generation/mrprompt-context.svg) |
+| RAG 评估链路 | 时间切分、全量/多路候选池、双轴 Qrels 与多 K 指标 | [架构图](docs/architecture/evaluation/rag-evaluation.svg) |
+| Generate 评估链路 | 六维 Gold Judge、三次稳定性、机器比较与人工 AB | [架构图](docs/architecture/evaluation/generation-evaluation.svg) |
 
 三张图的 Mermaid 源码、高清 PNG、关键 JSON 输入输出和中文注释见
 [生成链路架构说明](docs/architecture/generation/README.md)。完整代码索引见
-[项目导航](navigation.md)。
+[项目导航](navigation.md)。两条评估链路的指标解释见
+[评估链路架构说明](docs/architecture/evaluation/README.md)。
 
 ## Docker 启动
 

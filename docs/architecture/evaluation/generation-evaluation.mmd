@@ -1,0 +1,78 @@
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"Microsoft YaHei, Segoe UI, sans-serif","fontSize":"17px","primaryTextColor":"#17231f","lineColor":"#68746f"},"flowchart":{"curve":"basis","htmlLabels":true,"nodeSpacing":34,"rankSpacing":42}}}%%
+flowchart TB
+    subgraph INPUT["1. 冻结可比较的生成系统"]
+        direction LR
+        DATASET["同一冻结评测集<br/>每题：问题 + 作者真实回答 Gold<br/>Dev 用于迭代，Test 用于最终比较"]
+        SYSTEMS["不同生成方法的回答<br/>例如：Strong Identity、Persona Pack、MRPrompt、Magic If<br/>每次改模块或参数都保存为新的不可变 run"]
+        CHECK["可比性检查<br/>同一作者、同一数据集哈希、同一切分、题目完整<br/>系统身份由 run manifest 和 SHA-256 固定"]
+        DATASET --> CHECK
+        SYSTEMS --> CHECK
+    end
+
+    subgraph JUDGE["2. 六维 Gold Judge：每个系统独立评分"]
+        direction TB
+        PAIR["Judge 每次只看一份候选<br/>输入：当前问题 + Gold + 某系统回答<br/>不告诉 Judge 其他系统的回答和名称"]
+        RUBRIC["六个 1–5 分维度<br/><b>D1</b> 核心立场与价值取向<br/><b>D2</b> 论证方式与推理组织<br/><b>D3</b> 词汇与语域<br/><b>D4</b> 语气与人格姿态<br/><b>D5</b> 句法与节奏<br/><b>D6</b> 自然表达与生成痕迹<br/>参考 TwinVoice 的 persona fidelity 分解思路，并按本项目 Gold 对比任务细化"]
+        GROUPS["一次评分拆成三组请求<br/>内容：D1–D2　表达：D3–D5　自然度：D6<br/>每维必须返回分数、Gold 证据、候选证据和理由"]
+        REPEAT["固定重复 3 次<br/>temperature = 0，保留三次原始评分<br/>每道题、每个维度最终取中位数"]
+        PAIR --> RUBRIC --> GROUPS --> REPEAT
+    end
+    CHECK --> PAIR
+
+    subgraph STABILITY["3. Judge 自身稳定性检查"]
+        direction LR
+        EXACT["完全一致率<br/>三次分数中有多少与中位数完全相同"]
+        WITHIN["±1 一致率<br/>三次分数中有多少与中位数相差不超过 1"]
+        RANGE["极差<br/>同一题同一维度的最高分 − 最低分<br/>越小表示越稳定"]
+        CI["95% CI<br/>对题目重采样得到系统均分区间<br/>反映评测题有限带来的不确定性"]
+    end
+    REPEAT --> EXACT
+    REPEAT --> WITHIN
+    REPEAT --> RANGE
+    REPEAT --> CI
+
+    subgraph SUMMARY["4. 单系统报告"]
+        direction LR
+        ITEM["逐题报告<br/>Gold、系统回答、D1–D6 中位数<br/>三次原始分、证据、理由和极差"]
+        METHOD["方法概览<br/>各维均值 / 中位数 / 95% CI<br/>完全一致率、±1 一致率、平均极差"]
+        GROUP["只作辅助摘要<br/>内容忠实度 = D1–D2<br/>语言表达相似度 = D3–D5<br/>自然表达 = D6<br/>不把六维压成唯一总分"]
+        ITEM --> METHOD --> GROUP
+    end
+    EXACT --> ITEM
+    WITHIN --> ITEM
+    RANGE --> ITEM
+    CI --> METHOD
+
+    subgraph COMPARE["5. 方法比较采用两条互补路线"]
+        direction TB
+        MACHINE["机器分数比较（当前正式做法）<br/>两个系统先分别完成独立 Gold Judge<br/>再在同一道题逐维计算分差和胜 / 平 / 负<br/>避免让同一个 Pairwise Judge 直接二选一造成首位偏差"]
+        HUMAN["人工盲测 AB（独立构念）<br/>显示问题、Gold、匿名候选 A / B<br/>强制选择整体更像作者的一篇<br/>A/B 位置按用户、系统组合和题目稳定随机，在样本间平衡位置"]
+        MATRIX["系统组合<br/>可选择不同方法两两比较<br/>同一作者与同一切分内汇总胜率<br/>跨作者报告先算作者内结果，再做等权宏平均"]
+        MACHINE --> MATRIX
+        HUMAN --> MATRIX
+    end
+    GROUP --> MACHINE
+    GROUP --> HUMAN
+
+    subgraph OUTPUT["6. 最终用于迭代的证据"]
+        direction LR
+        SELECT["Dev：定位哪一维改善或退化<br/>结合逐题证据决定是否保留模块"]
+        VERIFY["Test：只验证冻结候选方案的泛化<br/>不再根据 Test 反复改 Prompt"]
+        CALIBRATE["Judge 校准边界<br/>LLM 六维适合快速迭代<br/>关键结论仍需与人工六维或 AB 结果核对"]
+        SELECT --> VERIFY --> CALIBRATE
+    end
+    MATRIX --> SELECT
+
+    classDef source fill:#edf5f1,stroke:#4d796c,stroke-width:1.5px,color:#17231f;
+    classDef process fill:#eef4fa,stroke:#527c9e,stroke-width:1.5px,color:#17231f;
+    classDef judge fill:#fbf0e6,stroke:#a66c38,stroke-width:1.5px,color:#2c2118;
+    classDef stability fill:#f1eff7,stroke:#766991,stroke-width:1.5px,color:#231f2d;
+    classDef compare fill:#fff7df,stroke:#a7822d,stroke-width:1.5px,color:#2d2717;
+    classDef output fill:#eaf6ee,stroke:#3d8062,stroke-width:1.8px,color:#14271f;
+
+    class DATASET,SYSTEMS,CHECK source;
+    class PAIR,GROUPS,REPEAT process;
+    class RUBRIC judge;
+    class EXACT,WITHIN,RANGE,CI,ITEM,METHOD,GROUP stability;
+    class MACHINE,HUMAN,MATRIX compare;
+    class SELECT,VERIFY,CALIBRATE output;

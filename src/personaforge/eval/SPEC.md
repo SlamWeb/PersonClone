@@ -397,6 +397,12 @@ Precision 和 Recall，并独立输出 all30、dev10、test20。Recall 的分母
 0/1/2 分别表示无用、有一定帮助、明显有用。机器标签用于快速诊断召回与排序，不冒充
 人工金标准，也不能与 Study 1 的作者相似性判断混为同一构念。
 
+当前二值指标固定使用 `relevance_threshold=1`，即 1 分和 2 分都视为相关；分级
+`nDCG` 继续用 `2^score-1` 区分两个正等级。后续允许基于同一份冻结标签增加
+`relevance_threshold=2` 的严格敏感性报告，但它必须作为并列观察口径保存，不能静默
+替换历史默认结果。RAG 与 Generate 的架构图和指标释义位于
+`docs/architecture/evaluation/`。
+
 ### 解释边界
 
 Top3 指标低而 Top20/Top30 Recall 明显上升，表示候选池中存在有用材料但浅层排序不稳；

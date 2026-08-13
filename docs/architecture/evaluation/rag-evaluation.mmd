@@ -1,0 +1,70 @@
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"Microsoft YaHei, Segoe UI, sans-serif","fontSize":"17px","primaryTextColor":"#17231f","lineColor":"#68746f"},"flowchart":{"curve":"basis","htmlLabels":true,"nodeSpacing":34,"rankSpacing":42}}}%%
+flowchart TB
+    subgraph FREEZE["1. 冻结评测边界"]
+        direction LR
+        CORPUS["作者历史材料<br/>answer / article / pin"]
+        DATASET["时间切分评测题<br/>Dev：用于选方案<br/>Test：用于最终报告<br/>每题保存问题 + 作者真实回答 Gold"]
+        CUTOFF["防止答案泄漏<br/>评测题及时间切分后的材料<br/>不允许进入候选池和检索结果"]
+        CORPUS --> CUTOFF
+        DATASET --> CUTOFF
+    end
+
+    subgraph POOL["2. 为每道题建立候选池"]
+        direction TB
+        SIZE{"可见作者材料很多吗？"}
+        ALL["材料较少：全量候选池<br/>把切分后允许看到的全部 Parent<br/>逐题交给 Judge<br/><b>优点：</b>Recall 分母覆盖完整可见语料"]
+        ROUTES["材料很多：多路检索池<br/>① 原问题 Dense<br/>② 原问题 Sparse<br/>③ 原问题 Dense + Sparse RRF<br/>④ 四路 Query Transform + RRF<br/>⑤ 原问题 BM25<br/>⑥ 四路 Transform Dense + BM25 RRF"]
+        TOP["每路取 Parent Top30 或 Top50<br/>按 parent_id 并集去重<br/>只定义需要标注的评估边界"]
+        SIZE -- "否" --> ALL
+        SIZE -- "是" --> ROUTES --> TOP
+    end
+    CUTOFF --> SIZE
+
+    subgraph LABEL["3. Gold-aware LLM 标注：每个‘题目 × 候选材料’只判断一次"]
+        direction TB
+        INPUT["Judge 输入<br/>候选材料 + 当前问题 + 作者真实回答 Gold<br/>+ 从 Gold 提取的立场、推理、例子、表达单元<br/><b>Gold 仅用于离线评估，不进入在线 RAG</b>"]
+        AXES["两个独立效用轴，不求和<br/><b>内容支撑</b>：能否帮助重建 Gold 的立场、机制、事实或例子<br/><b>表达支撑</b>：能否帮助重建 Gold 的论证动作、语气、节奏"]
+        SCORE["每个轴均打 0 / 1 / 2<br/><b>0</b> 无用　<b>1</b> 有一定帮助　<b>2</b> 明显有用<br/>同时保存证据、理由和对应 Gold 单元"]
+        STABLE["稳定性流程<br/>先确定性判断 1 次<br/>边界样本复评；冲突样本第 3 次判断<br/>逐轴取中位数，保留全部原始 attempts"]
+        INPUT --> AXES --> SCORE --> STABLE
+    end
+    ALL --> INPUT
+    TOP --> INPUT
+
+    subgraph METRIC["4. 固定同一份标签，比较每条检索路线在不同 K 下的排序"]
+        direction TB
+        RANK["对每条路线读取自己的 Parent 排名<br/>K = 1 / 3 / 5 / 10 / 20 / 30<br/>Dense、Sparse、BM25 原始分数不跨模型混算"]
+        BINARY["当前二值口径：标签 ≥ 1 视为相关<br/><b>Hit@K</b>：前 K 是否至少有一篇相关<br/><b>MRR@K</b>：第一篇相关出现得多靠前<br/><b>Precision@K</b>：前 K 中相关材料占比<br/><b>Recall@K</b>：前 K 找到的相关材料 / 候选池全部相关材料<br/><b>MAP@K</b>：所有相关材料是否持续排在前面"]
+        GRADED["分级排序口径<br/><b>nDCG@K</b> 同时保留 1 分与 2 分差异<br/>增益：0→0，1→1，2→3<br/>明显有用的材料排得越靠前，得分越高"]
+        SCOPE["解释 Recall 前先看候选池范围<br/><b>全量池：</b>分母是全部可见作者材料中的相关项<br/><b>多路 TopN 池：</b>分母只覆盖多路并集中的相关项，属于有界 Recall"]
+        RANK --> BINARY
+        RANK --> GRADED
+        BINARY --> SCOPE
+        GRADED --> SCOPE
+    end
+    STABLE --> RANK
+
+    subgraph REPORT["5. 报告与下一步"]
+        direction LR
+        AUTHOR["单作者报告<br/>Dev 选检索方案，Test 冻结后验收<br/>逐题、逐路线、逐 K 查看"]
+        MACRO["多作者汇总<br/>先在每个作者内部按题平均<br/>再让每位作者等权做宏平均"]
+        STRICT["建议增加的敏感性视图（尚非当前默认）<br/>把标签 = 2 才算相关，再重算 Hit / MRR / Precision / Recall / MAP<br/>无需重新标注，用来判断结论是否依赖宽松阈值"]
+        AUTHOR --> MACRO --> STRICT
+    end
+    SCOPE --> AUTHOR
+
+    classDef source fill:#edf5f1,stroke:#4d796c,stroke-width:1.5px,color:#17231f;
+    classDef decision fill:#fff7df,stroke:#a7822d,stroke-width:1.5px,color:#2d2717;
+    classDef process fill:#eef4fa,stroke:#527c9e,stroke-width:1.5px,color:#17231f;
+    classDef judge fill:#fbf0e6,stroke:#a66c38,stroke-width:1.5px,color:#2c2118;
+    classDef metric fill:#f1eff7,stroke:#766991,stroke-width:1.5px,color:#231f2d;
+    classDef report fill:#eaf6ee,stroke:#3d8062,stroke-width:1.8px,color:#14271f;
+    classDef future fill:#ffffff,stroke:#7d8984,stroke-dasharray:6 4,color:#34413c;
+
+    class CORPUS,DATASET,CUTOFF source;
+    class SIZE decision;
+    class ALL,ROUTES,TOP,RANK process;
+    class INPUT,AXES,SCORE,STABLE judge;
+    class BINARY,GRADED,SCOPE metric;
+    class AUTHOR,MACRO report;
+    class STRICT future;

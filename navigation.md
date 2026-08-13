@@ -155,16 +155,16 @@ data/authors/zhihu/<author-token>/index/
 Query Transform、两级 Parent RRF、MRPrompt 消息数组、流式生成和回答后的记忆维护：
 
 - [`docs/architecture/generation/README.md`](docs/architecture/generation/README.md)：生成链路总说明。
-- [`generation-overview.svg`](docs/architecture/generation/generation-overview.svg)：从 React query 到最终回答。
-- [`retrieval-detail.svg`](docs/architecture/generation/retrieval-detail.svg)：四路 Dense/Sparse 与 Parent 聚合。
-- [`mrprompt-context.svg`](docs/architecture/generation/mrprompt-context.svg)：最终 Writer 上下文窗口。
+- [`generation-overview.png`](docs/architecture/generation/generation-overview.png)：从 React query 到最终回答。
+- [`retrieval-detail.png`](docs/architecture/generation/retrieval-detail.png)：四路 Dense/Sparse 与 Parent 聚合。
+- [`mrprompt-context.png`](docs/architecture/generation/mrprompt-context.png)：最终 Writer 上下文窗口。
 
 RAG 与 Generate 的完整评估口径也已整理成可读图，包含候选池分支、双轴标签、
 Hit/MRR/nDCG/Precision/Recall/MAP、六维 Gold Judge、三次稳定性和人工 AB：
 
 - [`docs/architecture/evaluation/README.md`](docs/architecture/evaluation/README.md)：评估链路总说明与变量解释。
-- [`rag-evaluation.svg`](docs/architecture/evaluation/rag-evaluation.svg)：RAG 候选池、标注与指标。
-- [`generation-evaluation.svg`](docs/architecture/evaluation/generation-evaluation.svg)：生成质量与 Judge 稳定性。
+- [`rag-evaluation.png`](docs/architecture/evaluation/rag-evaluation.png)：RAG 候选池、标注与指标。
+- [`generation-evaluation.png`](docs/architecture/evaluation/generation-evaluation.png)：生成质量与 Judge 稳定性。
 
 ## 4. Web 后端与前端
 

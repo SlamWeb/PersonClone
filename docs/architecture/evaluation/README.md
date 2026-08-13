@@ -4,7 +4,7 @@
 
 ## 1. RAG 评估链路
 
-![PersonaForge RAG 评估链路](rag-evaluation.svg)
+![PersonaForge RAG 评估链路](rag-evaluation.png)
 
 对应源码：[rag-evaluation.mmd](rag-evaluation.mmd)
 
@@ -41,7 +41,7 @@
 
 ## 2. Generate 评估链路
 
-![PersonaForge Generate 评估链路](generation-evaluation.svg)
+![PersonaForge Generate 评估链路](generation-evaluation.png)
 
 对应源码：[generation-evaluation.mmd](generation-evaluation.mmd)
 

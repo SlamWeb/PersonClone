@@ -27,11 +27,11 @@ flowchart LR
 
 | 模块 | 主要内容 | 查看 |
 | --- | --- | --- |
-| 端到端生成链路 | React、FastAPI、Turn Planner、联网、检索、SSE 与记忆维护 | [架构图](docs/architecture/generation/generation-overview.svg) |
-| 四路检索链路 | Query Transform、Dense/Sparse Child 召回、两级 Parent RRF | [架构图](docs/architecture/generation/retrieval-detail.svg) |
-| MRPrompt 上下文 | Narrative Schema、用户记忆、会话历史与最终 messages 数组 | [架构图](docs/architecture/generation/mrprompt-context.svg) |
-| RAG 评估链路 | 时间切分、全量/多路候选池、双轴 Qrels 与多 K 指标 | [架构图](docs/architecture/evaluation/rag-evaluation.svg) |
-| Generate 评估链路 | 六维 Gold Judge、三次稳定性、机器比较与人工 AB | [架构图](docs/architecture/evaluation/generation-evaluation.svg) |
+| 端到端生成链路 | React、FastAPI、Turn Planner、联网、检索、SSE 与记忆维护 | [高清 PNG](docs/architecture/generation/generation-overview.png) |
+| 四路检索链路 | Query Transform、Dense/Sparse Child 召回、两级 Parent RRF | [高清 PNG](docs/architecture/generation/retrieval-detail.png) |
+| MRPrompt 上下文 | Narrative Schema、用户记忆、会话历史与最终 messages 数组 | [高清 PNG](docs/architecture/generation/mrprompt-context.png) |
+| RAG 评估链路 | 时间切分、全量/多路候选池、双轴 Qrels 与多 K 指标 | [高清 PNG](docs/architecture/evaluation/rag-evaluation.png) |
+| Generate 评估链路 | 六维 Gold Judge、三次稳定性、机器比较与人工 AB | [高清 PNG](docs/architecture/evaluation/generation-evaluation.png) |
 
 三张图的 Mermaid 源码、高清 PNG、关键 JSON 输入输出和中文注释见
 [生成链路架构说明](docs/architecture/generation/README.md)。完整代码索引见

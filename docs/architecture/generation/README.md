@@ -21,7 +21,7 @@
 
 这张图回答“用户按下发送后，系统依次做了什么”。关键 JSON 字段旁边都标明了它们在控制什么。
 
-![PersonaForge 端到端生成链路](generation-overview.svg)
+![PersonaForge 端到端生成链路](generation-overview.png)
 
 对应源码：[generation-overview.mmd](generation-overview.mmd)
 
@@ -29,7 +29,7 @@
 
 这张图展开总图里的 RAG 节点。当前 Grounded 链路不是把原问题直接检索一次，而是先生成四种用途不同的检索表达；每种表达分别执行 BGE-M3 Dense 和 Sparse Child 检索，再做两层 Parent RRF。
 
-![PersonaForge 四路检索与 Parent 聚合](retrieval-detail.svg)
+![PersonaForge 四路检索与 Parent 聚合](retrieval-detail.png)
 
 对应源码：[retrieval-detail.mmd](retrieval-detail.mmd)
 
@@ -48,7 +48,7 @@ Parent 聚合只使用名次，不把 Dense、Sparse 的原始相似度跨模型
 
 这张图回答“最终送给 Writer LLM 的完整信息由什么组成”。它特别区分了作者身份记忆、当前用户记忆和会话记忆，三者作用不同。
 
-![PersonaForge MRPrompt 上下文窗口](mrprompt-context.svg)
+![PersonaForge MRPrompt 上下文窗口](mrprompt-context.png)
 
 对应源码：[mrprompt-context.mmd](mrprompt-context.mmd)
 

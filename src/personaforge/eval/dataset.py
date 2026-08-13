@@ -11,6 +11,7 @@ from typing import Any
 
 
 DATASET_SCHEMA_VERSION = "personaforge.eval.dataset.v0"
+CORPUS_SNAPSHOT_SCHEMA_VERSION = "personaforge.eval.corpus_snapshot.v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,8 +32,14 @@ def prepare_temporal_dataset(
     dev_size: int = 10,
     test_size: int = 20,
     min_answer_characters: int = 200,
+    test_only: bool = False,
 ) -> TemporalDatasetResult:
-    if dev_size < 1 or test_size < 1:
+    if test_only:
+        if test_size < 1:
+            raise ValueError("test_size must be positive for a test-only dataset.")
+        dev_size = 0
+        min_answer_characters = 0
+    elif dev_size < 1 or test_size < 1:
         raise ValueError("dev_size and test_size must both be positive.")
 
     parents = load_jsonl(index_dir / "parents.jsonl")
@@ -45,21 +52,35 @@ def prepare_temporal_dataset(
         key=created_at_key,
     )
     required_count = dev_size + test_size
-    if len(eligible) < required_count:
+    if test_only:
+        if not eligible:
+            raise ValueError(
+                f"Need at least one eligible answer for a test-only dataset, but found {len(eligible)}."
+            )
+        test_size = len(eligible)
+        dev_rows = []
+        test_rows = eligible
+    elif len(eligible) < required_count:
         raise ValueError(
             f"Need {required_count} eligible answers, but only found {len(eligible)} in {index_dir}."
         )
 
-    holdout = eligible[-required_count:]
-    dev_rows = holdout[:dev_size]
-    test_rows = holdout[dev_size:]
-    cutoff = str(dev_rows[0]["created_at"])
+    if not test_only:
+        holdout = eligible[-required_count:]
+        dev_rows = holdout[:dev_size]
+        test_rows = holdout[dev_size:]
+    cutoff = str((dev_rows or test_rows)[0]["created_at"])
     cutoff_time = parse_datetime(cutoff)
-    excluded_parent_ids = sorted(
-        str(row.get("doc_id"))
-        for row in parents
-        if should_exclude_from_train(row, cutoff_time)
-    )
+    if test_only:
+        # Sparse authors use a retrospective corpus: keep historical articles available,
+        # but remove every evaluated answer so the gold response cannot be retrieved verbatim.
+        excluded_parent_ids = sorted(str(row.get("doc_id")) for row in test_rows)
+    else:
+        excluded_parent_ids = sorted(
+            str(row.get("doc_id"))
+            for row in parents
+            if should_exclude_from_train(row, cutoff_time)
+        )
 
     records = [
         *[
@@ -83,12 +104,15 @@ def prepare_temporal_dataset(
         "dataset_sha256": sha256_json(records),
         "created_at": utc_now(),
         "selection": {
+            "protocol": "sparse_author_test_only" if test_only else "standard_temporal_holdout",
             "kind": "answer",
             "min_answer_characters": min_answer_characters,
             "dev_size": dev_size,
             "test_size": test_size,
-            "temporal_cutoff": cutoff,
-            "strict_future_exclusion": True,
+            "test_only": test_only,
+            "temporal_cutoff": None if test_only else cutoff,
+            "strict_future_exclusion": not test_only,
+            "corpus_policy": "exclude_eval_answers_only" if test_only else "exclude_future_parents",
         },
         "excluded_parent_ids": excluded_parent_ids,
         "excluded_parent_ids_sha256": sha256_json(excluded_parent_ids),
@@ -114,6 +138,62 @@ def prepare_temporal_dataset(
 
 def load_dataset(path: Path) -> list[dict[str, Any]]:
     return load_jsonl(path)
+
+
+def freeze_corpus_snapshot(
+    *,
+    index_dir: Path,
+    dataset_path: Path,
+    out_path: Path | None = None,
+) -> dict[str, Any]:
+    """Freeze the eligible corpus identity used by retrieval evaluation."""
+
+    index_dir = index_dir.expanduser().resolve()
+    dataset_path = dataset_path.expanduser().resolve()
+    manifest = load_dataset_manifest(dataset_path)
+    parents = load_jsonl(index_dir / "parents.jsonl")
+    if sha256_json(parents) != str(manifest.get("source_parents_sha256") or ""):
+        raise ValueError("Current parents.jsonl no longer matches the prepared temporal dataset")
+    excluded = {str(value) for value in manifest.get("excluded_parent_ids") or []}
+    eligible = []
+    for parent in sorted(parents, key=lambda row: str(row.get("doc_id") or "")):
+        parent_id = str(parent.get("doc_id") or "")
+        if not parent_id or parent_id in excluded:
+            continue
+        eligible.append(
+            {
+                "parent_id": parent_id,
+                "kind": str(parent.get("kind") or ""),
+                "created_at": str(parent.get("created_at") or ""),
+                "content_sha256": hashlib.sha256(
+                    (str(parent.get("title") or "") + "\n" + str(parent.get("text") or "")).encode("utf-8")
+                ).hexdigest(),
+            }
+        )
+    snapshot = {
+        "schema_version": CORPUS_SNAPSHOT_SCHEMA_VERSION,
+        "author": str(manifest.get("author") or ""),
+        "dataset_sha256": str(manifest.get("dataset_sha256") or ""),
+        "source_parents_sha256": str(manifest.get("source_parents_sha256") or ""),
+        "excluded_parent_ids_sha256": str(manifest.get("excluded_parent_ids_sha256") or ""),
+        "eligible_parent_count": len(eligible),
+        "eligible_parents_sha256": sha256_json(eligible),
+        "eligible_parents": eligible,
+        "created_at": utc_now(),
+    }
+    target = (out_path or dataset_path.parent / "corpus_snapshot.json").expanduser().resolve()
+    if target.exists():
+        existing = read_json(target)
+        immutable_keys = (
+            "dataset_sha256",
+            "source_parents_sha256",
+            "eligible_parents_sha256",
+        )
+        if any(str(existing.get(key) or "") != str(snapshot.get(key) or "") for key in immutable_keys):
+            raise FileExistsError(f"Corpus snapshot already exists with different inputs: {target}")
+        return existing
+    write_json(snapshot, target)
+    return snapshot
 
 
 def load_dataset_manifest(dataset_path: Path) -> dict[str, Any]:

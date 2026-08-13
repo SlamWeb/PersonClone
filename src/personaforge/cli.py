@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 import getpass
+import os
 from pathlib import Path
 from typing import Iterable
 
@@ -14,12 +15,14 @@ from personaforge.crawler.markdown import write_markdown_corpus, write_profile
 from personaforge.crawler.models import ContentItem, ContentKind, CreatorProfile
 from personaforge.crawler.zhihu import ZhihuPublicCrawler, fallback_profile, parse_user_token
 from personaforge.crawler.zhihu_browser import ZhihuBrowserCrawler, save_zhihu_session
+from personaforge.env import load_env_file
 from personaforge.ingest.embeddings import BgeM3Encoder
 from personaforge.ingest.build import build_corpus
 from personaforge.ingest.index import index_corpus
 from personaforge.ingest.query_understanding import build_grounded_query_plan, plan_to_trace
 from personaforge.ingest.retrieve import retrieve_parents, retrieve_parents_for_queries
 from personaforge.llm import DeepSeekJsonClient
+from personaforge.persona.narrative import load_narrative_schema, load_narrative_schema_for_index
 from personaforge.persona.pack import load_persona_pack_for_index
 from personaforge.persona.suggestions import generate_suggestions
 from personaforge.persona.writer import WRITER_PROMPT_CHOICES, build_prompt_pack, generate_answer
@@ -146,6 +149,12 @@ def build_parser() -> argparse.ArgumentParser:
     ask_parser.add_argument("--per-query-parent-k", type=int, default=30)
     ask_parser.add_argument("--parent-top-k", type=int, default=20)
     ask_parser.add_argument(
+        "--writer-context-top-k",
+        type=int,
+        default=20,
+        help="Number of retrieved parent documents sent to the writer. Use 5 for the MRPrompt RAG5 comparison.",
+    )
+    ask_parser.add_argument(
         "--query-mode",
         choices=["raw", "grounded"],
         default="grounded",
@@ -159,6 +168,10 @@ def build_parser() -> argparse.ArgumentParser:
         choices=WRITER_PROMPT_CHOICES,
         default="current",
         help="Writer prompt variant. current keeps the tuned anti-AI prompt; strong_identity tests a generic identity-immersion prompt.",
+    )
+    ask_parser.add_argument(
+        "--narrative-schema-path",
+        help="Optional Narrative Schema path. Required for --writer-prompt mrprompt unless found beside the author index.",
     )
     ask_parser.add_argument("--trace-path", help="Optional JSON file for query, retrieval, and answer trace.")
     ask_parser.add_argument("--no-fp16", action="store_true", help="Disable fp16 when loading BGE-M3.")
@@ -182,6 +195,12 @@ def build_parser() -> argparse.ArgumentParser:
     prompt_pack_parser.add_argument("--per-query-parent-k", type=int, default=30)
     prompt_pack_parser.add_argument("--parent-top-k", type=int, default=20)
     prompt_pack_parser.add_argument(
+        "--writer-context-top-k",
+        type=int,
+        default=20,
+        help="Number of retrieved parent documents sent to the exported writer prompt.",
+    )
+    prompt_pack_parser.add_argument(
         "--query-mode",
         choices=["raw", "grounded"],
         default="grounded",
@@ -193,6 +212,10 @@ def build_parser() -> argparse.ArgumentParser:
         choices=WRITER_PROMPT_CHOICES,
         default="strong_identity",
         help="Writer prompt variant to export.",
+    )
+    prompt_pack_parser.add_argument(
+        "--narrative-schema-path",
+        help="Optional Narrative Schema path. Required for --writer-prompt mrprompt unless found beside the author index.",
     )
     prompt_pack_parser.add_argument("--out", help="Output Markdown file. Prints to stdout when omitted.")
     prompt_pack_parser.add_argument("--trace-path", help="Optional JSON file for query and retrieval trace.")
@@ -215,6 +238,11 @@ def build_parser() -> argparse.ArgumentParser:
     eval_prepare_parser.add_argument("--dev-size", type=int, default=10)
     eval_prepare_parser.add_argument("--test-size", type=int, default=20)
     eval_prepare_parser.add_argument("--min-answer-characters", type=int, default=200)
+    eval_prepare_parser.add_argument(
+        "--test-only",
+        action="store_true",
+        help="Build a sparse-author dataset from all timestamped answers as Test; no Dev split is created.",
+    )
 
     eval_run_parser = eval_subparsers.add_parser("run", help="Generate answers for one prepared eval split.")
     eval_run_parser.add_argument("author", help="Creator token.")
@@ -224,6 +252,10 @@ def build_parser() -> argparse.ArgumentParser:
     eval_run_parser.add_argument(
         "--persona-pack-path",
         help="Optional Persona Pack path when the eval index is outside the author directory.",
+    )
+    eval_run_parser.add_argument(
+        "--narrative-schema-path",
+        help="Optional Narrative Schema path when the eval index is outside the author directory.",
     )
     eval_run_parser.add_argument("--out-dir", help="Dataset directory. Defaults to the dataset parent directory.")
     eval_run_parser.add_argument("--run-name", required=True, help="Unique local name for this experiment run.")
@@ -239,6 +271,24 @@ def build_parser() -> argparse.ArgumentParser:
     eval_run_parser.add_argument("--child-top-k", type=int, default=100)
     eval_run_parser.add_argument("--per-query-parent-k", type=int, default=30)
     eval_run_parser.add_argument("--parent-top-k", type=int, default=20)
+    eval_run_parser.add_argument(
+        "--writer-context-top-k",
+        type=int,
+        default=20,
+        help="Number of retrieved parent documents sent to the writer during evaluation.",
+    )
+    eval_run_parser.add_argument(
+        "--content-context-top-k",
+        type=int,
+        default=5,
+        help="Strong-style mode: number of parents reserved for current-answer content.",
+    )
+    eval_run_parser.add_argument(
+        "--style-context-top-k",
+        type=int,
+        default=3,
+        help="Strong-style mode: number of parents selected as expression exemplars.",
+    )
     eval_run_parser.add_argument("--query-mode", choices=["raw", "grounded"], default="grounded")
     eval_run_parser.add_argument("--max-search-results", type=int, default=5)
     eval_run_parser.add_argument("--temperature", type=float, default=0.85)
@@ -249,7 +299,147 @@ def build_parser() -> argparse.ArgumentParser:
         default="strong_identity",
         help="Writer prompt variant. Eval defaults to the current strong identity baseline.",
     )
+    eval_run_parser.add_argument("--method-id", help="Stable method identifier shown in evaluation reports.")
+    eval_run_parser.add_argument("--display-name", help="Human-readable method name shown in evaluation reports.")
+    eval_run_parser.add_argument("--description", default="", help="Short change summary shown in evaluation reports.")
+    eval_run_parser.add_argument("--parent-method", help="Optional parent method identifier for lineage display.")
+    eval_run_parser.add_argument("--prompt-version", help="Explicit prompt version label for this run.")
     eval_run_parser.add_argument("--no-fp16", action="store_true", help="Disable fp16 when loading BGE-M3.")
+
+    eval_pool_parser = eval_subparsers.add_parser(
+        "retrieval-pool",
+        help="Freeze a six-route retrieval candidate pool for relevance evaluation.",
+    )
+    eval_pool_parser.add_argument("author", help="Creator token.")
+    eval_pool_parser.add_argument("--dataset", required=True, help="Path to dataset.jsonl from pf eval prepare.")
+    eval_pool_parser.add_argument("--dataset-id", help="Stable experiment dataset ID, for example temporal_dev10_v0.")
+    eval_pool_parser.add_argument("--index-dir", help="Directory containing parents.jsonl and nodes.jsonl.")
+    eval_pool_parser.add_argument("--qdrant-path", help="Local Qdrant storage path.")
+    eval_pool_parser.add_argument("--out-dir", help="Output directory. Defaults beside the dataset.")
+    eval_pool_parser.add_argument("--split", choices=["dev", "test", "all"], default="dev")
+    eval_pool_parser.add_argument(
+        "--query-plan-file",
+        help="Frozen JSONL query plans. When complete, no query-transform LLM or Web search is called.",
+    )
+    eval_pool_parser.add_argument("--model-name", default="BAAI/bge-m3", help="Embedding model name.")
+    eval_pool_parser.add_argument(
+        "--embedding-device",
+        choices=["auto", "cpu", "cuda"],
+        default="auto",
+        help="Device for query embedding.",
+    )
+    eval_pool_parser.add_argument("--child-top-k", type=int, default=100)
+    eval_pool_parser.add_argument("--route-parent-k", type=int, default=30)
+    eval_pool_parser.add_argument("--per-query-parent-k", type=int, default=30)
+    eval_pool_parser.add_argument("--max-search-results", type=int, default=5)
+    eval_pool_parser.add_argument("--bm25-k1", type=float, default=1.2)
+    eval_pool_parser.add_argument("--bm25-b", type=float, default=0.75)
+    eval_pool_parser.add_argument("--force", action="store_true", help="Replace an existing frozen pool.")
+    eval_pool_parser.add_argument("--no-fp16", action="store_true", help="Disable fp16 when loading BGE-M3.")
+
+    eval_core_parser = eval_subparsers.add_parser(
+        "retrieval-core",
+        help="Derive a smaller human-labeling pool from an existing frozen retrieval pool.",
+    )
+    eval_core_parser.add_argument("--source-manifest", required=True, help="Manifest of the complete retrieval pool.")
+    eval_core_parser.add_argument("--route-depth", type=int, default=3, help="Keep candidates in any route's Top N.")
+    eval_core_parser.add_argument("--out-dir", help="Output directory beside the complete pool by default.")
+    eval_core_parser.add_argument("--force", action="store_true", help="Replace an existing derived core pool.")
+
+    eval_full_pool_parser = eval_subparsers.add_parser(
+        "retrieval-full-pool",
+        help="Freeze every temporally eligible parent for corpus-wide retrieval qrels.",
+    )
+    eval_full_pool_parser.add_argument("--source-manifest", required=True, help="Frozen six-route pool manifest.")
+    eval_full_pool_parser.add_argument("--dataset", required=True, help="Matching temporal dataset.jsonl.")
+    eval_full_pool_parser.add_argument("--index-dir", required=True, help="Directory containing parents.jsonl.")
+    eval_full_pool_parser.add_argument("--out-dir", help="Output directory beside the source pool by default.")
+    eval_full_pool_parser.add_argument("--force", action="store_true", help="Replace an existing exhaustive pool.")
+
+    eval_gold_units_parser = eval_subparsers.add_parser(
+        "retrieval-gold-units",
+        help="Freeze Gold answer units used only by the offline retrieval Judge.",
+    )
+    eval_gold_units_parser.add_argument("--dataset", required=True, help="Temporal dataset.jsonl containing Gold answers.")
+    eval_gold_units_parser.add_argument("--out-file", help="Output JSONL; defaults beside the dataset.")
+    eval_gold_units_parser.add_argument("--split", choices=["dev", "test", "all"], default="all")
+    eval_gold_units_parser.add_argument("--max-tokens", type=int, default=1800)
+    eval_gold_units_parser.add_argument("--max-attempts", type=int, default=3)
+
+    eval_gold_label_parser = eval_subparsers.add_parser(
+        "retrieval-gold-label",
+        help="Create dual-axis, Gold-aware qrels for a frozen retrieval pool.",
+    )
+    eval_gold_label_parser.add_argument("--pool-manifest", required=True)
+    eval_gold_label_parser.add_argument("--dataset", required=True)
+    eval_gold_label_parser.add_argument("--gold-units", required=True)
+    eval_gold_label_parser.add_argument("--label-set", default="gold_aware_dual_axis_v2")
+    eval_gold_label_parser.add_argument("--seed-label-manifest", help="Reuse completed V2 labels shared with a larger pool.")
+    eval_gold_label_parser.add_argument("--batch-size", type=int, default=10)
+    eval_gold_label_parser.add_argument("--max-concurrency", type=int, default=4)
+    eval_gold_label_parser.add_argument("--max-tokens", type=int, default=6500)
+    eval_gold_label_parser.add_argument("--max-attempts", type=int, default=3)
+    eval_gold_label_parser.add_argument("--stability-sample-rate", type=float, default=0.05)
+    eval_gold_label_parser.add_argument("--budget-cny", type=float, help="Pause after this estimated CNY budget.")
+    eval_gold_label_parser.add_argument("--candidate-warmup-count", type=int, default=2)
+    eval_gold_label_parser.add_argument("--split", choices=["dev", "test", "all"], default="all")
+    eval_gold_label_parser.add_argument("--limit", type=int, help="Optional prefix limit for smoke testing.")
+
+    eval_gold_codex_export_parser = eval_subparsers.add_parser(
+        "retrieval-gold-codex-export",
+        help="Export a hash-bound dual-axis Codex handoff package.",
+    )
+    eval_gold_codex_export_parser.add_argument("--pool-manifest", required=True)
+    eval_gold_codex_export_parser.add_argument("--dataset", required=True)
+    eval_gold_codex_export_parser.add_argument("--gold-units", required=True)
+    eval_gold_codex_export_parser.add_argument("--out-dir")
+    eval_gold_codex_export_parser.add_argument("--label-set", default="codex_gold_aware_dual_axis_v1")
+    eval_gold_codex_export_parser.add_argument("--split", choices=["dev", "test", "all"], default="all")
+
+    eval_gold_codex_import_parser = eval_subparsers.add_parser(
+        "retrieval-gold-codex-import",
+        help="Validate and publish a completed dual-axis Codex handoff.",
+    )
+    eval_gold_codex_import_parser.add_argument("--pool-manifest", required=True)
+    eval_gold_codex_import_parser.add_argument("--dataset", required=True)
+    eval_gold_codex_import_parser.add_argument("--gold-units", required=True)
+    eval_gold_codex_import_parser.add_argument("--review-file", required=True)
+    eval_gold_codex_import_parser.add_argument("--label-set", default="codex_gold_aware_dual_axis_v1")
+    eval_gold_codex_import_parser.add_argument("--split", choices=["dev", "test", "all"], default="all")
+
+    eval_v1_v2_parser = eval_subparsers.add_parser(
+        "retrieval-v1-v2-compare",
+        help="Compare query-only V1 labels with Gold-aware V2 content support.",
+    )
+    eval_v1_v2_parser.add_argument("--pool-manifest", required=True)
+    eval_v1_v2_parser.add_argument("--v1-label-manifest", required=True)
+    eval_v1_v2_parser.add_argument("--v2-label-manifest", required=True)
+    eval_v1_v2_parser.add_argument("--out-file")
+
+    eval_llm_label_parser = eval_subparsers.add_parser(
+        "retrieval-llm-label",
+        help="Use an LLM to label every query-parent pair in a frozen retrieval pool.",
+    )
+    eval_llm_label_parser.add_argument("--pool-manifest", required=True, help="Manifest of the complete retrieval pool.")
+    eval_llm_label_parser.add_argument("--label-set", default="llm_relevance_v1", help="Stable label-set name for resumable output.")
+    eval_llm_label_parser.add_argument("--limit", type=int, help="Optional prefix limit for a smoke run.")
+    eval_llm_label_parser.add_argument("--max-tokens", type=int, default=900)
+    eval_llm_label_parser.add_argument("--max-attempts", type=int, default=3)
+
+    eval_codex_label_parser = eval_subparsers.add_parser(
+        "retrieval-codex-label",
+        help="Materialize a completed offline Codex review without calling an API.",
+    )
+    eval_codex_label_parser.add_argument("--pool-manifest", required=True, help="Manifest of the complete retrieval pool.")
+    eval_codex_label_parser.add_argument("--review-file", required=True, help="Completed Codex review JSON file.")
+    eval_codex_label_parser.add_argument("--label-set", default="codex_relevance_v1", help="Stable output label-set name.")
+
+    eval_judge_parser = eval_subparsers.add_parser(
+        "judge",
+        help="Run the frozen six-dimension Gold Judge for one discovered dev10 system.",
+    )
+    eval_judge_parser.add_argument("system_id", help="Immutable system ID shown by the Generate evaluation page.")
+    eval_judge_parser.add_argument("--data-dir", default="data", help="Local data root containing eval runs.")
 
     web_parser = subparsers.add_parser("web", help="Start the local Web UI.")
     web_parser.add_argument("author", nargs="?", help="Creator token.")
@@ -260,7 +450,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     web_parser.add_argument("--port", type=int, default=8000)
     web_parser.add_argument("--data-dir", default="data", help="Local data root.")
-    web_parser.add_argument("--model-name", default="BAAI/bge-m3", help="Embedding model name.")
+    web_parser.add_argument(
+        "--model-name",
+        default=os.environ.get("PERSONAFORGE_EMBEDDING_MODEL", "BAAI/bge-m3"),
+        help="Embedding model ID or local directory (env: PERSONAFORGE_EMBEDDING_MODEL).",
+    )
     web_parser.add_argument(
         "--embedding-device",
         choices=["auto", "cpu", "cuda"],
@@ -274,6 +468,11 @@ def build_parser() -> argparse.ArgumentParser:
     web_parser.add_argument("--temperature", type=float, default=0.85)
     web_parser.add_argument("--max-tokens", type=int, default=1600)
     web_parser.add_argument("--no-fp16", action="store_true", help="Disable fp16 when loading BGE-M3.")
+    web_parser.add_argument(
+        "--no-deployment-guards",
+        action="store_true",
+        help="Disable local Chat/login protections for controlled development tests.",
+    )
 
     forge_parser = subparsers.add_parser(
         "forge",
@@ -324,6 +523,11 @@ def build_parser() -> argparse.ArgumentParser:
     forge_parser.add_argument("--max-search-results", type=int, default=5)
     forge_parser.add_argument("--temperature", type=float, default=0.85)
     forge_parser.add_argument("--max-tokens", type=int, default=1600)
+    forge_parser.add_argument(
+        "--no-deployment-guards",
+        action="store_true",
+        help="Disable local Chat/login protections for controlled development tests.",
+    )
 
     return parser
 
@@ -343,6 +547,7 @@ def _ensure_data_dirs(data_dir: Path) -> list[Path]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    load_env_file()
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -691,6 +896,13 @@ def _generation_index_dir(args: argparse.Namespace) -> Path:
     )
 
 
+def _writer_context_parent_hits(args: argparse.Namespace, retrieve_result):
+    limit = int(getattr(args, "writer_context_top_k", 20))
+    if limit <= 0:
+        raise ValueError("--writer-context-top-k must be positive.")
+    return retrieve_result.parents[:limit]
+
+
 def _run_ask(args: argparse.Namespace) -> int:
     retrieve_result, query_trace, objective_background = _retrieve_for_generation(args)
     index_dir = _generation_index_dir(args)
@@ -698,16 +910,20 @@ def _run_ask(args: argparse.Namespace) -> int:
         index_dir,
         required=args.writer_prompt == "persona_pack",
     ) if args.writer_prompt == "persona_pack" else None
+    narrative_schema = _load_narrative_schema_for_writer(args, index_dir)
+    writer_parent_hits = _writer_context_parent_hits(args, retrieve_result)
     llm = DeepSeekJsonClient.from_env()
     answer = generate_answer(
         query=args.query,
-        parent_hits=retrieve_result.parents,
+        parent_hits=writer_parent_hits,
         llm=llm,
         objective_background=objective_background,
         writer_prompt=args.writer_prompt,
         persona_pack=persona_pack,
+        narrative_schema=narrative_schema,
         temperature=args.temperature,
         max_tokens=args.max_tokens,
+        deployment_guards_enabled=not args.no_deployment_guards,
     )
 
     if args.trace_path:
@@ -730,12 +946,15 @@ def _run_prompt_pack(args: argparse.Namespace) -> int:
         index_dir,
         required=args.writer_prompt == "persona_pack",
     ) if args.writer_prompt == "persona_pack" else None
+    narrative_schema = _load_narrative_schema_for_writer(args, index_dir)
+    writer_parent_hits = _writer_context_parent_hits(args, retrieve_result)
     prompt_pack = build_prompt_pack(
         query=args.query,
-        parent_hits=retrieve_result.parents,
+        parent_hits=writer_parent_hits,
         objective_background=objective_background,
         writer_prompt=args.writer_prompt,
         persona_pack=persona_pack,
+        narrative_schema=narrative_schema,
     )
 
     if args.trace_path:
@@ -747,6 +966,8 @@ def _run_prompt_pack(args: argparse.Namespace) -> int:
             writer_prompt=args.writer_prompt,
             persona_pack_id=persona_pack.pack_id if persona_pack else None,
             persona_pack_sha256=persona_pack.sha256 if persona_pack else None,
+            narrative_schema_id=narrative_schema.schema_id if narrative_schema else None,
+            narrative_schema_sha256=narrative_schema.sha256 if narrative_schema else None,
         )
 
     if args.out:
@@ -782,6 +1003,22 @@ def _run_suggest(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_narrative_schema_for_writer(
+    args: argparse.Namespace,
+    index_dir: Path,
+):
+    if args.writer_prompt != "mrprompt":
+        return None
+    explicit_path = getattr(args, "narrative_schema_path", None)
+    if explicit_path:
+        return load_narrative_schema(
+            Path(explicit_path),
+            parent_store_path=index_dir / "parents.jsonl",
+            verify_evidence=True,
+        )
+    return load_narrative_schema_for_index(index_dir, required=True)
+
+
 def _run_eval(args: argparse.Namespace) -> int:
     if args.eval_command == "prepare":
         from personaforge.eval.dataset import prepare_temporal_dataset
@@ -799,6 +1036,7 @@ def _run_eval(args: argparse.Namespace) -> int:
             dev_size=args.dev_size,
             test_size=args.test_size,
             min_answer_characters=args.min_answer_characters,
+            test_only=args.test_only,
         )
         print(f"Prepared temporal dataset for {args.author}:")
         print(f"- dev/test: {result.dev_count}/{result.test_count}")
@@ -826,11 +1064,22 @@ def _run_eval(args: argparse.Namespace) -> int:
             child_top_k=args.child_top_k,
             per_query_parent_k=args.per_query_parent_k,
             parent_top_k=args.parent_top_k,
+            writer_context_top_k=args.writer_context_top_k,
+            content_context_top_k=args.content_context_top_k,
+            style_context_top_k=args.style_context_top_k,
             max_search_results=args.max_search_results,
             temperature=args.temperature,
             max_tokens=args.max_tokens,
             limit=args.limit,
             persona_pack_path=Path(args.persona_pack_path) if args.persona_pack_path else None,
+            narrative_schema_path=(
+                Path(args.narrative_schema_path) if args.narrative_schema_path else None
+            ),
+            method_id=args.method_id,
+            display_name=args.display_name,
+            description=args.description,
+            parent_method=args.parent_method,
+            prompt_version=args.prompt_version,
         )
         encoder = BgeM3Encoder(args.model_name, device=args.embedding_device, use_fp16=not args.no_fp16)
         result = run_temporal_eval(
@@ -845,6 +1094,257 @@ def _run_eval(args: argparse.Namespace) -> int:
         print(f"- manifest: {result.manifest_path}")
         print(f"- results: {result.runs_path}")
         print(f"- summary: {result.summary_path}")
+        return 0
+
+    if args.eval_command == "retrieval-pool":
+        from personaforge.eval.retrieval_pool import RetrievalPoolConfig, build_retrieval_pool
+
+        dataset_path = Path(args.dataset)
+        index_dir = Path(args.index_dir) if args.index_dir else Path("data/authors") / "zhihu" / args.author / "index"
+        qdrant_path = Path(args.qdrant_path) if args.qdrant_path else index_dir / "qdrant"
+        config = RetrievalPoolConfig(
+            author=args.author,
+            dataset_path=dataset_path,
+            dataset_id=args.dataset_id,
+            split=args.split,
+            out_dir=Path(args.out_dir) if args.out_dir else None,
+            query_plan_path=Path(args.query_plan_file) if args.query_plan_file else None,
+            child_top_k=args.child_top_k,
+            route_parent_k=args.route_parent_k,
+            per_query_parent_k=args.per_query_parent_k,
+            max_search_results=args.max_search_results,
+            bm25_k1=args.bm25_k1,
+            bm25_b=args.bm25_b,
+            force=args.force,
+        )
+        encoder = BgeM3Encoder(args.model_name, device=args.embedding_device, use_fp16=not args.no_fp16)
+        query_plan_llm = None if args.query_plan_file else DeepSeekJsonClient.from_env()
+        result = build_retrieval_pool(
+            config,
+            index_dir=index_dir,
+            qdrant_path=qdrant_path,
+            encoder=encoder,
+            llm=query_plan_llm,
+        )
+        print(f"Frozen retrieval pool {result.pool_id}:")
+        print(f"- queries: {result.query_count}")
+        print(f"- candidate pairs: {result.candidate_count}")
+        print(f"- pool: {result.pool_path}")
+        print(f"- manifest: {result.manifest_path}")
+        return 0
+
+    if args.eval_command == "retrieval-core":
+        from personaforge.eval.retrieval_pool import derive_core_pool
+
+        result = derive_core_pool(
+            Path(args.source_manifest),
+            route_depth=args.route_depth,
+            out_dir=Path(args.out_dir) if args.out_dir else None,
+            force=args.force,
+        )
+        print(f"Derived core retrieval pool {result.pool_id}:")
+        print(f"- queries: {result.query_count}")
+        print(f"- candidate pairs: {result.candidate_count}")
+        print(f"- pool: {result.pool_path}")
+        print(f"- manifest: {result.manifest_path}")
+        return 0
+
+    if args.eval_command == "retrieval-full-pool":
+        from personaforge.eval.retrieval_pool import build_exhaustive_retrieval_pool
+
+        result = build_exhaustive_retrieval_pool(
+            Path(args.source_manifest),
+            dataset_path=Path(args.dataset),
+            index_dir=Path(args.index_dir),
+            out_dir=Path(args.out_dir) if args.out_dir else None,
+            force=args.force,
+        )
+        print(f"Built exhaustive retrieval pool {result.pool_id}:")
+        print(f"- queries: {result.query_count}")
+        print(f"- candidate pairs: {result.candidate_count}")
+        print(f"- pool: {result.pool_path}")
+        print(f"- manifest: {result.manifest_path}")
+        return 0
+
+    if args.eval_command == "retrieval-gold-units":
+        from personaforge.eval.retrieval_gold_qrels import extract_gold_units
+
+        client = DeepSeekJsonClient.from_env()
+
+        def report_gold_progress(current: int, total: int) -> None:
+            print(f"Gold units: {current}/{total}", flush=True)
+
+        result = extract_gold_units(
+            Path(args.dataset),
+            client=client,
+            out_path=Path(args.out_file) if args.out_file else None,
+            splits=None if args.split == "all" else [args.split],
+            max_tokens=args.max_tokens,
+            max_attempts=args.max_attempts,
+            progress=report_gold_progress,
+        )
+        print("Completed Gold unit extraction:")
+        print(f"- units: {result['path']}")
+        print(f"- manifest: {result['manifest_path']}")
+        return 0
+
+    if args.eval_command == "retrieval-gold-label":
+        from personaforge.eval.retrieval_gold_qrels import label_gold_aware_pool
+
+        client = DeepSeekJsonClient.from_env()
+
+        def report_gold_label_progress(phase: str, current: int, total: int) -> None:
+            if current == total or current == 1 or current % 10 == 0:
+                print(f"Gold-aware labels {phase}: {current}/{total}", flush=True)
+
+        result = label_gold_aware_pool(
+            Path(args.pool_manifest),
+            dataset_path=Path(args.dataset),
+            gold_units_path=Path(args.gold_units),
+            client=client,
+            label_set=args.label_set,
+            splits=None if args.split == "all" else [args.split],
+            seed_label_manifest=Path(args.seed_label_manifest) if args.seed_label_manifest else None,
+            batch_size=args.batch_size,
+            max_concurrency=args.max_concurrency,
+            max_tokens=args.max_tokens,
+            max_attempts=args.max_attempts,
+            stability_sample_rate=args.stability_sample_rate,
+            budget_cny=args.budget_cny,
+            candidate_warmup_count=args.candidate_warmup_count,
+            limit=args.limit,
+            progress=report_gold_label_progress,
+        )
+        manifest = result["manifest"]
+        print("Completed Gold-aware retrieval labeling:")
+        print(f"- label set: {manifest['label_set']}")
+        print(f"- progress: {manifest['completed']} / {manifest['total']}")
+        print(f"- stability: {manifest['stability']}")
+        print(f"- estimated cost: CNY {manifest.get('estimated_cost_cny', 0):.4f}")
+        print(f"- cache hit rate: {(manifest.get('usage') or {}).get('cache_hit_rate')}")
+        print(f"- labels: {result['labels_path']}")
+        print(f"- metrics: {result['manifest_path'].parent / 'metrics.json'}")
+        return 0
+
+    if args.eval_command == "retrieval-gold-codex-export":
+        from personaforge.eval.retrieval_gold_qrels import export_codex_gold_handoff
+
+        result = export_codex_gold_handoff(
+            Path(args.pool_manifest),
+            dataset_path=Path(args.dataset),
+            gold_units_path=Path(args.gold_units),
+            out_dir=Path(args.out_dir) if args.out_dir else None,
+            label_set=args.label_set,
+        )
+        print("Created Codex Gold-aware handoff:")
+        print(f"- handoff: {result['handoff_id']}")
+        print(f"- package: {result['zip_path']}")
+        print(f"- template: {result['template_path']}")
+        return 0
+
+    if args.eval_command == "retrieval-gold-codex-import":
+        from personaforge.eval.retrieval_gold_qrels import materialize_codex_gold_labels
+
+        result = materialize_codex_gold_labels(
+            Path(args.pool_manifest),
+            Path(args.review_file),
+            dataset_path=Path(args.dataset),
+            gold_units_path=Path(args.gold_units),
+            label_set=args.label_set,
+            splits=None if args.split == "all" else [args.split],
+        )
+        manifest = result["manifest"]
+        print("Completed dual-axis Codex retrieval labeling:")
+        print(f"- label set: {manifest['label_set']}")
+        print(f"- progress: {manifest['completed']} / {manifest['total']}")
+        print(f"- labels: {result['labels_path']}")
+        print(f"- metrics: {result['manifest_path'].parent / 'metrics.json'}")
+        return 0
+
+    if args.eval_command == "retrieval-v1-v2-compare":
+        from personaforge.eval.retrieval_gold_qrels import compare_v1_v2
+
+        result = compare_v1_v2(
+            Path(args.pool_manifest),
+            v1_label_manifest=Path(args.v1_label_manifest),
+            v2_label_manifest=Path(args.v2_label_manifest),
+            out_path=Path(args.out_file) if args.out_file else None,
+        )
+        report = result["report"]
+        print("Completed V1/V2 retrieval-label comparison:")
+        print(f"- compared pairs: {report['all']['total']}")
+        print(f"- V1 0 -> V2 1/2: {report['all']['v1_zero_to_v2_positive']}")
+        print(f"- changed labels: {report['changed_count']}")
+        print(f"- report: {result['path']}")
+        return 0
+
+    if args.eval_command == "retrieval-llm-label":
+        from personaforge.eval.retrieval_judge import label_pool
+
+        client = DeepSeekJsonClient.from_env()
+        last_printed = {"value": -1}
+
+        def report_progress(current: int, total: int) -> None:
+            if current == total or current - last_printed["value"] >= 10:
+                print(f"LLM retrieval labels: {current}/{total}", flush=True)
+                last_printed["value"] = current
+
+        result = label_pool(
+            Path(args.pool_manifest),
+            client=client,
+            label_set=args.label_set,
+            max_tokens=args.max_tokens,
+            max_attempts=args.max_attempts,
+            limit=args.limit,
+            progress=report_progress,
+        )
+        manifest = result["manifest"]
+        print("Completed retrieval LLM labeling:")
+        print(f"- label set: {manifest['label_set']}")
+        print(f"- progress: {manifest['completed']} / {manifest['total']}")
+        print(f"- labels: {result['labels_path']}")
+        print(f"- metrics: {result['manifest_path'].parent / 'metrics.json'}")
+        return 0
+
+    if args.eval_command == "retrieval-codex-label":
+        from personaforge.eval.retrieval_judge import materialize_codex_labels
+
+        result = materialize_codex_labels(
+            Path(args.pool_manifest),
+            Path(args.review_file),
+            label_set=args.label_set,
+        )
+        manifest = result["manifest"]
+        print("Completed offline Codex retrieval labeling:")
+        print(f"- label set: {manifest['label_set']}")
+        print(f"- progress: {manifest['completed']} / {manifest['total']}")
+        print(f"- labels: {result['labels_path']}")
+        print(f"- metrics: {result['manifest_path'].parent / 'metrics.json'}")
+        return 0
+
+    if args.eval_command == "judge":
+        from personaforge.web.generation_evaluation import (
+            GenerationEvaluationStore,
+            GenerationJudgeManager,
+        )
+
+        store = GenerationEvaluationStore(Path(args.data_dir))
+        manager = GenerationJudgeManager(store)
+        job = manager.create(args.system_id, repeats=3)
+        if job["status"] == "completed":
+            print(f"Gold Judge already completed: {job['id']}")
+        elif job["status"] == "running":
+            print(f"Gold Judge is already running in another process: {job['id']}")
+            return 0
+        else:
+            manager.run_once()
+            job = store.public_judge_job(job["id"])
+            print(f"Gold Judge {job['status']}: {job['id']}")
+        print(f"- system: {job['system_id']}")
+        print(f"- model: {job['model']}")
+        print(f"- progress: {job['completed_items']} / {job['total_items']}")
+        if job.get("error_message"):
+            print(f"- error: {job['error_message']}")
         return 0
 
     raise ValueError(f"Unknown eval command: {args.eval_command}")
@@ -933,6 +1433,8 @@ def _write_ask_trace(path: Path, *, query_trace: dict | None, retrieve_result, a
         "writer_prompt": answer.writer_prompt,
         "persona_pack_id": answer.persona_pack_id,
         "persona_pack_sha256": answer.persona_pack_sha256,
+        "narrative_schema_id": answer.narrative_schema_id,
+        "narrative_schema_sha256": answer.narrative_schema_sha256,
         "answer": answer.answer,
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8", newline="\n")
@@ -947,6 +1449,8 @@ def _write_prompt_pack_trace(
     writer_prompt: str,
     persona_pack_id: str | None,
     persona_pack_sha256: str | None,
+    narrative_schema_id: str | None,
+    narrative_schema_sha256: str | None,
 ) -> None:
     import json
 
@@ -981,6 +1485,8 @@ def _write_prompt_pack_trace(
         "writer_prompt": writer_prompt,
         "persona_pack_id": persona_pack_id,
         "persona_pack_sha256": persona_pack_sha256,
+        "narrative_schema_id": narrative_schema_id,
+        "narrative_schema_sha256": narrative_schema_sha256,
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8", newline="\n")
 
@@ -1003,6 +1509,7 @@ def _run_web(args: argparse.Namespace) -> int:
         max_search_results=args.max_search_results,
         temperature=args.temperature,
         max_tokens=args.max_tokens,
+        deployment_guards_enabled=not getattr(args, "no_deployment_guards", False),
     )
     run_web(config)
     return 0
@@ -1114,6 +1621,7 @@ def _run_forge(args: argparse.Namespace) -> int:
             max_search_results=args.max_search_results,
             temperature=args.temperature,
             max_tokens=args.max_tokens,
+            no_deployment_guards=args.no_deployment_guards,
         )
     )
 

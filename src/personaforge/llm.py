@@ -92,13 +92,44 @@ class DeepSeekJsonClient:
         temperature: float = 0.0,
         max_tokens: int = 1024,
     ) -> dict[str, object]:
-        text = self.complete_text(
+        payload, _usage = self.complete_json_with_usage(
             messages,
             temperature=temperature,
             max_tokens=max_tokens,
-            response_format={"type": "json_object"},
         )
-        return parse_json_object(text)
+        return payload
+
+    def complete_json_with_usage(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float = 0.0,
+        max_tokens: int = 1024,
+    ) -> tuple[dict[str, object], LlmUsage | None]:
+        """Return JSON and this request's usage without relying on shared mutable state."""
+
+        body: dict[str, object] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "response_format": {"type": "json_object"},
+        }
+        if self.thinking:
+            body["thinking"] = {"type": self.thinking}
+        payload = _post_json(
+            _chat_endpoint(self.base_url),
+            body,
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            timeout_seconds=self.timeout_seconds,
+        )
+        usage = _usage_from_payload(payload)
+        self.last_usage = usage
+        try:
+            text = str(payload["choices"][0]["message"]["content"]).strip()
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ValueError(f"Unexpected chat completion payload: {payload!r}") from exc
+        return parse_json_object(text), usage
 
     def complete_text(
         self,

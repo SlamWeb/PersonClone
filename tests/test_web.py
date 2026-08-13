@@ -433,8 +433,29 @@ def test_create_app_registers_trace_endpoint(tmp_path) -> None:
     assert "/api/chat/turns" in paths
     assert "/api/chat/turns/{turn_id}" in paths
     assert "/api/memories" in paths
+    assert "/api/studies/study1/admin/studies" in paths
+    assert "/api/studies/study1/studies/{study_id}" in paths
+    assert "/api/studies/study1/studies/{study_id}/sessions" in paths
     assert "/api/memories/{memory_id}" in paths
     assert "/api/memory-settings" in paths
+
+
+def test_health_exposes_actionable_startup_checks(tmp_path) -> None:
+    from personaforge.web.startup_checks import run_startup_checks
+
+    missing_model = tmp_path / "missing-bge-m3"
+    config = WebConfig(data_dir=tmp_path, model_name=str(missing_model))
+    report = run_startup_checks(data_dir=tmp_path, model_name=str(missing_model), env={})
+    app = create_app(config, startup_report=report)
+
+    payload = TestClient(app).get("/health").json()
+
+    assert payload["status"] == "degraded"
+    checks = {item["check_id"]: item for item in payload["preflight"]["checks"]}
+    assert checks["llm_api_key"]["status"] == "error"
+    assert "DEEPSEEK_API_KEY" in checks["llm_api_key"]["message"]
+    assert checks["embedding_model"]["status"] == "error"
+    assert str(missing_model) in checks["embedding_model"]["message"]
 
 
 def test_memory_api_is_user_scoped_and_supports_correction(tmp_path) -> None:

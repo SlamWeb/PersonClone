@@ -101,6 +101,48 @@ def test_current_prompt_avoids_model_generated_quote_labels() -> None:
     assert "模拟人物内心话" in prompt
 
 
+def test_rag_magic_if_prompt_is_generic_and_uses_no_profile_requirement() -> None:
+    prompt = writer_system_prompt("rag_magic_if")
+
+    assert "Magic If" in prompt
+    assert "过去真实发布的问题与回答" in prompt
+    assert "历史示例只提供表达证据" in prompt
+    assert "Persona Pack" not in prompt
+    assert "Narrative Schema" not in prompt
+
+
+def test_rag_magic_if_v2_prompt_is_sample_conditioned_and_generic() -> None:
+    prompt = writer_system_prompt("rag_magic_if_v2")
+
+    assert "真实说过的话" in prompt
+    assert "不是写作规范" in prompt
+    assert "不要把所有样本平均成一份风格说明" in prompt
+    assert "不要复制历史回答中的\n句子" in prompt
+    assert "句法、标点、引号、连接方式" in prompt
+    assert "当前问题决定这次要讨论的内容" in prompt
+    assert "Persona Pack" not in prompt
+    assert "Narrative Schema" not in prompt
+
+
+def test_strong_style_prompts_keep_magic_if_and_separate_context_roles() -> None:
+    direct = writer_system_prompt("strong_style_v1")
+    two_pass = writer_system_prompt("strong_style_2pass_v1")
+
+    assert "Magic If" in direct
+    assert "内容参考和表达示范" in direct
+    assert "内部回答计划" in two_pass
+    assert "不要把两类上下文混成一份摘要" in direct
+
+
+def test_pure_role_rag10_prompt_is_minimal() -> None:
+    prompt = writer_system_prompt("pure_role_rag10_v1")
+
+    assert "化身为他" in prompt
+    assert "只输出最终回答内容" in prompt
+    assert "内容规划" not in prompt
+    assert "表达选择" not in prompt
+
+
 def test_multiturn_writer_uses_real_roles_and_keeps_current_user_last() -> None:
     messages = build_writer_messages(
         query="那普通女人呢？",

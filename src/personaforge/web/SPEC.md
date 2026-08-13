@@ -9,7 +9,7 @@ Web MVP 面向面试展示，目标是把现有 CLI RAG 链路变成一个可交
 ```text
 选择本地 persona
 -> 输入问题
--> FastAPI 调用当前 RAG20 + writer 链路
+-> FastAPI 调用当前 RAG + Narrative Schema writer 链路
 -> SSE 真流式返回回答
 -> 回答完成后展示检索来源
 ```
@@ -22,7 +22,8 @@ Web MVP 面向面试展示，目标是把现有 CLI RAG 链路变成一个可交
 - build/index 的文档与索引语义。
 - query understanding / query transform 策略。
 - dense+sparse retrieval 和 parent RRF 聚合。
-- writer prompt 和生成策略。
+- writer 的生成策略本身；Web 只增加 `mrprompt` 与 Narrative Schema 的接线，旧
+  `persona_pack` 仍保留为兼容对照。
 
 Web 只编排已有 crawler、build 和 index 能力，不在 Web 模块里重写这些逻辑。
 
@@ -77,6 +78,10 @@ src/personaforge/web/
   streaming.py    SSE 序列化工具
 ```
 
+检索评估任务由 Web 进程共享同一套 SQLite 状态；需要脱离 Web 长时间运行时，使用
+`scripts/run_retrieval_eval_worker.py` 启动独立 worker，并显式指向当前仓库的 `data/`。
+worker 只消费 `queued/running` 任务，完成后自行退出，不应与旧目录的服务混用数据库。
+
 React 前端：
 
 ```text
@@ -95,7 +100,17 @@ web/
 
 ### `GET /health`
 
-返回服务状态，并暴露本地 embedding 模型的预热状态：
+返回服务状态、启动前检查和本地 embedding 模型的预热状态。
+
+启动前检查必须是非破坏性的：不加载 BGE-M3、不调用外部 API、不打印秘密。它检查
+`DEEPSEEK_API_KEY`、BGE-M3 配置、数据目录可写性和可选的 `TAVILY_API_KEY`，每项返回
+稳定的 `check_id/status/message/action`。缺少必要配置时 Web 仍应启动，顶层状态为
+`degraded`；配置齐全时为 `ok`。
+
+模型 ID（如 `BAAI/bge-m3`）未命中本地 Hugging Face 缓存只记为 warning，因为首次
+入库或检索可以自动下载。只有显式本地模型路径不存在或为空时才记为 error。
+
+embedding 模型预热状态：
 
 - `idle`：尚未开始加载；
 - `loading`：正在后台加载；
@@ -111,6 +126,9 @@ Windows 下 `FlagEmbedding -> datasets -> pyarrow` 的首次原生依赖导入�
 Uvicorn 和应用 worker 启动之前，随后才允许后台加载模型权重。当前环境约束
 `pyarrow>=21,<24`；已验证 PyArrow 24 在本项目 Windows 进程中可能触发无法被 Python
 异常捕获的 access violation，表现为服务没有 shutdown 日志便直接退出。
+
+`pf web` 启动时必须把同一份检查报告打印到终端。Docker 健康检查只判断 Web 进程是否
+可访问，因此 `degraded` 仍返回 HTTP 200；具体能力是否可用由 `preflight` 字段表达。
 
 ### `GET /api/personas`
 
@@ -131,10 +149,16 @@ data/authors/zhihu/<author>/index/
   "author": "wu-ren-jun-28",
   "query": "如何看待女生常说的配得感",
   "query_mode": "grounded",
-  "writer_prompt": "strong_identity",
+  "writer_prompt": "mrprompt",
   "parent_top_k": 20
 }
 ```
+
+`mrprompt` 需要作者目录中的 `narrative_schema.json`。没有该文件的作者仍可选择
+`strong_identity` 或兼容的 `persona_pack`。现有会话摘要、最近对话和用户记忆继续由
+会话层提供；Web 不额外实现一套 STM。`parent_top_k=20` 与 `parent_top_k=5` 可用于
+RAG20/RAG5 对照，但这两个版本必须在相同的 query understanding、query transform 和
+writer prompt 下比较。
 
 响应为 SSE：
 
@@ -243,6 +267,108 @@ Web 主界面采用“分身空间”而不是通用 AI Chat 的信息架构：
 - 按钮使用克制的触觉微交互：悬停和选中状态在约 140-180 ms 内连续过渡，按下时在
   60 ms 内轻微下沉并缩小，释放后平滑复位；图标按钮和发送按钮的按压反馈可以略强。
   必须尊重 `prefers-reduced-motion`，不能用涟漪或明显弹跳干扰阅读。
+
+## Chat 与 Evaluate 工作区
+
+右侧主区域顶部使用 `Chat / Evaluate / Experiment` 工作区控件。`Chat` 与 `Evaluate`
+继续保存在产品壳内；产品中的 `Experiment` 是仅管理员可见的研究工作台，跳转到
+`/experiment/admin` 查看实验作者、参与码、进行中/已完成进度、匿名提交回放和独立导出。
+它不是参与者入口，也不放进左侧实验台。参与者只能通过研究者分发的干净作者专属
+`/experiment/<study_id>` 链接进入，避免聊天侧栏、作者库和开发者评估暗示被试。
+
+Study 1 支持多作者并以 `study_id` 隔离。`/experiment/admin` 提供实验作者选择、参与码
+生成、专属链接复制和独立导出；参与者页面不提供作者选择。旧 `/experiment` 只用于兼容
+首份材料库，不作为正式招募链接。相关 API 包括：
+
+参与者首次提交邀请码后，前端在浏览器本地保存 `{session_id, resume_token}`，后续每个
+`/api/studies/study1/sessions/{session_id}/...` 请求通过
+`X-Study-Session-Token` 发送该凭据。参与码恢复会轮换凭据；仅保存旧 `session_id` 的早期
+浏览器记录会回到邀请码页，而不会绕过会话校验。
+
+```text
+GET  /api/studies/study1/admin/studies
+GET  /api/studies/study1/studies/{study_id}
+POST /api/studies/study1/studies/{study_id}/sessions
+GET  /api/studies/study1/admin/overview?study_id={study_id}
+GET  /api/studies/study1/admin/export?study_id={study_id}&format=jsonl|csv
+```
+
+`Evaluate` 只消费 `pf eval retrieval-pool` 已冻结的候选池，不在 Web 请求中调用 LLM、
+embedding 或 Qdrant。页面包含：
+
+- 总进度、每题进度和“只看未完成”。
+- 问题列表与前后导航。
+- 当前问题、候选标题、完整 parent 正文和知乎原文链接。
+- `0 无用 / 1 有一定帮助 / 2 明显有用 / 暂时跳过`。
+- `0/1/2` 键盘快捷键和前后方向键。
+- JSONL、CSV 导出。
+
+Evaluate 必须在固定高度工作区内运行：RAG 和 Generate 共用相同宽度的左侧评估栏与
+顶部留白；材料正文只在中间阅读区滚动，底部评分操作始终可见。RAG 候选材料不重复写
+“候选材料”这类无信息标签；`pin` 使用“想法”作为标题，article/answer 使用原题目。
+Generate 的“作者原回答”“系统回答”“候选 A/B”必须采用黑色、可快速扫描的明确标题，
+并通过边框与留白区分比较对象。评估与实验表单的小字号以 100% 浏览器缩放可读为底线，
+不依赖用户放大页面才能辨认。
+
+每次点击有效分数后立即写入 `data/system/personaforge.sqlite3`。数据库主键为
+`pool_id + item_id + parent_id + user_id`，因此用户之间互相隔离，重复评分为修订而非
+新增。候选顺序根据用户、池、问题和 parent ID 做稳定哈希排序，刷新后不变。
+
+为了降低标注暗示，未评分候选的 API 响应不返回 route/rank 详情；评分成功后才返回并
+允许展开。网页发现不到候选池时只显示生成命令，不隐式创建或修改实验数据。
+
+新增 API：
+
+```text
+GET /api/evaluations/retrieval/pools
+GET /api/evaluations/retrieval/pools/{pool_id}
+GET /api/evaluations/retrieval/pools/{pool_id}/queries/{item_id}
+PUT /api/evaluations/retrieval/pools/{pool_id}/queries/{item_id}/candidates/{parent_id}
+GET /api/evaluations/retrieval/pools/{pool_id}/export?format=jsonl|csv
+```
+
+### Generate 评估工作区
+
+`Evaluate` 内部再使用 `RAG / Generate` 两段式控件切换评估对象。RAG 保留当前候选材料
+标注；Generate 自动发现冻结且与 `temporal_dev10_v0` 哈希一致的完整系统 run。切换
+不会改变 Chat 工作区或当前作者。
+
+Generate 提供三个相互独立的测量入口和一个总览：
+
+- 人工六维：选择一个系统，逐题同时查看 question、Gold 和 Candidate；D1--D6 分别
+  选择 1--5，理由可选。允许逐维即时保存，但六维齐全才算该题完成。
+- 匿名 AB：选择两个完整系统，逐题查看 Gold 与匿名 A/B，强制二选一，不提供平局；
+  系统名在作答后才揭示。
+- LLM Judge：展示 Gold Judge V1 六维均分、三组汇总、稳定性和逐题证据；未运行时可
+  创建后台任务，用户可以离开页面或切换工作区。
+- 总览：按系统显示六维结果、人工进度、AB 胜率和 Judge 状态。六维不合成排行榜总分，
+  D6 单独展示。
+
+人工记录按登录用户隔离并写入现有 SQLite；系统 run 和自动 Judge 结果为所有登录用户
+共享的实验资产。Generate API 至少包括：
+
+```text
+GET  /api/evaluations/generation/systems
+GET  /api/evaluations/generation/systems/{system_id}
+GET  /api/evaluations/generation/systems/{system_id}/items/{item_id}
+PUT  /api/evaluations/generation/systems/{system_id}/items/{item_id}/rubric
+GET  /api/evaluations/generation/comparisons/{left_id}/{right_id}
+GET  /api/evaluations/generation/comparisons/{left_id}/{right_id}/items/{item_id}
+PUT  /api/evaluations/generation/comparisons/{left_id}/{right_id}/items/{item_id}
+POST /api/evaluations/generation/judge-jobs
+GET  /api/evaluations/generation/judge-jobs/{job_id}
+```
+
+Generate 页面不能现场重新生成 dev10 Candidate。生成仍由可复跑 eval runner 完成；新
+run 写入后刷新系统列表即可出现。Judge 后端服务同时允许 CLI 调用，但网页是普通用户
+的主要入口。
+
+同一系统的 Judge 任务使用持久化结果目录。若任务因瞬时模型或网络错误失败，再次发起
+时应复用原任务和已写入的 `result.json`，从已完成题目继续，而不是重新创建一套重复
+的 Judge 结果。
+
+Study 1 的配对题应直接告诉被试：拖动选中文字可标注“像”或“不像”的依据，且 A/B
+两边均可标注；不要把这项发现性交互藏在实现里。
 
 ## Persona Metadata
 
@@ -462,8 +588,22 @@ SQLite 中把这些历史会话一次性认领给首位管理员。相同 `sessi
 ```text
 数据库没有用户 -> Web 首屏创建第一位管理员并认领 local-user 历史
 数据库已有用户 -> Web 首屏只允许登录
-新增协作者 -> pf user create <username>
+已有管理员 -> 侧栏“成员”抽屉创建协作者或管理员账号
 ```
+
+成员抽屉仅对管理员显示。`协作者` 可共同使用 Chat、作者库和 Evaluate；`管理员`
+额外可管理 Study 1 的实验、参与码、导出与成员账号。`pf user create <username>` 仍保留
+为服务端恢复和自动化入口，但不再是正常协作流程的唯一入口。
+
+管理 API 只允许管理员调用：
+
+```text
+GET  /api/admin/users
+POST /api/admin/users
+```
+
+接口只返回用户名、显示名、角色和创建时间，绝不返回密码或密码哈希。新账号的会话与
+长期记忆从创建时起独立；作者材料、索引和实验配置仍是团队共享资源。
 
 密码只保存 Argon2 哈希。登录成功后由 FastAPI 生成高熵随机 Session Token，浏览器
 通过 `HttpOnly + SameSite=Lax` Cookie 自动携带；SQLite 只保存 Token 的 SHA-256
@@ -852,6 +992,108 @@ GET /api/personas/{author}/suggestions
 - 多模型对比。
 - session memory。
 
+## 工作区与侧栏
+
+顶部 `Chat / Evaluate` 是同一应用内的工作区切换，不共享同一套上下文侧栏：
+
+- `Chat` 展示作者身份、历史会话、记忆和实验设置侧栏。
+- `Evaluate` 展示评估集、完成进度和问题列表侧栏，不显示历史会话。
+- 两种侧栏都可独立收起和恢复，状态分别保存在浏览器本地；切换工作区不会覆盖另一种侧栏状态。
+- 作者头像窄栏始终保留，用于切换分身和进入作者库。
+
+Evaluate 主区使用连续白色画布：顶部问题区和底部评分区只通过细边界分隔，中间的单篇待评内容使用克制的阅读框承载，不使用灰白相间的大色块。评分区必须明确展示当前判断问题，正文、标签和评分说明不得依赖低对比度小字传达关键信息。
+
+候选内容不显示“候选材料”等自解释标签。`answer` 和 `article` 展示原始标题；`pin` 不把正文首句伪装成标题，统一显示“想法”。Chat 会话侧栏只显示当前作者名称和状态，不重复展示作者头像；全局作者头像栏负责切换身份，主区空状态头像负责角色呈现。
+
+检索评估集选择器同时展示完整候选池和派生核心池，并在名称后显示候选总数。核心池与
+完整池共享人工标签，但完成进度分别按各自候选集合计算；默认优先展示新生成的核心池，
+避免把宽候选池误当成人工任务单。
+
+### Gold-aware 检索报告
+
+检索机器报告兼容两代标注。旧 `query_only_relevance_v1` 继续显示单一 `score`；
+`gold_aware_dual_axis_v2` 必须提供“内容支撑”和“作者表达支撑”切换。切换后，指标、
+候选相关性顺序、当前分数、证据和 Gold unit 映射都必须来自同一个轴，不能用内容轴
+排序却展示表达轴分数。
+
+V2 报告显示作者真实回答、冻结 Gold units、候选全文、两轴分数、候选证据、映射的
+unit ID、复判次数和一致性状态。完整 Qrels 的 Recall 文案必须明确分母为时间切分前
+全部可用作者语料；旧候选池只能称为六路候选并集。指标包括 Hit、MRR、graded nDCG、
+Precision、Recall 和 MAP，支持 `K=1/3/5/10/20/30` 及 all/dev/test 视图。若存在
+`comparison_v1_vs_v2.json`，报告展示改判总数和旧 0 分转为 V2 1/2 分的数量。
+
+这些 Gold-aware 数据只允许从登录后的 Evaluate 接口读取，不得加入 Chat 请求、
+在线 reranker、writer 上下文或参与者 Study 页面。部分完成的标签集必须显示
+`completed/total`，其中 completed 只统计完成所需稳定性复评的标签。页面同时显示已有
+首遍、待首遍和待复评数量，不得把只有第一遍结果的样本计入稳定 Qrels，也不得将
+partial Test20 指标包装成正式结果。
+
+候选池与 LLM 报告是两个独立资产。候选池选择器可以列出尚未建立 LLM 标签集的冻结池，
+但必须明确显示“未标注”；选中此类候选池后仍保留报告侧栏和候选池切换入口，不能因为
+没有标签集而卸载整个报告工作区。无标签池只显示空状态，不得伪造指标或逐题结果。
+
+当前全量报告的正式完成状态为 `12690/12690`，30 道题均可按相关性顺序查看 423 篇
+候选材料；前端必须读取标签目录内冻结的多 K 指标，而不是按当前页面可见候选重新计算。
+两个轴均应显示 `eligible_author_corpus_before_cutoff` 的完整语料 Recall 范围，并提供
+all/dev/test 与 `K=1/3/5/10/20/30` 切换。
+
+Evaluate 顶部只保留 `RAG / Generate` 一级对象切换。RAG 内的“人工标注 / LLM 报告”
+属于当前 RAG 工作区，固定放在左侧栏标题下方，不能与顶部一级控件争抢空间。两种视图
+共用相同的侧栏宽度、高度、收起入口和内部滚动边界；切换视图时产品外壳不得跳动。
+
+LLM 报告再拆成“指标总览”和“逐题标注”。指标总览只展示当前 all/dev/test 划分内的
+逐题平均指标，必须明确写出“不是某一道单题”；逐题标注只展示当前问题、Gold 锚点和
+全部候选材料，不重复显示聚合指标。问题列表和候选材料各自具有真实滚动容器，不能依赖
+浏览器整页滚动，也不能因为父容器 `overflow: hidden` 而裁掉内容。
+
+RAG 工作区新增第三个同级视图“评估任务”，用于初始化和维护多作者检索评估资产。任务
+创建表单选择作者、labeler、dev/test 范围和预算；管理员可以创建 DeepSeek API 任务，
+协作者可以创建 Codex handoff、下载任务包、导入结果和查看报告。普通 Study 参与者不能
+访问该入口。
+
+任务列表至少显示阶段、完成量、缓存命中/未命中 token、输出 token、估算成本、预算、
+错误和恢复动作。状态包括 `queued / running / awaiting_codex / paused_budget / completed /
+failed / cancelled / interrupted`。离开页面不影响任务；刷新或服务重启后从 SQLite 恢复。
+Codex 导入由浏览器读取本地结果 JSON 后提交结构化请求，不要求用户在后端终端输入命令。
+评估任务列表跟随左侧表单当前选择的作者展示；创建任务后立即显示任务卡和后台准备提示，
+不能因为全局作者范围与表单作者不同而把刚创建的任务过滤掉。
+
+任务完成后只发布不可变 dataset/pool/label 资产，现有“LLM 报告”继续从这些资产读取；
+任务面板本身不直接重算指标，也不能把 partial 标签包装为正式结果。
+若同一全量 pool 上存在 dev/test 两套 label set，报告的问题列表必须按 label manifest 的
+`selected_splits` 过滤；例如 dev 任务完成后只显示 10 道 dev 题，不能把 test20 显示为
+未完成。逐题报告按所选效用轴先展示 2 分、再展示 1 分和 0 分材料，并保留检索顺序供核对。
+
+### Generate 方法对比总览
+
+Generate 的“总览”不是把不同 dev 集或不同 Judge 版本混成一张榜单。前端先按
+`dataset_id + dataset_sha256` 选择冻结数据集，再按 `prompt_version` 选择评估体系。
+同一选择下展示所有自动发现的生成系统：已完成 Judge 的系统展示内容/风格/自然度分组
+均值和 D1--D6 矩阵，未运行该版本 Judge 的系统保留在列表中并明确标记为“未运行”。
+缺失值不得当作 0 分，也不得参与方法排序。
+
+### 多作者评估作用域
+
+评估资产必须按作者隔离。顶部作者头像在 Evaluate 工作区中改变当前作者作用域；人工
+检索、LLM 检索报告、评估任务和 Generate 系统列表都只能读取该作者的资产。页面不得
+把不同作者的候选池、Gold 回答或生成回答拼成一个逐题任务。没有作者元数据的历史资产
+继续保留，但显示为“未归属/旧数据”，不能猜测归属，也不能参与跨作者 AB 对比。
+
+作者头像栏提供“全部作者”入口。该入口只用于管理者查看跨作者汇总，不用于人工标注、
+逐题 Generate 评分或跨作者 AB。跨作者汇总的主口径是宏平均：先在每个作者内部按兼容
+的冻结数据集、切分、Top K 和 Judge/标签版本计算平均，再对作者平均；查询数加权的
+微平均只能作为补充。不同协议、数据集哈希、标签版本或 Judge 版本不得直接平均。
+
+后端列表接口支持可选的 `author` 查询参数，前端切换作者时重新请求而不是仅隐藏已加载
+的卡片。Generate 的 `_compatible_pair` 必须同时检查冻结数据集、题目集合和作者身份；
+任一系统缺失作者身份，或两者作者不同，都返回明确错误。这样作者切换不仅是视觉筛选，
+也是数据边界和实验有效性的约束。
+
+生成方法的显示名由 `manifest.writer_prompt` 映射为 MRPrompt、Persona Pack、Strong
+Identity、Current 或 Writer Replay；未知方法回退到 manifest 的运行名。Judge 结果公开
+携带 `prompt_version`，旧结果没有该字段时由后端回退到当前 Gold Judge 版本，以便旧
+dev10 运行继续进入对比页面。
+
 ## Docker 静态资源契约
 
 容器部署设置：
@@ -863,3 +1105,59 @@ PERSONAFORGE_WEB_DIST=/app/web/dist
 `app.py` 优先读取该环境变量定位编译后的 React 静态资源；本地开发未设置时，
 继续使用仓库内的 `web/dist`。这样生产镜像可以使用普通 wheel 安装，不依赖
 editable install 的源码路径。
+# 2026-08 生成报告交互补充
+
+Generate 总览使用同一冻结 dev 集和 Judge 版本横向比较不同生成 run。每个 run 的方法
+名称、方法标识、父版本、Prompt 版本、Writer 上下文篇数、温度、模型和代码 revision
+来自 manifest 的非敏感元数据，不能只依赖本地运行目录名。
+
+点击某个方法的 Judge 详情后，页面先显示方法概览和稳定性表，再显示 10 个独立题目链接。
+每个链接带 `generationView`、`generationSystem`、`generationItem` 查询参数，刷新或复制
+链接可以直接打开对应题目的详情，不要求从第一题滚动到目标题。单题详情显示作者原回答、
+系统回答、六个维度的最终分、三次原始评分、证据和 Judge 理由，并保留上一题/下一题导航。
+### RAG LLM 标注报告
+
+RAG 评估保留“人工标注”和“LLM 报告”两种并列视图。人工视图继续使用按用户
+稳定打乱、评分前隐藏 route/rank 的流程；机器视图读取候选池旁的共享
+`llm_labels/<label_set>/` 资产，不在 Web 请求中调用 LLM。
+
+“指标总览”支持 all30、dev10、test20 切换，并在 `K=1/3/5/10/20/30` 上展示六路
+Hit、MRR、分级 nDCG、Precision、Recall 和 MAP 的逐题平均值。完整 Qrels 的 Recall
+范围写为时间切分前全部可用作者语料；旧候选池报告才写为冻结六路候选并集。
+
+“逐题标注”将当前问题的候选 parent 按 2 分、1 分、0 分和最佳路由排名排序，每张材料
+卡显示完整正文、0/1/2 标签、短证据、理由、知乎链接和六路 rank；同时可以切换为
+“检索顺序”核对各路召回位置。切换问题只改变单题标题、Gold 锚点和候选列表，不应出现
+不随问题变化的聚合指标卡。
+
+候选池 V0 与六路 V1 都允许被 Web 自动发现；问题列表随 split 切换，逐题报告始终按
+相关性展示最有用材料。这个排序只服务于观察，不会修改冻结候选池、标签或生成链路。
+
+新增 API：
+
+```text
+GET /api/evaluations/retrieval/pools/{pool_id}/llm-labels
+GET /api/evaluations/retrieval/pools/{pool_id}/llm-labels/{label_set}
+GET /api/evaluations/retrieval/pools/{pool_id}/llm-labels/{label_set}/queries/{item_id}
+```
+
+### 部署保护与输入边界
+
+默认启动时开启轻量部署保护，目标是保护通过 Cloudflare Tunnel 或私有网络分享的
+单进程实例，不把它当作分布式安全系统。普通 Chat 请求按登录用户限流：每 10 分钟最多
+10 次、每个用户同时只能有 1 个排队或运行中的回答、全局最多 2 个活动回答；超限返回
+`429` 和 `Retry-After`。活动数读取持久化的 `turn_runs` 状态，因此完成、失败、重启恢复
+后都会自然释放容量。
+
+登录失败按直接连接地址在 5 分钟内最多记录 8 次；成功登录会清除该地址的失败计数。
+Chat 输入长度限制为 4000 个字符。保护层只包 Chat 和登录，不包离线评估、Judge、RAG
+标注任务或作者入库任务，它们继续使用各自的队列、预算和并发控制。
+
+`pf web` 和 `pf forge` 默认开启保护；仅在本机受控测试时使用
+`--no-deployment-guards` 临时关闭。当前实现是进程内锁和内存时间窗，若以后扩展为多进程
+或多实例，需要迁移到 Redis 等共享限流存储，不能直接复用这一版。
+
+安全审计约束：SQLite 的用户输入必须通过参数绑定传入；动态 SQL 只能使用代码内固定的
+字段白名单，不能把用户名、作者名、路径或请求参数直接拼进 SQL。返回统一安全响应头，
+包括 `X-Content-Type-Options`、`X-Frame-Options`、`Referrer-Policy` 和受限的
+`Permissions-Policy`；没有为了不破坏现有 React 静态资源而强行加入 CSP。

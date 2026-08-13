@@ -1,187 +1,138 @@
-# PersonaForge Open Source
+# PersonaForge
 
-Local-first creator persona RAG.
-
-This repo is the planned open-source product version split from the research workspace. The MVP goal is simple:
+PersonaForge 是一个 local-first 的创作者数字分身平台：抓取公开创作者内容，构建本地
+BGE-M3 混合检索索引，再通过 FastAPI + React 提供带引用、记忆、Trace 和评估的对话体验。
 
 ```text
-crawl public creator content locally
--> build a local RAG index
--> connect your own LLM API key
--> chat with a local web UI
+公开内容抓取 -> Markdown 语料 -> parent/child 节点 -> Qdrant 混合检索
+-> query understanding/transform -> 作者回答生成 -> Trace 与离线评估
 ```
 
-The detailed contract lives in [SPEC.md](SPEC.md).
+项目导航见 [navigation.md](navigation.md)，系统约束见 [SPEC.md](SPEC.md)。
 
-当前 Web 支持按账号隔离的持久会话与跨会话用户记忆。记忆只从用户消息中异步提取，
-不会把作者生成内容写成用户事实；用户可以在侧栏的“我的记忆”里查看、纠正、置顶、
-遗忘或关闭自动写入。
+## 已有能力
 
-## Quick Start
+- 知乎公开回答、文章、想法抓取，必要时使用本地登录态回退。
+- 每位作者独立目录与 Qdrant collection，Web 端异步执行 `crawl -> build -> index`。
+- BGE-M3 dense/sparse、BM25、query transform 与 RRF 检索链路。
+- FastAPI + React 单端口 Web、SSE 流式回答、持久会话和用户长期记忆。
+- Chat 全链路 Trace、RAG 评估、生成评估和 Study 1 实验管理。
+- SQLite 用户隔离、管理员/协作者账号、部署限流和可恢复后台任务。
 
-从 GitHub 安装当前开发版：
+## 本地首次启动
+
+要求 Python 3.11、Node.js 20。Windows PowerShell：
 
 ```powershell
+git clone https://github.com/SlamWeb/PersonaForge-.git
+cd PersonaForge-
 python -m venv .venv
-.\.venv\Scripts\activate
+.\.venv\Scripts\Activate.ps1
 python -m pip install -U pip
-pip install -e ".[all]"
+pip install -e ".[all,dev]"
 playwright install chromium
-pf forge zhihu <author-token> --quality fast
+Copy-Item .env.example .env
 ```
 
-`pf forge` 默认抓取所有当前可访问内容，然后依次 build、index 并在
-`http://127.0.0.1:8000/` 启动 Web。若公开接口不可用，先保存本地登录态：
+在 `.env` 中至少填写：
+
+```dotenv
+DEEPSEEK_API_KEY=你的_Key
+```
+
+构建前端并启动：
+
+```powershell
+cd web
+npm ci
+npm run build
+cd ..
+pf web --port 8000
+```
+
+打开 `http://127.0.0.1:8000/`。首次打开会创建第一位管理员；系统不开放公共注册，
+管理员可以在成员面板添加协作者。
+
+服务启动时会先打印配置检查。缺少 API Key、本地模型目录错误或数据目录不可写时，
+网页仍可启动，但终端与 `GET /health` 会明确说明受影响能力和修复方式。
+
+## 一键创建作者
+
+CLI 全流程：
+
+```powershell
+pf forge zhihu <用户名或作者 token> --quality fast
+```
+
+也可以登录 Web 后进入作者库，输入知乎用户名或主页 URL。任务会写入 SQLite，由后台
+Worker 异步抓取、构建和入库；期间可以继续使用其他作者和对话。
+
+若公开接口无法获得完整内容，再保存本机登录态：
 
 ```powershell
 pf zhihu-login
-pf forge zhihu <author-token> --quality fast
 ```
 
-开发者安装和验证：
+登录态只保存在 `data/auth/zhihu_storage_state.json`，不会发送给浏览器或提交到 Git。
 
-```powershell
-pip install -e ".[all,dev]"
-pf --help
-pf init
-python -m pytest -q
-```
+## Docker 首次启动
 
-The current MVP contains:
-
-- Zhihu-like crawler output contract.
-- Markdown -> parent docs -> title/lead/passage child nodes.
-- BGE-M3 dense+sparse local Qdrant indexing.
-- Query understanding + query transform + RAG20 generation.
-- FastAPI Web backend with SSE streaming.
-- React/Vite Web frontend.
-- Web 作者库与服务端异步 `crawl -> build -> index` 任务。
-
-## Web MVP
-
-Install backend Web dependencies:
-
-```powershell
-pip install -e ".[web,dev]"
-```
-
-Start the FastAPI backend:
-
-```powershell
-pf web mock-columnist --port 8000
-```
-
-Docker 或服务器部署时显式监听所有网卡：
-
-```powershell
-pf web mock-columnist --host 0.0.0.0 --port 8000
-```
-
-本地默认仍绑定 `127.0.0.1`，不会无意暴露给局域网或公网。
-
-For frontend development:
-
-```powershell
-cd web
-npm install
-npm run dev
-```
-
-Open:
-
-```text
-http://127.0.0.1:5173/
-```
-
-For a single-port local run, build the frontend first and let FastAPI serve `web/dist`:
-
-```powershell
-cd web
-npm run build
-cd ..
-pf web mock-columnist --port 8000
-```
-
-Then open:
-
-```text
-http://127.0.0.1:8000/
-```
-
-首次打开时，网页会要求创建第一位管理员，并自动接管升级前已有的本地历史会话。
-以后只显示登录页，不开放公共注册。给协作者增加独立账号：
-
-```powershell
-pf user create collaborator
-pf user list
-```
-
-密码通过终端隐藏输入。作者语料与索引在账号间共享；聊天记录、生成任务和 Trace
-按账号隔离。Tailscale 可以限制哪些设备能够访问服务，但多人使用时仍需分别登录。
-
-页面左侧可以切换已就绪作者；“管理作者库”进入 `/authors`。添加作者时输入
-知乎用户名或主页 URL，确认后可以关闭弹窗或继续打开其他对话。服务端会把
-任务写入 SQLite，再由单 Worker 在后台依次抓取 Markdown、构建节点和创建
-Qdrant 索引。
-
-已有服务端登录态会自动作为知乎浏览器 fallback：
-
-```text
-data/auth/zhihu_storage_state.json
-```
-
-登录态只由后台 Worker 读取，不会发送到网页。
-
-## Docker Deployment
-
-当前 Docker 镜像包含 Web、索引依赖和 Playwright Chromium，因此也能执行
-网页发起的服务端作者任务。构建和空数据 smoke：
+Docker 镜像包含前端构建产物、FastAPI、CPU 检索依赖和 Playwright Chromium。
 
 ```powershell
 Copy-Item .env.example .env
-docker build -t personaforge:local .
-docker run --rm --name personaforge -p 8000:8000 personaforge:local
-```
-
-访问 `http://127.0.0.1:8000/health` 应返回 `{"status":"ok"}`。
-挂载已有本地数据并后台运行：
-
-```powershell
+# 编辑 .env，填写 DEEPSEEK_API_KEY
 docker compose up -d --build
-docker compose ps
+docker compose logs -f app
 ```
 
-数据卷、模型缓存、API Key 和线上服务器步骤见
+访问：
+
+```text
+http://127.0.0.1:8000/
+http://127.0.0.1:8000/health
+```
+
+新机器没有 BGE-M3 缓存时，启动检查会显示 warning，首次入库或检索时自动下载
+`BAAI/bge-m3`；Docker volume 会保留 Hugging Face 缓存。完整部署和排错说明见
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)。
 
-## Offline Evaluation
+仓库的 GitHub Actions 会在全新 Linux runner 上完成 Python 测试、React 构建、Docker
+镜像构建，以及“空数据、无模型、无 API Key”的首次启动 smoke。这个流程不会占用开发
+电脑的内存。
 
-PersonaForge can prepare a strict temporal holdout without rebuilding the local index. It keeps the newest valid answers out of retrieval, including all later articles and pins, then dynamically excludes those parent IDs in every dense/sparse query.
+## 评估与实验
+
+时间切分评估集：
 
 ```powershell
 pf eval prepare <author>
-pf eval run <author> --dataset data/eval/<dataset>/dataset.jsonl --split dev --run-name baseline
 ```
 
-For a low-cost smoke run, add `--limit 1`. Each run writes a local manifest, machine-readable `runs.jsonl`, and one Markdown review file per question under `data/eval/`. Evaluation outputs are intentionally ignored by git. LLM judging and rewrite loops are a later stage; v0 starts with reproducible generation and human review.
+Web 的 Evaluate 工作区包含：
 
-## Current Decisions
+- RAG：人工标注、LLM 报告、六路检索指标和可恢复评估任务。
+- Generate：人工六维、匿名 AB、LLM Judge 与多次评分稳定性报告。
+- Experiment：Study 1 邀请码、实验进度、参与者回放和分析导出。
 
-- MVP 是 local-first CLI + Web；连接该 Web 的用户可以把作者任务提交给服务
-  宿主机执行。
-- Sample corpus will use self-made Zhihu-like Markdown under `samples/zhihu_mock_md/`.
-- `--quality fast` is the default build path and does not call an LLM for preprocessing.
-- `--quality full` may add document summaries, but does not create hypothetical questions.
-- Query transform happens at query time.
-- LLM providers will be abstracted for DeepSeek, OpenAI, and OpenRouter.
-- Embedding stays local with BGE-M3 in the first version.
-- Web uses FastAPI + React/Vite. Streamlit/Gradio are not the main architecture.
-- Web 作者库复用 CLI 的 crawl/build/index 实现，通过 SQLite 队列异步编排，
-  不在 API 层重复实现抓取和入库逻辑。
-- `pf forge` is the one-command CLI orchestration for crawl -> build -> index -> Web.
+所有真实语料、索引、会话、API 输出和实验响应都位于 `data/`，默认不进入版本控制。
 
-No real crawled corpus, auth state, local index, model files, eval output, or API keys should be committed.
+## 开发验证
 
-## Notes For Contributors
+```powershell
+python scripts/check_no_secrets.py
+python -m pytest -q
+cd web
+npm run build
+```
 
-Implementation notes are tracked in [docs/IMPLEMENTATION_NOTES.md](docs/IMPLEMENTATION_NOTES.md). Each module should be explainable enough for an interview, not just runnable.
+## 数据与秘密边界
+
+以下内容不得提交：
+
+- `.env` 与任何 API Key。
+- `data/` 下的真实语料、Cookie/登录态、模型、索引、会话和评估结果。
+- 本地数据库、Trace、临时导出和运行日志。
+
+仓库仅保留自制的 `samples/zhihu_mock_md/` 作为格式示例。Docker 构建上下文同样排除
+`.env`、`data/` 和 `run.txt`。

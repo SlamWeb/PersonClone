@@ -31,6 +31,21 @@ class BootstrapRequest(BaseModel):
     display_name: str | None = Field(default=None, max_length=80)
 
 
+class AdminUserCreateRequest(BaseModel):
+    username: str = Field(min_length=2, max_length=32)
+    password: str = Field(min_length=8, max_length=256)
+    display_name: str | None = Field(default=None, max_length=80)
+    role: Literal["admin", "member"] = "member"
+
+
+class AdminUserInfo(AuthUserInfo):
+    created_at: str
+
+
+class AdminUsersResponse(BaseModel):
+    users: list[AdminUserInfo]
+
+
 class PersonaInfo(BaseModel):
     author: str
     source: str
@@ -40,6 +55,7 @@ class PersonaInfo(BaseModel):
     headline: str = ""
     content_count: int | None = None
     persona_pack_available: bool = False
+    narrative_schema_available: bool = False
     profile_url: str | None = None
     last_synced_at: str | None = None
 
@@ -140,9 +156,9 @@ class AuthorJobsResponse(BaseModel):
 class ChatStreamRequest(BaseModel):
     author: str | None = None
     session_id: str | None = None
-    query: str = Field(min_length=1)
+    query: str = Field(min_length=1, max_length=4000)
     query_mode: Literal["raw", "grounded"] = "grounded"
-    writer_prompt: Literal["current", "strong_identity", "persona_pack"] = "strong_identity"
+    writer_prompt: Literal["current", "strong_identity", "persona_pack", "mrprompt"] = "mrprompt"
     parent_top_k: int = Field(default=20, ge=1, le=40)
     trace_capture: Literal["summary", "full"] = "summary"
 
@@ -205,3 +221,32 @@ class UserMemorySettingsResponse(BaseModel):
 class UserMemorySettingsPatchRequest(BaseModel):
     enabled: bool | None = None
     auto_write: bool | None = None
+
+
+class RetrievalLabelRequest(BaseModel):
+    score: int = Field(ge=0, le=2)
+
+
+class RetrievalEvalJobCreateRequest(BaseModel):
+    author: str = Field(min_length=1, max_length=200)
+    labeler: Literal["deepseek_api", "codex_handoff", "manual_import"] = "codex_handoff"
+    split: Literal["dev", "test"] = "dev"
+    budget_cny: float = Field(default=5.0, gt=0, le=1000)
+
+
+class RetrievalEvalJobResumeRequest(BaseModel):
+    budget_cny: float | None = Field(default=None, gt=0, le=1000)
+
+
+class GenerationRubricRequest(BaseModel):
+    scores: dict[str, int | None] = Field(default_factory=dict)
+    note: str = Field(default="", max_length=2000)
+
+
+class GenerationPairwiseRequest(BaseModel):
+    choice: Literal["A", "B"]
+
+
+class GenerationJudgeJobRequest(BaseModel):
+    system_id: str = Field(min_length=16, max_length=128)
+    repeats: int = Field(default=3, ge=3, le=3)

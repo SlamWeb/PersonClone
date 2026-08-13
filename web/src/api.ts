@@ -11,6 +11,10 @@ export type AuthState = {
   user?: AuthUser | null;
 };
 
+export type AdminUser = AuthUser & {
+  created_at: string;
+};
+
 export type UserMemory = {
   id: string;
   kind: 'semantic' | 'episodic' | 'procedural';
@@ -41,6 +45,7 @@ export type PersonaInfo = {
   headline: string;
   content_count?: number | null;
   persona_pack_available: boolean;
+  narrative_schema_available?: boolean;
   profile_url?: string | null;
   last_synced_at?: string | null;
 };
@@ -104,7 +109,7 @@ export type ChatStreamRequest = {
   session_id?: string | null;
   query: string;
   query_mode: 'raw' | 'grounded';
-  writer_prompt: 'current' | 'strong_identity' | 'persona_pack';
+  writer_prompt: 'current' | 'strong_identity' | 'persona_pack' | 'mrprompt';
   parent_top_k: number;
   trace_capture: 'summary' | 'full';
 };
@@ -316,6 +321,350 @@ export type TraceStage = {
   usage?: TraceUsage | null;
 };
 
+export type RetrievalPoolSummary = {
+  pool_id: string;
+  dataset_id: string;
+  display_name?: string;
+  author: string;
+  author_status?: 'assigned' | 'unassigned';
+  split: string;
+  query_count: number;
+  candidate_count: number;
+  labeled_count: number;
+  completed: boolean;
+  created_at: string;
+  llm_label_sets?: Array<{
+    label_set: string;
+    status: string;
+    completed: number;
+    total: number;
+  }>;
+  recall_scope?: string;
+  counts?: {
+    queries?: number;
+    candidate_pairs?: number;
+    eligible_parents_per_query?: number;
+    unique_parents?: number;
+  };
+};
+
+export type RetrievalQuerySummary = {
+  item_id: string;
+  ordinal: number;
+  query: string;
+  split?: string;
+  candidate_count: number;
+  labeled_count: number;
+  completed: boolean;
+};
+
+export type RetrievalWorkspace = {
+  pool: Pick<RetrievalPoolSummary, 'pool_id' | 'dataset_id' | 'display_name' | 'author' | 'split' | 'created_at' | 'recall_scope'>;
+  progress: { labeled: number; total: number; completed: boolean };
+  queries: RetrievalQuerySummary[];
+};
+
+export type RetrievalCandidate = {
+  parent_id: string;
+  ordinal: number;
+  title: string;
+  text: string;
+  url: string;
+  kind: string;
+  score: 0 | 1 | 2 | null;
+  retrieval_details?: Record<string, { rank: number; score: number }> | null;
+};
+
+export type RetrievalQuery = {
+  pool_id: string;
+  item_id: string;
+  query: string;
+  candidate_count: number;
+  labeled_count: number;
+  candidates: RetrievalCandidate[];
+};
+
+export type RetrievalRouteMetrics = {
+  route: string;
+  cutoff: number;
+  query_count: number;
+  candidate_count: number;
+  judged_candidate_count: number;
+  judged_query_count: number;
+  fully_judged_query_count?: number;
+  unjudged_query_count: number;
+  coverage: number;
+  hit_at_k: number | null;
+  mrr_at_k: number | null;
+  ndcg_at_k: number | null;
+  precision_at_k: number | null;
+  recall_at_k: number | null;
+  map_at_k?: number | null;
+  relevant_query_count?: number;
+  no_relevant_query_count?: number;
+  by_cutoff?: Record<string, Omit<RetrievalRouteMetrics, 'by_cutoff'>>;
+};
+
+export type RetrievalMetrics = {
+  schema_version?: string;
+  cutoff: number;
+  cutoffs?: number[];
+  recall_scope?: string;
+  relevance_threshold: number;
+  query_count: number;
+  candidate_count?: number;
+  judged_candidate_count?: number;
+  relevant_candidate_count?: number;
+  coverage?: number;
+  routes: Record<string, RetrievalRouteMetrics>;
+  splits?: Record<string, RetrievalMetrics>;
+};
+
+export type RetrievalLlmLabelSet = {
+  label_set: string;
+  status: string;
+  model: string;
+  prompt_version: string;
+  completed: number;
+  total: number;
+  progress?: {
+    pass1_completed?: number;
+    judge_pass1_completed?: number;
+    missing_pass1?: number;
+    pass2_required?: number;
+    pass2_completed?: number;
+    pending_pass2?: number;
+    pass3_required?: number;
+    pass3_completed?: number;
+    pending_pass3?: number;
+    stability_completed?: number;
+  };
+  updated_at?: string;
+  axes?: Record<string, { label?: string; values?: number[] }>;
+  default_axis?: string;
+  selected_splits?: string[];
+  metrics: RetrievalMetrics;
+};
+
+export type RetrievalLlmWorkspace = {
+  pool: Pick<RetrievalPoolSummary, 'pool_id' | 'dataset_id' | 'display_name' | 'author' | 'split' | 'created_at' | 'recall_scope' | 'counts'>;
+  label_set: Omit<RetrievalLlmLabelSet, 'metrics' | 'updated_at'>;
+  active_axis?: string;
+  metrics: RetrievalMetrics;
+  comparison?: {
+    v1_label_set: string;
+    v2_label_set: string;
+    comparison_axis: string;
+    total: number;
+    changed_count: number;
+    v1_zero_to_v2_positive: number;
+    transition_counts: Record<string, Record<string, number>>;
+  } | null;
+  queries: RetrievalQuerySummary[];
+};
+
+export type RetrievalLlmCandidate = {
+  parent_id: string;
+  relevance_order: number;
+  best_route_rank: number;
+  route_count: number;
+  title: string;
+  text: string;
+  url: string;
+  kind: string;
+  score: 0 | 1 | 2 | null;
+  axis_scores?: Record<string, 0 | 1 | 2>;
+  confidence?: string | null;
+  evidence?: string;
+  reason?: string;
+  content_candidate_evidence?: string;
+  content_gold_unit_ids?: string[];
+  persona_candidate_evidence?: string;
+  persona_gold_unit_ids?: string[];
+  repeat_count?: number;
+  exact_agreement?: boolean | null;
+  status: string;
+  route_ranks: Record<string, { rank: number; score: number }>;
+};
+
+export type RetrievalLlmQuery = {
+  pool_id: string;
+  label_set: string;
+  axes?: Record<string, { label?: string; values?: number[] }>;
+  active_axis?: string;
+  item_id: string;
+  query: string;
+  gold_answer?: string;
+  gold_units?: Record<string, Array<{ id?: string; text?: string }>>;
+  candidate_count: number;
+  labeled_count: number;
+  candidates: RetrievalLlmCandidate[];
+};
+
+export type RetrievalEvalJob = {
+  id: string;
+  author: string;
+  owner_id: string;
+  labeler: 'deepseek_api' | 'codex_handoff' | 'manual_import';
+  split: 'dev' | 'test';
+  status: 'queued' | 'running' | 'awaiting_codex' | 'paused_budget' | 'completed' | 'failed' | 'interrupted';
+  stage: string;
+  label: string;
+  dataset_id: string;
+  label_set?: string | null;
+  budget_cny: number;
+  completed_items: number;
+  total_items: number;
+  estimated_cost_cny: number;
+  usage: {
+    request_count?: number;
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+    prompt_cache_hit_tokens?: number;
+    prompt_cache_miss_tokens?: number;
+    cache_hit_rate?: number | null;
+    estimated_cost_cny?: number;
+  };
+  handoff_ready: boolean;
+  error_message?: string | null;
+  created_at: string;
+  updated_at: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+};
+
+export type GenerationSystem = {
+  system_id: string;
+  run_name: string;
+  method_id?: string;
+  display_name: string;
+  description: string;
+  parent_method?: string | null;
+  author: string;
+  author_status?: 'assigned' | 'unassigned';
+  dataset_id: string;
+  dataset_sha256: string;
+  split: string;
+  item_count: number;
+  writer_prompt: string;
+  prompt_version?: string | null;
+  prompt_sha256?: string;
+  parameters?: Record<string, unknown>;
+  git_revision?: string;
+  model: string;
+  created_at: string;
+  human_progress?: { completed: number; total: number };
+  judge?: GenerationJudgeJob | null;
+};
+
+export type GenerationDimension = {
+  key: string;
+  short: string;
+  label: string;
+  question: string;
+  anchors: Record<string, string>;
+};
+
+export type GenerationItemSummary = {
+  item_id: string;
+  ordinal: number;
+  question: string;
+  completed: boolean;
+};
+
+export type GenerationJudgeSummary = {
+  item_count: number;
+  dimensions: Record<string, {
+    count: number;
+    mean: number | null;
+    median: number | null;
+    ci95: [number | null, number | null];
+    exact_agreement: number | null;
+    within_one_agreement: number | null;
+    mean_range: number | null;
+  }>;
+  groups: Record<string, number | null>;
+};
+
+export type GenerationJudgeJob = {
+  id: string;
+  system_id: string;
+  status: 'queued' | 'running' | 'completed' | 'failed';
+  stage: string;
+  label: string;
+  model: string;
+  repeats: number;
+  completed_items: number;
+  total_items: number;
+  prompt_version?: string | null;
+  error_message?: string | null;
+  created_at: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+  result?: GenerationJudgeSummary | null;
+};
+
+export type GenerationWorkspace = {
+  system: GenerationSystem;
+  rubric: GenerationDimension[];
+  groups: Record<string, string>;
+  progress: { completed: number; total: number };
+  items: GenerationItemSummary[];
+  judge?: GenerationJudgeJob | null;
+};
+
+export type GenerationItem = {
+  system: GenerationSystem;
+  item_id: string;
+  question: string;
+  gold_answer: string;
+  candidate_answer: string;
+  human_scores: Record<string, number>;
+  human_note: string;
+  human_completed: boolean;
+  judge?: {
+    dimensions: Record<string, {
+      score: number | null;
+      status: string;
+      gold_evidence: string[];
+      candidate_evidence: string[];
+      reason: string;
+      exact_agreement?: number | null;
+      within_one_agreement?: number | null;
+      range?: number | null;
+      raw_ratings?: Array<{
+        repeat: number;
+        score: number | null;
+        status?: string;
+        reason?: string;
+        gold_evidence?: string[];
+        candidate_evidence?: string[];
+      }>;
+    }>;
+    groups: Record<string, number | null>;
+  } | null;
+};
+
+export type GenerationComparison = {
+  comparison_id: string;
+  systems: GenerationSystem[];
+  progress: { completed: number; total: number };
+  items: GenerationItemSummary[];
+  result: { votes: number; wins: Array<{ system: GenerationSystem; count: number }> };
+};
+
+export type GenerationComparisonItem = {
+  comparison_id: string;
+  item_id: string;
+  question: string;
+  gold_answer: string;
+  candidate_a: string;
+  candidate_b: string;
+  choice: 'A' | 'B' | null;
+  revealed: { A: GenerationSystem; B: GenerationSystem } | null;
+};
+
 export async function fetchAuthState(): Promise<AuthState> {
   const response = await apiFetch('/api/auth/state');
   if (!response.ok) throw new Error(await apiError(response, '无法读取登录状态'));
@@ -349,6 +698,28 @@ export async function loginAuth(username: string, password: string): Promise<Aut
 export async function logoutAuth(): Promise<void> {
   const response = await apiFetch('/api/auth/logout', { method: 'POST' });
   if (!response.ok) throw new Error(await apiError(response, '无法退出登录'));
+}
+
+export async function fetchAdminUsers(): Promise<AdminUser[]> {
+  const response = await apiFetch('/api/admin/users');
+  if (!response.ok) throw new Error(await apiError(response, '无法读取成员'));
+  const payload = await response.json();
+  return payload.users || [];
+}
+
+export async function createAdminUser(request: {
+  username: string;
+  password: string;
+  display_name?: string;
+  role: 'admin' | 'member';
+}): Promise<AdminUser> {
+  const response = await apiFetch('/api/admin/users', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(request)
+  });
+  if (!response.ok) throw new Error(await apiError(response, '无法创建成员'));
+  return response.json();
 }
 
 export async function fetchMemories(): Promise<UserMemory[]> {
@@ -406,6 +777,243 @@ export async function fetchPersonas(): Promise<{ personas: PersonaInfo[]; defaul
   if (!response.ok) {
     throw new Error(`Failed to load personas: ${response.status}`);
   }
+  return response.json();
+}
+
+export async function fetchRetrievalPools(author?: string | null): Promise<RetrievalPoolSummary[]> {
+  const query = author ? `?author=${encodeURIComponent(author)}` : '';
+  const response = await apiFetch(`/api/evaluations/retrieval/pools${query}`);
+  if (!response.ok) throw new Error(await apiError(response, '无法读取检索评估集'));
+  const payload = await response.json();
+  return payload.pools || [];
+}
+
+export async function fetchRetrievalWorkspace(poolId: string): Promise<RetrievalWorkspace> {
+  const response = await apiFetch(`/api/evaluations/retrieval/pools/${encodeURIComponent(poolId)}`);
+  if (!response.ok) throw new Error(await apiError(response, '无法读取评估进度'));
+  return response.json();
+}
+
+export async function fetchRetrievalQuery(poolId: string, itemId: string): Promise<RetrievalQuery> {
+  const response = await apiFetch(
+    `/api/evaluations/retrieval/pools/${encodeURIComponent(poolId)}/queries/${encodeURIComponent(itemId)}`
+  );
+  if (!response.ok) throw new Error(await apiError(response, '无法读取候选材料'));
+  return response.json();
+}
+
+export async function fetchRetrievalLlmLabelSets(poolId: string): Promise<RetrievalLlmLabelSet[]> {
+  const response = await apiFetch(
+    `/api/evaluations/retrieval/pools/${encodeURIComponent(poolId)}/llm-labels`
+  );
+  if (!response.ok) throw new Error(await apiError(response, '无法读取 LLM 检索标注'));
+  const payload = await response.json();
+  return payload.label_sets || [];
+}
+
+export async function fetchRetrievalLlmWorkspace(
+  poolId: string,
+  labelSet: string,
+  axis?: string
+): Promise<RetrievalLlmWorkspace> {
+  const query = axis ? `?axis=${encodeURIComponent(axis)}` : '';
+  const response = await apiFetch(
+    `/api/evaluations/retrieval/pools/${encodeURIComponent(poolId)}/llm-labels/${encodeURIComponent(labelSet)}${query}`
+  );
+  if (!response.ok) throw new Error(await apiError(response, '无法读取 LLM 检索报告'));
+  return response.json();
+}
+
+export async function fetchRetrievalLlmQuery(
+  poolId: string,
+  labelSet: string,
+  itemId: string,
+  axis?: string
+): Promise<RetrievalLlmQuery> {
+  const query = axis ? `?axis=${encodeURIComponent(axis)}` : '';
+  const response = await apiFetch(
+    `/api/evaluations/retrieval/pools/${encodeURIComponent(poolId)}/llm-labels/${encodeURIComponent(labelSet)}` +
+      `/queries/${encodeURIComponent(itemId)}${query}`
+  );
+  if (!response.ok) throw new Error(await apiError(response, '无法读取 LLM 检索材料'));
+  return response.json();
+}
+
+export async function fetchRetrievalEvalJobs(): Promise<RetrievalEvalJob[]> {
+  const response = await apiFetch('/api/evaluations/retrieval/jobs');
+  if (!response.ok) throw new Error(await apiError(response, '无法读取检索评估任务'));
+  const payload = await response.json();
+  return payload.jobs || [];
+}
+
+export async function createRetrievalEvalJob(request: {
+  author: string;
+  labeler: RetrievalEvalJob['labeler'];
+  split: RetrievalEvalJob['split'];
+  budget_cny: number;
+}): Promise<RetrievalEvalJob> {
+  const response = await apiFetch('/api/evaluations/retrieval/jobs', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(request)
+  });
+  if (!response.ok) throw new Error(await apiError(response, '无法创建检索评估任务'));
+  return response.json();
+}
+
+export async function resumeRetrievalEvalJob(jobId: string, budgetCny: number): Promise<RetrievalEvalJob> {
+  const response = await apiFetch(`/api/evaluations/retrieval/jobs/${encodeURIComponent(jobId)}/resume`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ budget_cny: budgetCny })
+  });
+  if (!response.ok) throw new Error(await apiError(response, '无法继续检索评估任务'));
+  return response.json();
+}
+
+export async function downloadRetrievalEvalHandoff(jobId: string): Promise<void> {
+  const response = await apiFetch(`/api/evaluations/retrieval/jobs/${encodeURIComponent(jobId)}/handoff`);
+  if (!response.ok) throw new Error(await apiError(response, '无法下载 Codex handoff'));
+  const blob = await response.blob();
+  const disposition = response.headers.get('content-disposition') || '';
+  const matchedName = disposition.match(/filename="?([^";]+)"?/i)?.[1];
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = matchedName || `${jobId}-codex-handoff.zip`;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
+export async function importRetrievalEvalReview(
+  jobId: string,
+  review: Record<string, unknown>
+): Promise<RetrievalEvalJob> {
+  const response = await apiFetch(`/api/evaluations/retrieval/jobs/${encodeURIComponent(jobId)}/codex-review`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(review)
+  });
+  if (!response.ok) throw new Error(await apiError(response, '无法导入双轴标注'));
+  return response.json();
+}
+
+export async function saveRetrievalLabel(
+  poolId: string,
+  itemId: string,
+  parentId: string,
+  score: 0 | 1 | 2
+): Promise<{ retrieval_details: Record<string, { rank: number; score: number }> }> {
+  const response = await apiFetch(
+    `/api/evaluations/retrieval/pools/${encodeURIComponent(poolId)}/queries/${encodeURIComponent(itemId)}` +
+      `/candidates/${encodeURIComponent(parentId)}`,
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ score })
+    }
+  );
+  if (!response.ok) throw new Error(await apiError(response, '无法保存评分'));
+  return response.json();
+}
+
+export function retrievalExportUrl(poolId: string, format: 'jsonl' | 'csv'): string {
+  return `/api/evaluations/retrieval/pools/${encodeURIComponent(poolId)}/export?format=${format}`;
+}
+
+export async function fetchGenerationSystems(author?: string | null): Promise<GenerationSystem[]> {
+  const query = author ? `?author=${encodeURIComponent(author)}` : '';
+  const response = await apiFetch(`/api/evaluations/generation/systems${query}`);
+  if (!response.ok) throw new Error(await apiError(response, '无法读取生成系统'));
+  const payload = await response.json();
+  return payload.systems || [];
+}
+
+export async function fetchGenerationWorkspace(systemId: string): Promise<GenerationWorkspace> {
+  const response = await apiFetch(`/api/evaluations/generation/systems/${encodeURIComponent(systemId)}`);
+  if (!response.ok) throw new Error(await apiError(response, '无法读取生成评估'));
+  return response.json();
+}
+
+export async function fetchGenerationItem(systemId: string, itemId: string): Promise<GenerationItem> {
+  const response = await apiFetch(
+    `/api/evaluations/generation/systems/${encodeURIComponent(systemId)}/items/${encodeURIComponent(itemId)}`
+  );
+  if (!response.ok) throw new Error(await apiError(response, '无法读取生成回答'));
+  return response.json();
+}
+
+export async function saveGenerationRubric(
+  systemId: string,
+  itemId: string,
+  scores: Record<string, number>,
+  note = ''
+): Promise<{ completed: boolean }> {
+  const response = await apiFetch(
+    `/api/evaluations/generation/systems/${encodeURIComponent(systemId)}/items/${encodeURIComponent(itemId)}/rubric`,
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scores, note })
+    }
+  );
+  if (!response.ok) throw new Error(await apiError(response, '无法保存六维评分'));
+  return response.json();
+}
+
+export async function fetchGenerationComparison(leftId: string, rightId: string): Promise<GenerationComparison> {
+  const response = await apiFetch(
+    `/api/evaluations/generation/comparisons/${encodeURIComponent(leftId)}/${encodeURIComponent(rightId)}`
+  );
+  if (!response.ok) throw new Error(await apiError(response, '无法读取 AB 对比'));
+  return response.json();
+}
+
+export async function fetchGenerationComparisonItem(
+  leftId: string,
+  rightId: string,
+  itemId: string
+): Promise<GenerationComparisonItem> {
+  const response = await apiFetch(
+    `/api/evaluations/generation/comparisons/${encodeURIComponent(leftId)}/${encodeURIComponent(rightId)}` +
+      `/items/${encodeURIComponent(itemId)}`
+  );
+  if (!response.ok) throw new Error(await apiError(response, '无法读取 AB 材料'));
+  return response.json();
+}
+
+export async function saveGenerationPairwise(
+  leftId: string,
+  rightId: string,
+  itemId: string,
+  choice: 'A' | 'B'
+): Promise<{ choice: 'A' | 'B'; revealed: { A: GenerationSystem; B: GenerationSystem } }> {
+  const response = await apiFetch(
+    `/api/evaluations/generation/comparisons/${encodeURIComponent(leftId)}/${encodeURIComponent(rightId)}` +
+      `/items/${encodeURIComponent(itemId)}`,
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ choice })
+    }
+  );
+  if (!response.ok) throw new Error(await apiError(response, '无法保存 AB 选择'));
+  return response.json();
+}
+
+export async function createGenerationJudgeJob(systemId: string): Promise<GenerationJudgeJob> {
+  const response = await apiFetch('/api/evaluations/generation/judge-jobs', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ system_id: systemId, repeats: 3 })
+  });
+  if (!response.ok) throw new Error(await apiError(response, '无法创建 Judge 任务'));
+  return response.json();
+}
+
+export async function fetchGenerationJudgeJob(jobId: string): Promise<GenerationJudgeJob> {
+  const response = await apiFetch(`/api/evaluations/generation/judge-jobs/${encodeURIComponent(jobId)}`);
+  if (!response.ok) throw new Error(await apiError(response, '无法读取 Judge 任务'));
   return response.json();
 }
 

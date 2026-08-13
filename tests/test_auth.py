@@ -62,6 +62,67 @@ def test_browser_session_bootstrap_login_and_logout(tmp_path) -> None:
         assert logged_in.json()["authenticated"] is True
 
 
+def test_web_adds_basic_security_headers_and_bounds_chat_input(tmp_path) -> None:
+    app = create_app(WebConfig(data_dir=tmp_path, auth_required=False))
+
+    with TestClient(app) as client:
+        response = client.get("/api/auth/state")
+        assert response.headers["x-content-type-options"] == "nosniff"
+        assert response.headers["x-frame-options"] == "DENY"
+        assert response.headers["referrer-policy"] == "same-origin"
+
+        oversized = client.post(
+            "/api/chat/turns",
+            json={"author": "alice", "query": "x" * 4001},
+        )
+        assert oversized.status_code == 422
+
+
+def test_admin_can_create_collaborators_but_members_cannot_manage_accounts(tmp_path) -> None:
+    app = create_app(WebConfig(data_dir=tmp_path, auth_required=True))
+
+    with TestClient(app) as client:
+        assert client.post(
+            "/api/auth/bootstrap",
+            json={"username": "owner", "password": "password-123", "display_name": "Owner"},
+        ).status_code == 200
+
+        created = client.post(
+            "/api/admin/users",
+            json={
+                "username": "partner",
+                "password": "password-456",
+                "display_name": "Partner",
+                "role": "admin",
+            },
+        )
+        assert created.status_code == 201
+        assert created.json()["role"] == "admin"
+        assert "password" not in created.json()
+
+        collaborator = client.post(
+            "/api/admin/users",
+            json={"username": "member", "password": "password-789", "role": "member"},
+        )
+        assert collaborator.status_code == 201
+        assert {user["username"] for user in client.get("/api/admin/users").json()["users"]} == {
+            "owner",
+            "partner",
+            "member",
+        }
+
+        assert client.post("/api/auth/logout").status_code == 200
+        assert client.post(
+            "/api/auth/login",
+            json={"username": "member", "password": "password-789"},
+        ).status_code == 200
+        assert client.get("/api/admin/users").status_code == 403
+        assert client.post(
+            "/api/admin/users",
+            json={"username": "blocked", "password": "password-000", "role": "member"},
+        ).status_code == 403
+
+
 def test_users_cannot_read_each_others_conversations_or_turns(tmp_path) -> None:
     auth = AuthStore(tmp_path)
     alice = auth.create_user(username="alice", password="password-123")

@@ -25,6 +25,7 @@ from personaforge.ingest.query_understanding import (
 )
 from personaforge.ingest.retrieve import ParentHit, RetrieveResult, retrieve_parents, retrieve_parents_for_queries
 from personaforge.llm import DeepSeekJsonClient, JsonChatClient
+from personaforge.persona.narrative import load_narrative_schema_for_index
 from personaforge.persona.pack import load_persona_pack_for_index
 from personaforge.persona.writer import build_writer_messages
 from personaforge.web.conversations import ConversationStore
@@ -76,6 +77,7 @@ class WebConfig:
     auth_required: bool = True
     secure_cookies: bool | None = None
     session_days: int = 30
+    deployment_guards_enabled: bool = True
 
 
 @dataclass(slots=True)
@@ -87,6 +89,7 @@ class LocalPersona:
     headline: str
     content_count: int | None
     persona_pack_available: bool
+    narrative_schema_available: bool
     profile_url: str | None
     last_synced_at: str | None
     author_dir: Path
@@ -120,6 +123,9 @@ class PreparedChat:
     persona_pack_id: str | None = None
     persona_pack_sha256: str | None = None
     persona_pack_claim_count: int = 0
+    narrative_schema_id: str | None = None
+    narrative_schema_sha256: str | None = None
+    narrative_schema_facet_count: int = 0
     turn_id: str | None = None
     turn_plan: dict[str, Any] | None = None
     conversation_context: dict[str, Any] | None = None
@@ -317,6 +323,11 @@ class PersonaChatService:
             persona_pack = (
                 load_persona_pack_for_index(index_dir, required=True)
                 if writer_prompt == "persona_pack"
+                else None
+            )
+            narrative_schema = (
+                load_narrative_schema_for_index(index_dir, required=True)
+                if writer_prompt == "mrprompt"
                 else None
             )
             stages: list[dict[str, Any]] = []
@@ -621,6 +632,7 @@ class PersonaChatService:
                 objective_background=objective_background,
                 writer_prompt=writer_prompt,
                 persona_pack=persona_pack,
+                narrative_schema=narrative_schema,
                 conversation_summary=conversation_context.summary,
                 conversation_messages=turns_to_chat_messages(selected_turns),
                 response_depth=plan.response_depth,
@@ -649,6 +661,9 @@ class PersonaChatService:
                         "persona_pack_id": persona_pack.pack_id if persona_pack else None,
                         "persona_pack_sha256": persona_pack.sha256 if persona_pack else None,
                         "persona_pack_claim_count": persona_pack.claim_count if persona_pack else 0,
+                        "narrative_schema_id": narrative_schema.schema_id if narrative_schema else None,
+                        "narrative_schema_sha256": narrative_schema.sha256 if narrative_schema else None,
+                        "narrative_schema_facet_count": narrative_schema.facet_count if narrative_schema else 0,
                         "selected_user_memory_count": len(selected_memories),
                     },
                     usage=estimated_usage_for_text(
@@ -691,6 +706,9 @@ class PersonaChatService:
             persona_pack_id=persona_pack.pack_id if persona_pack else None,
             persona_pack_sha256=persona_pack.sha256 if persona_pack else None,
             persona_pack_claim_count=persona_pack.claim_count if persona_pack else 0,
+            narrative_schema_id=narrative_schema.schema_id if narrative_schema else None,
+            narrative_schema_sha256=narrative_schema.sha256 if narrative_schema else None,
+            narrative_schema_facet_count=narrative_schema.facet_count if narrative_schema else 0,
             turn_id=turn_id,
             turn_plan=plan.to_dict(),
             conversation_context=conversation_context.trace_payload(),
@@ -738,6 +756,11 @@ class PersonaChatService:
                 index_dir,
                 required=writer_prompt == "persona_pack",
             ) if writer_prompt == "persona_pack" else None
+            narrative_schema = (
+                load_narrative_schema_for_index(index_dir, required=True)
+                if writer_prompt == "mrprompt"
+                else None
+            )
             query_trace: dict[str, Any] | None = None
             objective_background = ""
             understanding_ms = 0
@@ -859,6 +882,7 @@ class PersonaChatService:
                 objective_background=objective_background,
                 writer_prompt=writer_prompt,
                 persona_pack=persona_pack,
+                narrative_schema=narrative_schema,
             )
             stages.append(
                 self._stage(
@@ -872,6 +896,9 @@ class PersonaChatService:
                         "persona_pack_id": persona_pack.pack_id if persona_pack else None,
                         "persona_pack_sha256": persona_pack.sha256 if persona_pack else None,
                         "persona_pack_claim_count": persona_pack.claim_count if persona_pack else 0,
+                        "narrative_schema_id": narrative_schema.schema_id if narrative_schema else None,
+                        "narrative_schema_sha256": narrative_schema.sha256 if narrative_schema else None,
+                        "narrative_schema_facet_count": narrative_schema.facet_count if narrative_schema else 0,
                     },
                     usage=estimated_usage_for_text(*(message.get("content", "") for message in messages)),
                 )
@@ -911,6 +938,9 @@ class PersonaChatService:
             persona_pack_id=persona_pack.pack_id if persona_pack else None,
             persona_pack_sha256=persona_pack.sha256 if persona_pack else None,
             persona_pack_claim_count=persona_pack.claim_count if persona_pack else 0,
+            narrative_schema_id=narrative_schema.schema_id if narrative_schema else None,
+            narrative_schema_sha256=narrative_schema.sha256 if narrative_schema else None,
+            narrative_schema_facet_count=narrative_schema.facet_count if narrative_schema else 0,
         )
         self.record_prepared_trace(prepared)
         yield prepared
@@ -1170,6 +1200,9 @@ class PersonaChatService:
                 "persona_pack_id": prepared.persona_pack_id,
                 "persona_pack_sha256": prepared.persona_pack_sha256,
                 "persona_pack_claim_count": prepared.persona_pack_claim_count,
+                "narrative_schema_id": prepared.narrative_schema_id,
+                "narrative_schema_sha256": prepared.narrative_schema_sha256,
+                "narrative_schema_facet_count": prepared.narrative_schema_facet_count,
                 "duration_ms": prepared.writer_build_duration_ms,
                 "context_parents": [
                     {"rank": hit.rank, "parent_id": hit.parent_id, "title": hit.title}
@@ -1495,6 +1528,10 @@ def list_local_personas(data_dir: Path = Path("data")) -> list[LocalPersona]:
                     persona_pack_available=(
                         (author_dir / "persona_pack.json").exists()
                         or (index_dir / "persona_pack.json").exists()
+                    ),
+                    narrative_schema_available=(
+                        (author_dir / "narrative_schema.json").exists()
+                        or (index_dir / "narrative_schema.json").exists()
                     ),
                     profile_url=profile.get("profile_url"),
                     last_synced_at=indexed_at(index_dir),

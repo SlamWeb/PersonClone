@@ -243,9 +243,9 @@ python -m pytest -q
 - 浏览器 fallback 的 URL 标准化、类型匹配、storage state 解析。
 - CLI crawl 写出 `profile.json`、`manifest.jsonl` 和 `.md` 文件。
 
-## 2026-07-05 与旧研究语料的兼容性检查
+## 2026-07-05 与历史语料格式的兼容性检查
 
-已对照 `C:\PersonaForge` 里的旧 crawler 和旧 raw corpus：
+已对照迁移前的历史 crawler 和 raw corpus：
 
 - 旧 raw corpus 包含 `answer-*`、`article-*`、`pin-*` 三类 Markdown。
 - 三类文件共享同一个 raw contract：

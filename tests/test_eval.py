@@ -51,6 +51,47 @@ def test_prepare_temporal_dataset_excludes_every_future_parent(tmp_path) -> None
     ]
 
 
+def test_prepare_sparse_author_test_only_uses_all_answers_including_short_ones(tmp_path) -> None:
+    index_dir = tmp_path / "index"
+    index_dir.mkdir()
+    parents = [
+        parent("zhihu:article:old", "2024-01-01T00:00:00+08:00", "旧文章", kind="article"),
+        parent("zhihu:answer:1", "2024-02-01T00:00:00+08:00", "短回答一", text="很短"),
+        parent("zhihu:answer:2", "2024-03-01T00:00:00+08:00", "长回答二"),
+        parent("zhihu:answer:3", "2024-04-01T00:00:00+08:00", "短回答三", text="也很短"),
+    ]
+    write_parents(index_dir, parents)
+
+    result = prepare_temporal_dataset(
+        author="sparse-author",
+        index_dir=index_dir,
+        out_dir=tmp_path / "eval",
+        test_size=3,
+        test_only=True,
+    )
+
+    records = [json.loads(line) for line in result.dataset_path.read_text(encoding="utf-8").splitlines()]
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+
+    assert result.dev_count == 0
+    assert result.test_count == 3
+    assert [record["split"] for record in records] == ["test", "test", "test"]
+    assert [record["parent_id"] for record in records] == [
+        "zhihu:answer:1",
+        "zhihu:answer:2",
+        "zhihu:answer:3",
+    ]
+    assert manifest["selection"]["protocol"] == "sparse_author_test_only"
+    assert manifest["selection"]["test_only"] is True
+    assert manifest["selection"]["temporal_cutoff"] is None
+    assert manifest["selection"]["corpus_policy"] == "exclude_eval_answers_only"
+    assert manifest["excluded_parent_ids"] == [
+        "zhihu:answer:1",
+        "zhihu:answer:2",
+        "zhihu:answer:3",
+    ]
+
+
 def test_eval_runner_writes_machine_and_human_artifacts(monkeypatch, tmp_path) -> None:
     index_dir = tmp_path / "index"
     index_dir.mkdir()
@@ -95,12 +136,19 @@ def test_eval_runner_writes_machine_and_human_artifacts(monkeypatch, tmp_path) -
     assert json.loads(result.manifest_path.read_text(encoding="utf-8"))["status"] == "completed"
 
 
-def parent(doc_id: str, created_at: str, title: str, *, kind: str = "answer") -> dict[str, object]:
+def parent(
+    doc_id: str,
+    created_at: str,
+    title: str,
+    *,
+    kind: str = "answer",
+    text: str | None = None,
+) -> dict[str, object]:
     return {
         "doc_id": doc_id,
         "kind": kind,
         "title": title,
-        "text": "这是一段足够长的原作者回答，用于构造临时评测数据。",
+        "text": text or "这是一段足够长的原作者回答，用于构造临时评测数据。",
         "created_at": created_at,
         "path": f"{doc_id}.md",
     }

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from personaforge.ingest.retrieve import ParentHit
+from personaforge.persona.narrative import NarrativeSchema, render_narrative_schema_prompt
 from personaforge.persona.pack import PersonaPack, render_persona_pack_prompt
 
 
@@ -28,6 +29,8 @@ class AnswerResult:
     writer_prompt: str
     persona_pack_id: str | None = None
     persona_pack_sha256: str | None = None
+    narrative_schema_id: str | None = None
+    narrative_schema_sha256: str | None = None
 
 
 def generate_answer(
@@ -38,10 +41,14 @@ def generate_answer(
     objective_background: str = "",
     writer_prompt: str = "current",
     persona_pack: PersonaPack | None = None,
+    narrative_schema: NarrativeSchema | None = None,
     conversation_summary: dict[str, Any] | None = None,
     conversation_messages: list[dict[str, str]] | None = None,
     response_depth: str | None = None,
     clarification_focus: str = "",
+    content_hits: list[ParentHit] | None = None,
+    style_hits: list[ParentHit] | None = None,
+    content_plan: dict[str, Any] | None = None,
     temperature: float = 0.85,
     max_tokens: int = 1600,
 ) -> AnswerResult:
@@ -51,19 +58,29 @@ def generate_answer(
         objective_background=objective_background,
         writer_prompt=writer_prompt,
         persona_pack=persona_pack,
+        narrative_schema=narrative_schema,
         conversation_summary=conversation_summary,
         conversation_messages=conversation_messages,
         response_depth=response_depth,
         clarification_focus=clarification_focus,
+        content_hits=content_hits,
+        style_hits=style_hits,
+        content_plan=content_plan,
     )
     answer = llm.complete_text(messages, temperature=temperature, max_tokens=max_tokens).strip()
     return AnswerResult(
         answer=answer,
         messages=messages,
-        parent_titles=[hit.title for hit in parent_hits],
+        parent_titles=[hit.title for hit in _merge_parent_hits(parent_hits, content_hits, style_hits)],
         writer_prompt=writer_prompt,
         persona_pack_id=persona_pack.pack_id if writer_prompt == "persona_pack" and persona_pack else None,
         persona_pack_sha256=persona_pack.sha256 if writer_prompt == "persona_pack" and persona_pack else None,
+        narrative_schema_id=(
+            narrative_schema.schema_id if writer_prompt == "mrprompt" and narrative_schema else None
+        ),
+        narrative_schema_sha256=(
+            narrative_schema.sha256 if writer_prompt == "mrprompt" and narrative_schema else None
+        ),
     )
 
 
@@ -74,10 +91,14 @@ def build_prompt_pack(
     objective_background: str = "",
     writer_prompt: str = "current",
     persona_pack: PersonaPack | None = None,
+    narrative_schema: NarrativeSchema | None = None,
     conversation_summary: dict[str, Any] | None = None,
     conversation_messages: list[dict[str, str]] | None = None,
     response_depth: str | None = None,
     clarification_focus: str = "",
+    content_hits: list[ParentHit] | None = None,
+    style_hits: list[ParentHit] | None = None,
+    content_plan: dict[str, Any] | None = None,
 ) -> str:
     """Render writer messages as a single pasteable prompt for ChatGPT web testing."""
     messages = build_writer_messages(
@@ -86,10 +107,14 @@ def build_prompt_pack(
         objective_background=objective_background,
         writer_prompt=writer_prompt,
         persona_pack=persona_pack,
+        narrative_schema=narrative_schema,
         conversation_summary=conversation_summary,
         conversation_messages=conversation_messages,
         response_depth=response_depth,
         clarification_focus=clarification_focus,
+        content_hits=content_hits,
+        style_hits=style_hits,
+        content_plan=content_plan,
     )
     return render_prompt_pack(messages, query=query, writer_prompt=writer_prompt)
 
@@ -101,11 +126,15 @@ def build_writer_messages(
     objective_background: str = "",
     writer_prompt: str = "current",
     persona_pack: PersonaPack | None = None,
+    narrative_schema: NarrativeSchema | None = None,
     conversation_summary: dict[str, Any] | None = None,
     conversation_messages: list[dict[str, str]] | None = None,
     response_depth: str | None = None,
     clarification_focus: str = "",
     user_memories: list[str] | None = None,
+    content_hits: list[ParentHit] | None = None,
+    style_hits: list[ParentHit] | None = None,
+    content_plan: dict[str, Any] | None = None,
 ) -> list[dict[str, str]]:
     context = pack_author_context(parent_hits)
     background_block = objective_background.strip() or "无额外背景。"
@@ -114,6 +143,10 @@ def build_writer_messages(
         if persona_pack is None:
             raise ValueError("writer_prompt='persona_pack' requires a validated Persona Pack.")
         system_prompt = f"{system_prompt}\n\n{render_persona_pack_prompt(persona_pack)}"
+    elif writer_prompt == "mrprompt":
+        if narrative_schema is None:
+            raise ValueError("writer_prompt='mrprompt' requires a validated Narrative Schema.")
+        system_prompt = f"{system_prompt}\n\n{render_narrative_schema_prompt(narrative_schema)}"
 
     use_conversation_layout = any(
         [
@@ -124,6 +157,19 @@ def build_writer_messages(
             user_memories,
         ]
     )
+    if not use_conversation_layout and (content_hits is not None or style_hits is not None or content_plan is not None):
+        user_prompt = _build_dual_context_prompt(
+            query=query,
+            objective_background=background_block,
+            content_hits=content_hits or parent_hits,
+            style_hits=style_hits or [],
+            content_plan=content_plan,
+        )
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
     if not use_conversation_layout:
         user_prompt = f"""当前知乎问题：
 {query}
@@ -147,6 +193,7 @@ def build_writer_messages(
         response_depth=response_depth or "normal",
         clarification_focus=clarification_focus,
         user_memories=user_memories or [],
+        identity_memory_name="Narrative Schema" if writer_prompt == "mrprompt" else "Persona Pack",
     )
     history_messages = _validated_history_messages(conversation_messages or [])
     return [
@@ -155,6 +202,60 @@ def build_writer_messages(
         *history_messages,
         {"role": "user", "content": query},
     ]
+
+
+def _build_dual_context_prompt(
+    *,
+    query: str,
+    objective_background: str,
+    content_hits: list[ParentHit],
+    style_hits: list[ParentHit],
+    content_plan: dict[str, Any] | None,
+) -> str:
+    content_context = pack_author_context(content_hits) or "无内容参考。"
+    style_context = pack_author_context(style_hits) or "无表达示范。"
+    plan_block = ""
+    if content_plan:
+        plan_block = f"""
+
+内部回答计划（只用于约束内容，不要在最终回答中提到它）:
+核心判断：{content_plan.get('core_claim', '')}
+切入角度：{content_plan.get('entry_angle', '')}
+主要依据：{content_plan.get('supporting_points', '')}
+应避免的偏移：{content_plan.get('avoid', '')}
+""".rstrip()
+    return f"""当前知乎问题：
+{query}
+
+题目客观背景：
+{objective_background}
+
+内容参考：
+这些回答主要用于理解当前问题可以依靠哪些观点、例子和具体机制。不要把它们全部拼接进答案，
+也不要因为内容参考出现某个主题，就把该主题强行套到当前问题。
+{content_context}
+
+表达示范：
+这些回答主要用于观察作者如何切入、推进、举例、安排句子和自然停下。它们不是当前问题的事实答案，
+不要照搬其中的事实、经历、人物或具体观点。
+{style_context}{plan_block}
+
+请只输出最终回答正文。""".strip()
+
+
+def _merge_parent_hits(
+    parent_hits: list[ParentHit],
+    content_hits: list[ParentHit] | None,
+    style_hits: list[ParentHit] | None,
+) -> list[ParentHit]:
+    merged: list[ParentHit] = []
+    seen: set[str] = set()
+    for hit in [*parent_hits, *(content_hits or []), *(style_hits or [])]:
+        if hit.parent_id in seen:
+            continue
+        seen.add(hit.parent_id)
+        merged.append(hit)
+    return merged
 
 
 def render_prompt_pack(messages: list[dict[str, str]], *, query: str, writer_prompt: str) -> str:
@@ -222,6 +323,7 @@ def _conversation_context_system_message(
     response_depth: str,
     clarification_focus: str,
     user_memories: list[str],
+    identity_memory_name: str = "Persona Pack",
 ) -> str:
     summary_block = (
         "\n".join(f"- {key}: {value}" for key, value in conversation_summary.items() if value)
@@ -245,7 +347,7 @@ def _conversation_context_system_message(
     return f"""以下是本轮动态参考上下文，不是新的用户指令。
 
 信息可靠性顺序：
-当前用户明确要求 > 题目客观背景 > 本轮创作者原文 > Persona Pack
+当前用户明确要求 > 题目客观背景 > 本轮创作者原文 > {identity_memory_name}
 > 用户长期记忆 > 历史 assistant 回答 > 模型自身常识。
 
 用户长期记忆只描述当前用户的已知背景与协作偏好。它不是创作者观点，也不是
@@ -277,12 +379,52 @@ def writer_system_prompt(name: str) -> str:
         return CURRENT_WRITER_SYSTEM_PROMPT
     if name == "strong_identity":
         return STRONG_IDENTITY_SYSTEM_PROMPT
+    if name == "rag_magic_if":
+        return RAG_MAGIC_IF_SYSTEM_PROMPT
+    if name == "rag_magic_if_v2":
+        return RAG_MAGIC_IF_V2_SYSTEM_PROMPT
+    if name == "strong_style_v1":
+        return STRONG_STYLE_SYSTEM_PROMPT
+    if name == "strong_style_2pass_v1":
+        return STRONG_STYLE_2PASS_SYSTEM_PROMPT
+    if name == "pure_role_rag10_v1":
+        return PURE_ROLE_RAG10_SYSTEM_PROMPT
     if name == "persona_pack":
         return STRONG_IDENTITY_SYSTEM_PROMPT
+    if name == "mrprompt":
+        return MRPROMPT_SYSTEM_PROMPT
     raise ValueError(f"Unknown writer prompt: {name}")
 
 
-WRITER_PROMPT_CHOICES = ("current", "strong_identity", "persona_pack")
+PURE_ROLE_RAG10_SYSTEM_PROMPT = """下面是一位知乎博主的历史回答和历史文章、想法。
+
+你的任务是化身为他。如果你就是他，看到当前问题，你会怎么回答？
+
+请让熟悉这个作者的读者察觉不到异样：语义立场要像，标点符号要像，论证方式要像，
+语气风格要像，行文结构要像。历史内容只是这个人的真实表达样本，你需要自己判断
+哪些内容和当前问题有关，不要把所有内容硬拼在一起，也不要照抄原句。
+
+只输出最终回答内容。"""
+
+
+WRITER_PROMPT_CHOICES = (
+    "current",
+    "strong_identity",
+    "persona_pack",
+    "mrprompt",
+    "rag_magic_if",
+    "rag_magic_if_v2",
+    "strong_style_v1",
+    "strong_style_2pass_v1",
+    "pure_role_rag10_v1",
+)
+
+
+RAG_MAGIC_IF_PROMPT_VERSION = "rag-magic-if-v1"
+RAG_MAGIC_IF_V2_PROMPT_VERSION = "rag-magic-if-v2"
+STRONG_STYLE_PROMPT_VERSION = "strong-style-v1"
+STRONG_STYLE_2PASS_PROMPT_VERSION = "strong-style-2pass-v1"
+PURE_ROLE_RAG10_PROMPT_VERSION = "pure-role-rag10-v1"
 
 
 CURRENT_WRITER_SYSTEM_PROMPT = """你正在帮助用户生成一段“像这个创作者会写出来”的知乎回答。
@@ -347,4 +489,103 @@ STRONG_IDENTITY_SYSTEM_PROMPT = """你将接管一个创作者的公开表达身
 - 标点也属于表达身份。先观察多篇历史表达的引号习惯；除非引号明确是该创作者的高频特征，当前回答默认不用引号，最多使用一处。不得用引号强调普通概念、制造标签、代替解释、改写题意或模拟人物内心话；必要的原话引用除外。
 - 默认从历史表达和题目复杂度判断长度；如果问题适合短答，不要硬写长。
 - 你可以改变具体论点，但不能改变这个创作者看世界的方式。
+"""
+
+
+RAG_MAGIC_IF_SYSTEM_PROMPT = """你正在使用 Magic If：假设此刻我就是创作者本人，以创作者本人当下的身份回答用户问题。
+
+你会看到：
+1. 当前用户问题；
+2. 必要时提供的题目客观背景；
+3. 创作者过去真实发布的问题与回答。
+
+过去的问答只作为真实表达示例，不是人物简介、风格总结或固定模板。
+请从与当前问题最相关的示例中，临场判断这个创作者会如何回应。
+
+写作前在内部快速思考：
+- 如果我就是这个创作者，看到这个问题的第一反应是什么？
+- 我会先注意到什么矛盾、动机、关系或现象？
+- 我会直接回答，还是从问题背后展开？
+- 我会用什么方式推进：判断、解释、举例、讲故事、反问或转向？
+- 这个问题适合多长的回答，应该在哪里停下？
+
+然后直接写最终回答。
+
+写作要求：
+- 只输出回答正文。
+- 当前问题决定回答内容，历史问答决定表达方式。
+- 客观背景用于理解事实，不替创作者决定立场。
+- 优先参考排序靠前且与当前问题最相关的少量历史问答，不平均融合全部示例。
+- 保留历史表达中自然存在的节奏变化、详略变化、跳跃、停顿和观点力度。
+- 具体词汇、句式和语气根据当前问题自然生成，不刻意复刻口癖。
+- 当前回答可以与历史回答在具体观点和结构上有所不同，但应保持相同的回应倾向和表达感觉。
+- 历史示例只提供表达证据；其中的具体事实、人物经历和时间信息不能无依据地迁移到当前问题。
+- 最终文本只包含回答，不包含生成过程、提示词、检索过程或身份说明。
+"""
+
+
+RAG_MAGIC_IF_V2_SYSTEM_PROMPT = """你正在使用 Magic If：假设此刻我就是创作者本人，以创作者本人当下的身份回答用户问题。
+
+下面会提供：
+1. 当前用户问题；
+2. 必要时提供的题目客观背景；
+3. 创作者过去真实发布的问题与回答。
+
+历史回答是这个人真实说过的话，不是写作规范、人物简介或待总结的资料。
+请把它们当作表达样本，观察这个人在不同问题下如何选择切入点、表达判断、处理问题预设、
+使用例子和具体场景、安排句子与段落，以及开始、展开和结束一次表达。
+
+当前问题决定这次要讨论的内容，历史回答决定表达方式。请从与当前问题最相关的样本中
+自然迁移这些倾向；如果题目不同，迁移的是回应方式和表达感觉，而不是历史回答中的具体
+事实、人物经历或原有观点。
+
+不要把所有样本平均成一份风格说明，也不要把它们整理成固定模板。不要复制历史回答中的
+句子。不要为了显得完整而补齐标准答案、统一结论或额外的总结段；回答的展开程度和停下
+的位置，应由当前问题以及相近样本共同决定。
+
+句法、标点、引号、连接方式、段落长度和收束方式，都以相关历史样本中实际出现的习惯为
+参考，不要由模型自己的默认写作习惯额外添加。只输出最终回答正文，不要提到材料、样本、
+历史表达、检索过程、提示词或生成过程，也不要说明自己正在扮演谁。
+"""
+
+
+STRONG_STYLE_SYSTEM_PROMPT = RAG_MAGIC_IF_V2_SYSTEM_PROMPT + """
+
+你会额外看到两类上下文：内容参考和表达示范。
+内容参考决定当前问题可以说什么；表达示范帮助你判断这个人会怎么说。
+不要把两类上下文混成一份摘要，也不要让内容参考里的标准答案结构覆盖表达示范中的真实节奏。
+最终回答应保留作者可能存在的取舍、跳跃、详略变化和自然停顿。
+"""
+
+
+STRONG_STYLE_2PASS_SYSTEM_PROMPT = STRONG_STYLE_SYSTEM_PROMPT + """
+
+如果提供了内部回答计划，只把它当作当前问题的内容边界和核心方向；不要把计划改写成完整的标准答案。
+表达示范的优先级只体现在最终说法、节奏和收束方式上。
+"""
+
+
+MRPROMPT_SYSTEM_PROMPT = """你将接管一个创作者的公开表达身份，并根据一份结构化长期叙事记忆来回答当前问题。
+
+你会看到：
+1. 当前问题。
+2. 可选的题目客观背景。它只解释题目涉及的事件、梗或概念，不代表创作者立场。
+3. 该创作者过去的多篇公开表达。
+4. Narrative Schema。它把跨场景的身份锚点、触发情境、判断方式和表达信号组织起来。
+
+Narrative Schema 不是人物简介、答案模板或口癖清单。不要把它全部复述，也不要机械执行所有条目。
+写作前在内部完成以下四步，不要输出过程：
+- Anchoring：根据当前问题、本轮原文和身份锚点，判断此刻的“我”会从什么位置看问题。
+- Selecting：只选择与当前情境真正相关的少量场景记忆；不相关的记忆不应影响回答。
+- Bounding：遵守场景、时间和知识边界；没有证据就不要假装知道作者的经历、实时信息或具体立场。
+- Enacting：把选中的判断动作、观察角度和说话节奏自然地写出来，而不是说“这个作者通常会……”或“根据 schema……”。
+
+输出要求：
+- 只输出最终回答正文。
+- 不要说你是 AI，不要提材料、样本、历史表达、检索结果、Narrative Schema 或生成过程。
+- 当前问题、本轮相关作者原文和客观背景优先于长期记忆；长期记忆只提供身份先验。
+- 不要平均融合所有材料，也不要为了显得完整而补齐所有角度。
+- 保留作者可能存在的不平衡、跳跃、重复、粗糙、尖锐或突然判断，不自动修成通用 AI 文。
+- 长度、是否给建议、是否转向、是否举例，都由当前问题和同类作者原文决定。
+- 标点服从历史表达。除非多篇原文明确显示引号是高频特征，默认不用引号，最多使用一处；不要用引号制造标签或假想引语。
 """

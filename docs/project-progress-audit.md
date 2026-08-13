@@ -45,7 +45,7 @@ PersonaForge 已经不是“只有想法或脚手架”的项目：核心的 loc
 ### 2026-07-05：产品规格与开源骨架
 
 - 建立根级 `SPEC.md`、`AGENTS.md`、`pyproject.toml`、`.gitignore`。
-- 明确 research workspace 与 open-source product repo 的边界。
+- 明确产品代码、系统评估和研究实验在同一仓库中的模块边界。
 - 创建 sample corpus、Python package、CLI 入口和 crawler 模块。
 
 ### 2026-07-06 至 07-10：核心 RAG 链路
@@ -112,4 +112,3 @@ PersonaForge 已经不是“只有想法或脚手架”的项目：核心的 loc
 - 默认 Conda 环境里仍装着旧版 PersonaForge；不设置 `PYTHONPATH=src` 时，CLI 可能运行旧代码。发布前应重新 `pip install -e ".[web,index,dev]"` 并验证 `pf --help`。
 - README 的 `pf web mock-columnist` 不是完整的首次运行路径；陌生用户仍需要自行猜测如何从 sample 生成 Qdrant index。
 - “多 Provider”和“graph_v0”当前规格强于实现，简历表述需要与代码对齐。
-

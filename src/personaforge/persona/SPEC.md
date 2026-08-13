@@ -9,7 +9,8 @@
 ```text
 用户问题
 客观题目背景（可为空）
-RAG top20 父文档全文
+检索候选 parent Top20（默认）
+-> writer context Top20 或实验性 Top5
 -> context pack
 -> writer prompt
 -> LLM answer
@@ -25,11 +26,14 @@ RAG top20 父文档全文
 
 ## 当前 prompt 策略
 
-当前保留三套 writer prompt，方便自用和实验对比：
+当前保留四套 writer prompt，方便自用和实验对比：
 
 - `current`：当前调过的反 AI / 反 advice / 反契约训诫 prompt，默认使用，保证现有自用效果不被覆盖。
 - `strong_identity`：通用强身份沉浸 prompt，不写任何特定作者词汇，测试“RAG20 + 强模型是否能自行归纳作者表达身份”。
 - `persona_pack`：在 `strong_identity` 的同一基础提示词上增加证据化作者画像；RAG20、query understanding、query transform 和生成参数均保持不变，用于隔离检验 Persona Pack 的增益。
+- `mrprompt`：独立的 Narrative Schema 实验分支；按 Anchoring、Selecting、Bounding、Enacting 四步使用场景化长期记忆。它不改变 RAG、query understanding、query transform 和生成参数，也不改变默认 Chat。
+- `rag_magic_if`：Magic If v1，保留旧版提示词，作为历史运行的可复现基线。
+- `rag_magic_if_v2`：通用的样本条件式 Magic If，不写作者特定口癖或固定结尾规则；只要求模型从当前相关历史回答中迁移表达分布，作为新一轮生成质量对照方法。
 
 CLI 切换方式：
 
@@ -38,9 +42,16 @@ pf ask <author> "<question>" --writer-prompt current
 pf ask <author> "<question>" --writer-prompt strong_identity
 pf ask <author> "<question>" --writer-prompt persona_pack
 pf prompt-pack <author> "<question>" --writer-prompt strong_identity --out .tmp/chatgpt_prompt.md
+pf ask <author> "<question>" --writer-prompt mrprompt --narrative-schema-path <author>/narrative_schema.json
 ```
 
 `prompt-pack` 用于模型差异手测。它复用检索和上下文打包，但不调用 writer LLM，只把 `build_writer_messages(...)` 的结果渲染成一份可粘贴到 ChatGPT 网页的 Markdown。这样可以比较“同样 RAG20 + 同样 prompt”下，不同模型的表达底色差异。
+
+RAG 数量是运行配置，不复制成两套 prompt：检索仍先保留 parent Top20，随后由
+`writer_context_top_k` 决定送给 writer 的数量。默认是 20；RAG5 对照使用 5。
+因此 RAG5/RAG20 只改变 writer 可见的作者历史表达数量，不改变召回、query transform、
+Narrative Schema 或生成参数。作者当前对话的最近消息和更早摘要继续由现有会话记忆负责，
+本模块不再额外创建一个 STM 子系统。
 
 `current` 策略：
 
@@ -134,9 +145,45 @@ pf eval run <author> --dataset <dataset.jsonl> --run-name <name> `
   --writer-prompt persona_pack --persona-pack-path <persona_pack.json>
 ```
 
+## Narrative Schema（新增实验分支）
+
+每位作者可以在作者目录保存一份：
+
+```text
+data/authors/zhihu/<author>/narrative_schema.json
+```
+
+首版 schema 参考 Memory-Driven Role-Playing 的叙事记忆组织方式，但不复制原论文的评测集或模型。它把长期记忆拆成：
+
+- `identity`：公开身份锚点和知识边界。
+- `global_summary`：跨主题的简短叙事概括。
+- `core_traits`：少量稳定的观察姿态，不是口癖清单。
+- `scene_facets`：按触发线索组织的场景记忆；每个 facet 记录情境、思考方式、行为动作、表达信号和边界。
+- `source_evidence`：审计用的 `claim_id + doc_id + excerpt`，必须能在当前 `parents.jsonl` 中逐字找到。
+- `generation_policy`：选择、边界和表现规则。
+
+`narrative.py` 负责解析、哈希、证据核验和 writer 渲染。渲染时不会把文档 ID 或证据摘录送给 writer，避免模型拼贴原句；证据只用于审计和时间切分防泄漏。
+
+当前 `wu-ren-jun-28/narrative_schema.json` 是从已审核的 `persona_pack.json` 迁移出的 `evidence_backed_bootstrap_v1`，Persona Pack 只是迁移输入，不是 `mrprompt` 的运行时依赖。它不是自动画像器，也不宣称已经找到了因果特征；后续作者扩展应继续人工审核并绑定训练期证据。
+
+`mrprompt` 的运行时优先级为：
+
+```text
+当前用户问题 > 题目客观背景 > 本轮 RAG（Top5 或 Top20） > Narrative Schema > 用户记忆/历史回答 > 模型常识
+```
+
+模型内部执行四步：
+
+1. Anchoring：根据当前问题、本轮原文和身份锚点确定此刻的观察位置。
+2. Selecting：只激活相关场景记忆，不平均融合所有 facet。
+3. Bounding：遵守适用主题、时间和知识边界，不补写私人经历或实时事实。
+4. Enacting：把判断动作和表达信号自然写进回答，不解释 schema 或生成过程。
+
+旧的 `persona_pack` 变体继续保留用于兼容和对照；`mrprompt` 不会自动覆盖它，也没有接入前端选择器。
+
 ## 上下文打包
 
-`pack_author_context(...)` 接收 parent hits，输出给 writer 的紧凑上下文。
+`pack_author_context(...)` 接收已经按 `writer_context_top_k` 截断的 parent hits，输出给 writer 的紧凑上下文。
 
 每个 parent 保留：
 
@@ -150,7 +197,8 @@ pf eval run <author> --dataset <dataset.jsonl> --run-name <name> `
 - child node 命中信息
 - URL、ID、时间等元数据
 
-原因：writer 不需要知道检索过程，检索过程只用于 trace。
+原因：writer 不需要知道检索过程，检索过程只用于 trace。评测 trace 同时记录
+`retrieved_parent_top_k` 和 `context_parent_top_k`，保证 RAG5/RAG20 的比较可审计。
 
 ## 文件说明
 
@@ -170,10 +218,46 @@ pf eval run <author> --dataset <dataset.jsonl> --run-name <name> `
 - `verify_persona_pack_evidence(...)`：逐字核验 claim evidence。
 - `render_persona_pack_prompt(...)`：把经过验证的 Pack 渲染为非清单式 writer 上下文。
 
+### `narrative.py`
+
+- `load_narrative_schema(...)`：加载并校验版本、字段和 SHA-256。
+- `load_narrative_schema_for_index(...)`：从作者目录加载 schema，并绑定 `parents.jsonl`。
+- `verify_narrative_schema_evidence(...)`：逐字核验 facet 的训练期证据。
+- `render_narrative_schema_prompt(...)`：只渲染可用于写作的场景记忆，不渲染审计摘录。
+
 ## 后续不进入当前版本的能力
 
 - judge/rewrite 在线闭环。
 - 多轮 session memory。
 - 长度控制前端选项。
 - 多 provider 完整抽象。
-- 自动 Persona Pack 构建器与人工审核工作台。
+- 自动 Narrative Schema 构建器与人工审核工作台。
+
+## 强效双上下文实验分支
+
+`strong_style_v1` 和 `strong_style_2pass_v1` 只用于离线生成评估，不覆盖默认 Chat
+链路，也不替换旧的 `rag_magic_if_v2` 运行。两者都保留通用 Magic If v2，只改变
+Writer 看到历史表达的组织方式：
+
+```text
+RAG20 parent 候选
+-> 内容参考 Top5
+-> 表达示范候选（第 6 名以后）经 LLM 选择 Top3
+-> strong_style_v1：直接生成
+-> strong_style_2pass_v1：先生成内容规划，再生成最终回答
+```
+
+内容参考用于当前问题的事实、观点和论证材料；表达示范只用于观察句式、节奏、
+口语程度和停顿等表达形态。表达选择器最多返回三个候选 ID，选择失败时按候选池
+顺序回退。双阶段版本的内容规划只负责当前问题的核心判断和展开方向，不得变成
+固定写作提纲，也不输出到最终回答。
+
+这两个分支由评估 Runner 通过 `content_context_top_k=5` 和
+`style_context_top_k=3` 控制，并把内容 parent、表达选择和内容规划写入 trace。
+Web 通过扫描已完成的 run manifest 自动发现它们；新增实验必须创建新的不可变 run，
+不能覆盖旧答案或直接改变默认 Chat。
+
+`pure_role_rag10_v1` 是额外的最少中间层对照。它只把原始检索得到的十篇作者内容
+整体交给一条身份化 Prompt，不做 Persona Pack、Narrative Schema、表达选择或内容
+规划；正式评测使用 `query_mode=raw` 以保持变量边界清楚。它只通过评估 Runner
+注册为独立 run，不改变默认 Chat。

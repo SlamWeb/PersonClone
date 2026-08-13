@@ -48,7 +48,7 @@ data/authors/zhihu/<author-token>/raw/
 
 ingest 优先按 manifest 的 `path` 读取文件。这样后续目录怎么分组，不会影响入库逻辑。
 
-为了兼容旧研究语料，第一版 ingest 也允许旧扁平结构：
+为了兼容迁移前的历史语料格式，第一版 ingest 也允许旧扁平结构：
 
 ```text
 data/raw/<author>_md/

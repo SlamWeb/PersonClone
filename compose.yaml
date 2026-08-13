@@ -11,6 +11,8 @@ services:
       - "${PERSONAFORGE_PORT:-8000}:8000"
     env_file:
       - .env
+    environment:
+      PERSONAFORGE_EMBEDDING_MODEL: "${PERSONAFORGE_EMBEDDING_MODEL:-BAAI/bge-m3}"
     volumes:
       - type: bind
         source: ./data

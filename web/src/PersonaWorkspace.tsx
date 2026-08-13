@@ -5,9 +5,11 @@ import {
   LogOut,
   Menu,
   MessageSquarePlus,
+  PanelLeftClose,
   Plus,
   SlidersHorizontal,
   Trash2,
+  UsersRound,
   X
 } from 'lucide-react';
 import { ChatSessionSummary, PersonaInfo } from './api';
@@ -21,7 +23,10 @@ export function PersonaDock({
   personas,
   selectedAuthor,
   hasActiveJobs,
+  showAllAuthors,
+  allAuthorsActive,
   onSelect,
+  onSelectAll,
   onAdd,
   onManage,
   onOpenSessions
@@ -29,7 +34,10 @@ export function PersonaDock({
   personas: PersonaInfo[];
   selectedAuthor: string;
   hasActiveJobs: boolean;
+  showAllAuthors?: boolean;
+  allAuthorsActive?: boolean;
   onSelect: (author: string) => void;
+  onSelectAll?: () => void;
   onAdd: () => void;
   onManage: () => void;
   onOpenSessions: () => void;
@@ -54,6 +62,18 @@ export function PersonaDock({
           </button>
         ))}
       </div>
+      {showAllAuthors && onSelectAll ? (
+        <button
+          className={`dock-action dock-all-authors ${allAuthorsActive ? 'active' : ''}`}
+          type="button"
+          title="查看全部作者汇总"
+          aria-label="查看全部作者汇总"
+          aria-pressed={allAuthorsActive}
+          onClick={onSelectAll}
+        >
+          <UsersRound size={17} />
+        </button>
+      ) : null}
       <div className="persona-dock-actions">
         <button className="dock-action" type="button" title="添加作者" onClick={onAdd}>
           <Plus size={18} />
@@ -69,6 +89,7 @@ export function PersonaDock({
 
 export function ConversationSidebar({
   open,
+  collapsed,
   persona,
   sessions,
   currentSessionId,
@@ -80,9 +101,12 @@ export function ConversationSidebar({
   onOpenSession,
   onDeleteSession,
   onOpenMemory,
+  isAdmin,
+  onOpenMembers,
   onLogout
 }: {
   open: boolean;
+  collapsed: boolean;
   persona: PersonaInfo | null;
   sessions: ChatSessionSummary[];
   currentSessionId: string | null;
@@ -94,21 +118,23 @@ export function ConversationSidebar({
   onOpenSession: (sessionId: string) => void;
   onDeleteSession: (sessionId: string) => void;
   onOpenMemory: () => void;
+  isAdmin: boolean;
+  onOpenMembers: () => void;
   onLogout: () => void;
 }) {
   const groups = groupSessions(sessions);
   return (
     <>
       {open ? <button className="sidebar-scrim" type="button" aria-label="关闭会话栏" onClick={onClose} /> : null}
-      <aside className={`conversation-sidebar ${open ? 'mobile-open' : ''}`}>
+      <aside className={`conversation-sidebar ${open ? 'mobile-open' : ''} ${collapsed ? 'desktop-collapsed' : ''}`}>
         <header className="persona-panel-header">
-          {persona ? <PersonaPortrait persona={persona} size="large" /> : <PersonaPortraitFallback />}
           <div className="persona-panel-identity">
             <strong>{persona?.display_name || '选择作者'}</strong>
             <span><i aria-hidden="true" />已就绪</span>
           </div>
-          <button className="sidebar-close" type="button" title="关闭" onClick={onClose}>
-            <X size={18} />
+          <button className="sidebar-close" type="button" title="收起会话栏" onClick={onClose}>
+            <PanelLeftClose className="desktop-collapse-icon" size={18} />
+            <X className="mobile-close-icon" size={18} />
           </button>
         </header>
 
@@ -161,6 +187,7 @@ export function ConversationSidebar({
 
         <footer className="sidebar-footer">
           <span className="signed-in-user">{userName}</span>
+          {isAdmin ? <button className="member-entry" type="button" title="成员管理" onClick={onOpenMembers}><UsersRound size={15} /><span>成员</span></button> : null}
           <button className="logout-button" type="button" title="退出登录" onClick={onLogout}>
             <LogOut size={15} />
           </button>
@@ -198,10 +225,6 @@ function PersonaPortrait({ persona, size = 'normal' }: { persona: PersonaInfo; s
   ) : (
     <span className={`persona-portrait persona-portrait-fallback ${size}`}>{initials}</span>
   );
-}
-
-function PersonaPortraitFallback() {
-  return <span className="persona-portrait persona-portrait-fallback large">PF</span>;
 }
 
 function groupSessions(sessions: ChatSessionSummary[]): SessionGroup[] {

@@ -122,7 +122,14 @@ def prune_traces(data_dir: Path, author: str, *, keep: int, protected_trace_id: 
     directory = trace_directory(data_dir, author)
     if not directory.exists():
         return
-    paths = sorted(directory.glob("trace-*.json"), key=lambda item: item.stat().st_mtime, reverse=True)
+    # Windows can assign the same coarse mtime to several consecutive writes.
+    # Keep the filename as a deterministic tie-breaker so retention does not
+    # randomly preserve an older trace.
+    paths = sorted(
+        directory.glob("trace-*.json"),
+        key=lambda item: (item.stat().st_mtime_ns, item.name),
+        reverse=True,
+    )
     retained = 0
     for path in paths:
         if path.stem == protected_trace_id or retained < keep:

@@ -3,15 +3,9 @@
 .env.*
 !.env.example
 
-# Local user data
-data/raw/
-data/authors/
-data/index/
-data/auth/
-data/models/
-data/eval/
-data/system/
-data/tmp/
+# Local user data. This includes crawled corpora, auth state, indexes,
+# conversations, evaluation output, study responses, and model caches.
+data/
 .tmp/
 .tmp-data/
 .tmp-crawl/

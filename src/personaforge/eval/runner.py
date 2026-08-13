@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import subprocess
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -11,12 +12,24 @@ from time import perf_counter
 from typing import Any
 
 from personaforge.eval.dataset import load_dataset, load_dataset_manifest, sha256_json
+from personaforge.eval.strong_style import build_content_plan, select_expression_hits
 from personaforge.ingest.embeddings import TextEncoder
 from personaforge.ingest.query_understanding import build_grounded_query_plan, plan_to_trace
 from personaforge.ingest.retrieve import ParentHit, RetrieveResult, retrieve_parents, retrieve_parents_for_queries
 from personaforge.llm import JsonChatClient
+from personaforge.persona.narrative import (
+    NarrativeSchema,
+    load_narrative_schema,
+    load_narrative_schema_for_index,
+)
 from personaforge.persona.pack import PersonaPack, load_persona_pack, load_persona_pack_for_index
-from personaforge.persona.writer import generate_answer
+from personaforge.persona.writer import (
+    RAG_MAGIC_IF_PROMPT_VERSION,
+    RAG_MAGIC_IF_V2_PROMPT_VERSION,
+    PURE_ROLE_RAG10_PROMPT_VERSION,
+    generate_answer,
+    writer_system_prompt,
+)
 
 
 RUN_SCHEMA_VERSION = "personaforge.eval.run.v0"
@@ -34,11 +47,20 @@ class EvalRunConfig:
     child_top_k: int = 100
     per_query_parent_k: int = 30
     parent_top_k: int = 20
+    writer_context_top_k: int = 20
+    content_context_top_k: int = 5
+    style_context_top_k: int = 3
     max_search_results: int = 5
     temperature: float = 0.85
     max_tokens: int = 1600
     limit: int | None = None
     persona_pack_path: Path | None = None
+    narrative_schema_path: Path | None = None
+    method_id: str | None = None
+    display_name: str | None = None
+    description: str | None = None
+    parent_method: str | None = None
+    prompt_version: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +80,21 @@ def run_temporal_eval(
     encoder: TextEncoder,
     llm: JsonChatClient,
 ) -> EvalRunResult:
+    if config.parent_top_k <= 0:
+        raise ValueError("parent_top_k must be positive.")
+    if config.writer_context_top_k <= 0:
+        raise ValueError("writer_context_top_k must be positive.")
+    if config.writer_context_top_k > config.parent_top_k:
+        raise ValueError(
+            "writer_context_top_k cannot exceed parent_top_k; retrieve more parents first."
+        )
+    if config.writer_prompt in {"strong_style_v1", "strong_style_2pass_v1"}:
+        if config.content_context_top_k <= 0 or config.style_context_top_k <= 0:
+            raise ValueError("strong style context sizes must be positive.")
+        if config.content_context_top_k + config.style_context_top_k > config.parent_top_k:
+            raise ValueError(
+                "strong style content and expression contexts cannot exceed parent_top_k."
+            )
     dataset = [row for row in load_dataset(config.dataset_path) if row.get("split") == config.split]
     if config.limit is not None:
         dataset = dataset[: config.limit]
@@ -78,6 +115,18 @@ def run_temporal_eval(
         persona_pack = None
     if persona_pack is not None:
         assert_persona_pack_no_leak(persona_pack, excluded_parent_ids)
+    if config.writer_prompt == "mrprompt" and config.narrative_schema_path is not None:
+        narrative_schema = load_narrative_schema(
+            config.narrative_schema_path,
+            parent_store_path=index_dir / "parents.jsonl",
+            verify_evidence=True,
+        )
+    elif config.writer_prompt == "mrprompt":
+        narrative_schema = load_narrative_schema_for_index(index_dir, required=True)
+    else:
+        narrative_schema = None
+    if narrative_schema is not None:
+        assert_narrative_schema_no_leak(narrative_schema, excluded_parent_ids)
     run_dir = config.out_dir / "runs" / config.run_name
     if run_dir.exists():
         raise FileExistsError(f"Eval run already exists: {run_dir}. Choose a new --run-name.")
@@ -96,6 +145,12 @@ def run_temporal_eval(
         "excluded_parent_ids_sha256": dataset_manifest.get("excluded_parent_ids_sha256"),
         "excluded_parent_count": len(excluded_parent_ids),
         "config": config_to_dict(config),
+        "method_id": config.method_id or config.run_name,
+        "display_name": config.display_name or config.run_name,
+        "description": config.description or "",
+        "parent_method": config.parent_method,
+        "prompt_version": config.prompt_version or prompt_version_for(config.writer_prompt),
+        "prompt_sha256": prompt_sha256_for(config.writer_prompt),
         "git": git_revision(),
         "writer_model": str(getattr(llm, "model", type(llm).__name__)),
         "embedding_model": type(encoder).__name__,
@@ -104,6 +159,12 @@ def run_temporal_eval(
             "sha256": persona_pack.sha256,
             "claim_count": persona_pack.claim_count,
         } if persona_pack else None,
+        "narrative_schema": {
+            "schema_id": narrative_schema.schema_id,
+            "sha256": narrative_schema.sha256,
+            "facet_count": narrative_schema.facet_count,
+            "evidence_count": narrative_schema.evidence_count,
+        } if narrative_schema else None,
     }
     write_json(run_manifest, manifest_path)
 
@@ -119,6 +180,7 @@ def run_temporal_eval(
                 encoder=encoder,
                 llm=llm,
                 persona_pack=persona_pack,
+                narrative_schema=narrative_schema,
             )
             records.append(record)
             append_jsonl(record, runs_path)
@@ -157,6 +219,7 @@ def run_eval_item(
     encoder: TextEncoder,
     llm: JsonChatClient,
     persona_pack: PersonaPack | None = None,
+    narrative_schema: NarrativeSchema | None = None,
 ) -> dict[str, Any]:
     query = str(item["query"])
     started_at = perf_counter()
@@ -203,14 +266,45 @@ def run_eval_item(
 
     assert_no_leak(retrieve_result, excluded_parent_ids)
     retrieval_duration_ms = elapsed_ms(retrieval_started_at)
+    content_hits: list[ParentHit] | None = None
+    style_hits: list[ParentHit] | None = None
+    content_plan: dict[str, str] | None = None
+    style_selection_trace: dict[str, Any] | None = None
+    content_plan_trace: dict[str, Any] | None = None
+    if config.writer_prompt in {"strong_style_v1", "strong_style_2pass_v1"}:
+        content_hits = retrieve_result.parents[: config.content_context_top_k]
+        style_candidates = retrieve_result.parents[config.content_context_top_k :]
+        style_hits, style_selection_trace = select_expression_hits(
+            query=query,
+            objective_background=objective_background,
+            candidates=style_candidates,
+            llm=llm,
+            top_k=config.style_context_top_k,
+        )
+        if config.writer_prompt == "strong_style_2pass_v1":
+            content_plan, content_plan_trace = build_content_plan(
+                query=query,
+                objective_background=objective_background,
+                content_hits=content_hits,
+                llm=llm,
+            )
+        writer_parent_hits = _merge_hits(content_hits, style_hits)
+    else:
+        writer_parent_hits = retrieve_result.parents[: config.writer_context_top_k]
+    if not writer_parent_hits:
+        raise RuntimeError("Retrieval returned no parent documents for the writer context.")
     generation_started_at = perf_counter()
     answer_result = generate_answer(
         query=query,
-        parent_hits=retrieve_result.parents,
+        parent_hits=writer_parent_hits,
         llm=llm,
         objective_background=objective_background,
         writer_prompt=config.writer_prompt,
         persona_pack=persona_pack,
+        narrative_schema=narrative_schema,
+        content_hits=content_hits,
+        style_hits=style_hits,
+        content_plan=content_plan,
         temperature=config.temperature,
         max_tokens=config.max_tokens,
     )
@@ -232,7 +326,15 @@ def run_eval_item(
                 "variant": answer_result.writer_prompt,
                 "persona_pack_id": answer_result.persona_pack_id,
                 "persona_pack_sha256": answer_result.persona_pack_sha256,
+                "narrative_schema_id": answer_result.narrative_schema_id,
+                "narrative_schema_sha256": answer_result.narrative_schema_sha256,
+                "retrieved_parent_top_k": config.parent_top_k,
+                "context_parent_top_k": config.writer_context_top_k,
                 "context_parent_titles": answer_result.parent_titles,
+                "content_context_parent_ids": [hit.parent_id for hit in content_hits or []],
+                "style_context_parent_ids": [hit.parent_id for hit in style_hits or []],
+                "style_selection": style_selection_trace,
+                "content_plan": content_plan_trace,
                 "message_characters": [
                     {"role": message["role"], "characters": len(message["content"])}
                     for message in answer_result.messages
@@ -242,6 +344,8 @@ def run_eval_item(
                 "query_understanding_ms": understanding_duration_ms,
                 "retrieval_ms": retrieval_duration_ms,
                 "generation_ms": generation_duration_ms,
+                "style_selection_ms": (style_selection_trace or {}).get("duration_ms", 0),
+                "content_plan_ms": (content_plan_trace or {}).get("duration_ms", 0),
                 "total_ms": elapsed_ms(started_at),
             },
         },
@@ -260,6 +364,18 @@ def assert_no_leak(result: RetrieveResult, excluded_parent_ids: set[str]) -> Non
         raise RuntimeError(f"Evaluation leakage: excluded parent(s) retrieved: {sorted(leaked)}")
 
 
+def _merge_hits(*groups: list[ParentHit] | None) -> list[ParentHit]:
+    merged: list[ParentHit] = []
+    seen: set[str] = set()
+    for group in groups:
+        for hit in group or []:
+            if hit.parent_id in seen:
+                continue
+            seen.add(hit.parent_id)
+            merged.append(hit)
+    return merged
+
+
 def assert_persona_pack_no_leak(pack: PersonaPack, excluded_parent_ids: set[str]) -> None:
     evidence_ids = {
         evidence.doc_id
@@ -271,6 +387,22 @@ def assert_persona_pack_no_leak(pack: PersonaPack, excluded_parent_ids: set[str]
     if leaked:
         raise RuntimeError(
             f"Evaluation leakage: Persona Pack cites excluded parent(s): {sorted(leaked)}"
+        )
+
+
+def assert_narrative_schema_no_leak(
+    schema: NarrativeSchema,
+    excluded_parent_ids: set[str],
+) -> None:
+    evidence_ids = {
+        evidence.doc_id
+        for facet in schema.scene_facets
+        for evidence in facet.source_evidence
+    }
+    leaked = evidence_ids & excluded_parent_ids
+    if leaked:
+        raise RuntimeError(
+            f"Evaluation leakage: Narrative Schema cites excluded parent(s): {sorted(leaked)}"
         )
 
 
@@ -340,7 +472,32 @@ def config_to_dict(config: EvalRunConfig) -> dict[str, Any]:
     value["persona_pack_path"] = (
         str(config.persona_pack_path) if config.persona_pack_path is not None else None
     )
+    value["narrative_schema_path"] = (
+        str(config.narrative_schema_path) if config.narrative_schema_path is not None else None
+    )
     return value
+
+
+def prompt_version_for(writer_prompt: str) -> str:
+    if writer_prompt == "rag_magic_if":
+        return RAG_MAGIC_IF_PROMPT_VERSION
+    if writer_prompt == "rag_magic_if_v2":
+        return RAG_MAGIC_IF_V2_PROMPT_VERSION
+    if writer_prompt == "strong_style_v1":
+        from personaforge.persona.writer import STRONG_STYLE_PROMPT_VERSION
+
+        return STRONG_STYLE_PROMPT_VERSION
+    if writer_prompt == "strong_style_2pass_v1":
+        from personaforge.persona.writer import STRONG_STYLE_2PASS_PROMPT_VERSION
+
+        return STRONG_STYLE_2PASS_PROMPT_VERSION
+    if writer_prompt == "pure_role_rag10_v1":
+        return PURE_ROLE_RAG10_PROMPT_VERSION
+    return writer_prompt
+
+
+def prompt_sha256_for(writer_prompt: str) -> str:
+    return hashlib.sha256(writer_system_prompt(writer_prompt).encode("utf-8")).hexdigest()
 
 
 def append_jsonl(record: dict[str, Any], path: Path) -> None:

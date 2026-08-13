@@ -1,5 +1,5 @@
 import { CSSProperties, FormEvent, useEffect, useMemo, useRef, useState } from 'react';
-import { Activity, ArrowDown, ArrowUp, Brain, Check, Clock3, Copy, ExternalLink, Pencil, Pin, Save, SlidersHorizontal, Trash2, X } from 'lucide-react';
+import { Activity, ArrowDown, ArrowUp, Brain, Check, ClipboardCheck, Clock3, Copy, ExternalLink, FlaskConical, MessageCircle, PanelLeftOpen, Pencil, Pin, Save, SlidersHorizontal, Trash2, X } from 'lucide-react';
 import {
   AuthState,
   AuthorJob,
@@ -37,6 +37,9 @@ import {
   AuthorLibraryPage
 } from './AuthorManager';
 import { ConversationSidebar, PersonaDock, personaTheme } from './PersonaWorkspace';
+import { EvaluationWorkspace } from './EvaluationWorkspace';
+import { StudyWorkspace } from './StudyWorkspace';
+import { MemberManagementDrawer } from './MemberManagement';
 
 type Message = {
   id: string;
@@ -48,15 +51,15 @@ type Message = {
   turnId?: string | null;
 };
 
-type WriterPrompt = 'current' | 'strong_identity' | 'persona_pack';
+type WriterPrompt = 'current' | 'strong_identity' | 'persona_pack' | 'mrprompt';
 
 const OPENING_LINE = '今天想聊点什么？';
 
 function initialWriterPrompt(): WriterPrompt {
   const saved = localStorage.getItem('pf-writer-prompt');
-  return saved === 'current' || saved === 'persona_pack' || saved === 'strong_identity'
+  return saved === 'current' || saved === 'persona_pack' || saved === 'strong_identity' || saved === 'mrprompt'
     ? saved
-    : 'strong_identity';
+    : 'mrprompt';
 }
 
 export default function App() {
@@ -86,8 +89,19 @@ export default function App() {
   const [authorLibraryOpen, setAuthorLibraryOpen] = useState(() => window.location.pathname === '/authors');
   const [addAuthorOpen, setAddAuthorOpen] = useState(false);
   const [memoryOpen, setMemoryOpen] = useState(false);
+  const [membersOpen, setMembersOpen] = useState(false);
   const [conversationSidebarOpen, setConversationSidebarOpen] = useState(false);
+  const [conversationSidebarCollapsed, setConversationSidebarCollapsed] = useState(() =>
+    localStorage.getItem('pf-conversation-sidebar-collapsed') === 'true'
+  );
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
+  const [workspaceMode, setWorkspaceMode] = useState<'chat' | 'evaluate'>(() =>
+    localStorage.getItem('pf-workspace-mode') === 'evaluate' ? 'evaluate' : 'chat'
+  );
+  const [evaluationAuthorScope, setEvaluationAuthorScope] = useState<string | null>(() => {
+    const saved = localStorage.getItem('pf-evaluation-author-scope');
+    return saved && saved !== 'all' ? saved : null;
+  });
   const currentSessionRef = useRef<string | null>(null);
   const currentAuthorRef = useRef('');
   const pollingTurnsRef = useRef<Set<string>>(new Set());
@@ -168,6 +182,15 @@ export default function App() {
         setAuthorJobs(jobs);
         const selected = payload.default_author || payload.personas[0]?.author || '';
         setAuthor(selected);
+        const savedEvaluationScope = localStorage.getItem('pf-evaluation-author-scope');
+        if (savedEvaluationScope === 'all') {
+          setEvaluationAuthorScope(null);
+        } else if (savedEvaluationScope && payload.personas.some((item) => item.author === savedEvaluationScope)) {
+          setEvaluationAuthorScope(savedEvaluationScope);
+        } else if (selected) {
+          setEvaluationAuthorScope(selected);
+          localStorage.setItem('pf-evaluation-author-scope', selected);
+        }
         setStatus(selected ? `Ready: ${selected}` : 'No local persona index found.');
       })
       .catch((error) => {
@@ -211,7 +234,9 @@ export default function App() {
   }, [writerPrompt]);
 
   useEffect(() => {
-    if (selectedPersona && !selectedPersona.persona_pack_available && writerPrompt === 'persona_pack') {
+    if (selectedPersona && !selectedPersona.narrative_schema_available && writerPrompt === 'mrprompt') {
+      setWriterPrompt(selectedPersona.persona_pack_available ? 'persona_pack' : 'strong_identity');
+    } else if (selectedPersona && !selectedPersona.persona_pack_available && writerPrompt === 'persona_pack') {
       setWriterPrompt('strong_identity');
     }
   }, [selectedPersona, writerPrompt]);
@@ -368,7 +393,20 @@ export default function App() {
   function selectAuthor(nextAuthor: string) {
     setAuthor(nextAuthor);
     setConversationSidebarOpen(false);
+    if (workspaceMode === 'evaluate') {
+      setEvaluationAuthorScope(nextAuthor);
+      localStorage.setItem('pf-evaluation-author-scope', nextAuthor);
+      return;
+    }
     showChat();
+  }
+
+  function selectAllAuthors() {
+    setEvaluationAuthorScope(null);
+    localStorage.setItem('pf-evaluation-author-scope', 'all');
+    setWorkspaceMode('evaluate');
+    localStorage.setItem('pf-workspace-mode', 'evaluate');
+    setConversationSidebarOpen(false);
   }
 
   function upsertAuthorJob(job: AuthorJob) {
@@ -570,6 +608,10 @@ export default function App() {
     }
   }
 
+  if (window.location.pathname.startsWith('/experiment')) {
+    return <StudyWorkspace authState={authState} />;
+  }
+
   if (authState === null) {
     return (
       <main className="auth-page">
@@ -609,142 +651,219 @@ export default function App() {
   }
 
   return (
-    <div className="app-shell" style={personaTheme(selectedPersona) as CSSProperties}>
+    <div
+      className={`app-shell workspace-shell-${workspaceMode} ${
+        workspaceMode === 'chat' && !conversationSidebarCollapsed ? 'has-context-sidebar' : 'context-sidebar-collapsed'
+      }`}
+      style={personaTheme(selectedPersona) as CSSProperties}
+    >
       <PersonaDock
         personas={personas}
         selectedAuthor={author}
+        showAllAuthors={workspaceMode === 'evaluate'}
+        allAuthorsActive={workspaceMode === 'evaluate' && evaluationAuthorScope === null}
         hasActiveJobs={authorJobs.some((job) => job.status === 'queued' || job.status === 'running')}
         onSelect={selectAuthor}
+        onSelectAll={selectAllAuthors}
         onAdd={() => setAddAuthorOpen(true)}
         onManage={showAuthorLibrary}
-        onOpenSessions={() => setConversationSidebarOpen(true)}
-      />
-      <ConversationSidebar
-        open={conversationSidebarOpen}
-        persona={selectedPersona}
-        sessions={sessions}
-        currentSessionId={currentSessionId}
-        runningConversations={runningConversations}
-        userName={authState.user?.display_name || authState.user?.username || '用户'}
-        onClose={() => setConversationSidebarOpen(false)}
-        onNewChat={() => {
-          newChat();
-          setConversationSidebarOpen(false);
+        onOpenSessions={() => {
+          setWorkspaceMode('chat');
+          localStorage.setItem('pf-workspace-mode', 'chat');
+          setConversationSidebarCollapsed(false);
+          localStorage.setItem('pf-conversation-sidebar-collapsed', 'false');
+          setConversationSidebarOpen(true);
         }}
-        onOpenSession={(sessionId) => {
-          void openSession(sessionId);
-          setConversationSidebarOpen(false);
-        }}
-        onDeleteSession={(sessionId) => void removeSession(sessionId)}
-        onOpenMemory={() => setMemoryOpen(true)}
-        onLogout={() => void signOut()}
-        experimentPanel={(
-          <>
-            <WriterModeSelector
-              value={writerPrompt}
-              onChange={setWriterPrompt}
-              personaPackAvailable={Boolean(selectedPersona?.persona_pack_available)}
-              disabled={busy}
-            />
-            <div className="control-grid">
-              <label>
-                RAG
-                <select value={queryMode} onChange={(event) => setQueryMode(event.target.value as 'raw' | 'grounded')}>
-                  <option value="grounded">Grounded</option>
-                  <option value="raw">Raw</option>
-                </select>
-              </label>
-              <label>
-                TopK
-                <input
-                  type="number"
-                  min={1}
-                  max={40}
-                  value={parentTopK}
-                  onChange={(event) => setParentTopK(Number(event.target.value) || 20)}
-                />
-              </label>
-            </div>
-            <button
-              className={`developer-mode-toggle ${developerMode ? 'enabled' : ''}`}
-              type="button"
-              onClick={() => setDeveloperMode((enabled) => !enabled)}
-              aria-pressed={developerMode}
-            >
-              <SlidersHorizontal size={15} />
-              {developerMode ? '开发者模式已开启' : '开发者模式'}
-            </button>
-            {developerMode ? (
-              <label>
-                Trace 记录
-                <select value={traceCapture} onChange={(event) => setTraceCapture(event.target.value as 'summary' | 'full')}>
-                  <option value="summary">摘要</option>
-                  <option value="full">完整本地记录</option>
-                </select>
-              </label>
-            ) : null}
-          </>
-        )}
       />
-
-      <main className="chat-panel">
-        <section
-          className="messages"
-          ref={messagesRef}
-          onScroll={(event) => {
-            const node = event.currentTarget;
-            const distanceFromBottom = node.scrollHeight - node.scrollTop - node.clientHeight;
-            keepMessagesPinnedRef.current = distanceFromBottom < 120;
-            setShowScrollToBottom(distanceFromBottom >= 120);
+      {workspaceMode === 'chat' ? (
+        <ConversationSidebar
+          open={conversationSidebarOpen}
+          collapsed={conversationSidebarCollapsed}
+          persona={selectedPersona}
+          sessions={sessions}
+          currentSessionId={currentSessionId}
+          runningConversations={runningConversations}
+          userName={authState.user?.display_name || authState.user?.username || '用户'}
+          onClose={() => {
+            setConversationSidebarOpen(false);
+            setConversationSidebarCollapsed(true);
+            localStorage.setItem('pf-conversation-sidebar-collapsed', 'true');
           }}
-        >
-          {messages.length === 0 ? (
-            <OpeningMessage persona={selectedPersona} />
-          ) : (
-            messages.map((message) => (
-              <ChatBubble
-                key={message.id}
-                message={message}
-                persona={selectedPersona}
-                onOpenTrace={openTrace}
-                onRetryTurn={retryFailedTurn}
-                showTrace={developerMode}
+          onNewChat={() => {
+            newChat();
+            setConversationSidebarOpen(false);
+          }}
+          onOpenSession={(sessionId) => {
+            void openSession(sessionId);
+            setConversationSidebarOpen(false);
+          }}
+          onDeleteSession={(sessionId) => void removeSession(sessionId)}
+          onOpenMemory={() => setMemoryOpen(true)}
+          isAdmin={authState.user?.role === 'admin'}
+          onOpenMembers={() => setMembersOpen(true)}
+          onLogout={() => void signOut()}
+          experimentPanel={(
+            <>
+              <WriterModeSelector
+                value={writerPrompt}
+                onChange={setWriterPrompt}
+                personaPackAvailable={Boolean(selectedPersona?.persona_pack_available)}
+                narrativeSchemaAvailable={Boolean(selectedPersona?.narrative_schema_available)}
+                disabled={busy}
               />
-            ))
+              <div className="control-grid">
+                <label>
+                  RAG
+                  <select value={queryMode} onChange={(event) => setQueryMode(event.target.value as 'raw' | 'grounded')}>
+                    <option value="grounded">Grounded</option>
+                    <option value="raw">Raw</option>
+                  </select>
+                </label>
+                <label>
+                  TopK
+                  <input
+                    type="number"
+                    min={1}
+                    max={40}
+                    value={parentTopK}
+                    onChange={(event) => setParentTopK(Number(event.target.value) || 20)}
+                  />
+                </label>
+              </div>
+              <button
+                className={`developer-mode-toggle ${developerMode ? 'enabled' : ''}`}
+                type="button"
+                onClick={() => setDeveloperMode((enabled) => !enabled)}
+                aria-pressed={developerMode}
+              >
+                <SlidersHorizontal size={15} />
+                {developerMode ? '开发者模式已开启' : '开发者模式'}
+              </button>
+              {developerMode ? (
+                <label>
+                  Trace 记录
+                  <select value={traceCapture} onChange={(event) => setTraceCapture(event.target.value as 'summary' | 'full')}>
+                    <option value="summary">摘要</option>
+                    <option value="full">完整本地记录</option>
+                  </select>
+                </label>
+              ) : null}
+            </>
           )}
-          {liveStatus || currentRunLabel ? (
-            <LiveStatus
-              persona={selectedPersona}
-              label={liveStatus || currentRunLabel || '正在生成'}
-              continuation={hasVisibleStreamingAnswer}
-            />
-          ) : null}
-        </section>
+        />
+      ) : null}
 
-        <div className="composer-area">
-          {showScrollToBottom ? (
-            <button className="scroll-to-bottom" type="button" title="回到最新消息" onClick={scrollToLatest}>
-              <ArrowDown size={19} />
-            </button>
-          ) : null}
-          <form className="composer" onSubmit={handleSubmit}>
-            <textarea
-              ref={composerInputRef}
-              rows={1}
-              value={input}
-              onChange={(event) => setInput(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing) return;
-                event.preventDefault();
-                event.currentTarget.form?.requestSubmit();
-              }}
-              placeholder={`和${selectedPersona?.display_name || '这个分身'}聊点什么`}
-            />
-            <button type="submit" disabled={!canSend} title={busy ? '正在生成' : '发送'} aria-label={busy ? '正在生成' : '发送'}>
-              <ArrowUp size={19} />
-            </button>
-          </form>
+      <main className={`chat-panel workspace-${workspaceMode}`}>
+        <div className={`workspace-mode-switch mode-${workspaceMode}`} role="tablist" aria-label="工作区">
+          <span className="workspace-mode-indicator" aria-hidden="true" />
+          <button
+            type="button"
+            role="tab"
+            aria-selected={workspaceMode === 'chat'}
+            onClick={() => {
+              setWorkspaceMode('chat');
+              localStorage.setItem('pf-workspace-mode', 'chat');
+            }}
+          >
+            <MessageCircle size={15} />Chat
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={workspaceMode === 'evaluate'}
+            onClick={() => {
+              setWorkspaceMode('evaluate');
+              setConversationSidebarOpen(false);
+              localStorage.setItem('pf-workspace-mode', 'evaluate');
+            }}
+          >
+            <ClipboardCheck size={15} />Evaluate
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected="false"
+            onClick={() => { window.location.href = '/experiment/admin'; }}
+          >
+            <FlaskConical size={15} />Experiment
+          </button>
         </div>
+
+        {workspaceMode === 'chat' ? (
+          <>
+            {conversationSidebarCollapsed ? (
+              <button
+                className="workspace-sidebar-reveal"
+                type="button"
+                title="展开会话栏"
+                onClick={() => {
+                  setConversationSidebarCollapsed(false);
+                  localStorage.setItem('pf-conversation-sidebar-collapsed', 'false');
+                }}
+              >
+                <PanelLeftOpen size={18} />
+                <span>对话</span>
+              </button>
+            ) : null}
+            <section
+              className="messages"
+              ref={messagesRef}
+              onScroll={(event) => {
+                const node = event.currentTarget;
+                const distanceFromBottom = node.scrollHeight - node.scrollTop - node.clientHeight;
+                keepMessagesPinnedRef.current = distanceFromBottom < 120;
+                setShowScrollToBottom(distanceFromBottom >= 120);
+              }}
+            >
+              {messages.length === 0 ? (
+                <OpeningMessage persona={selectedPersona} />
+              ) : (
+                messages.map((message) => (
+                  <ChatBubble
+                    key={message.id}
+                    message={message}
+                    persona={selectedPersona}
+                    onOpenTrace={openTrace}
+                    onRetryTurn={retryFailedTurn}
+                    showTrace={developerMode}
+                  />
+                ))
+              )}
+              {liveStatus || currentRunLabel ? (
+                <LiveStatus
+                  persona={selectedPersona}
+                  label={liveStatus || currentRunLabel || '正在生成'}
+                  continuation={hasVisibleStreamingAnswer}
+                />
+              ) : null}
+            </section>
+
+            <div className="composer-area">
+              {showScrollToBottom ? (
+                <button className="scroll-to-bottom" type="button" title="回到最新消息" onClick={scrollToLatest}>
+                  <ArrowDown size={19} />
+                </button>
+              ) : null}
+              <form className="composer" onSubmit={handleSubmit}>
+                <textarea
+                  ref={composerInputRef}
+                  rows={1}
+                  value={input}
+                  onChange={(event) => setInput(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing) return;
+                    event.preventDefault();
+                    event.currentTarget.form?.requestSubmit();
+                  }}
+                  placeholder={`和${selectedPersona?.display_name || '这个分身'}聊点什么`}
+                />
+                <button type="submit" disabled={!canSend} title={busy ? '正在生成' : '发送'} aria-label={busy ? '正在生成' : '发送'}>
+                  <ArrowUp size={19} />
+                </button>
+              </form>
+            </div>
+          </>
+        ) : <EvaluationWorkspace user={authState.user!} personas={personas} authorScope={evaluationAuthorScope} />}
       </main>
       <TraceDrawer
         open={traceOpen}
@@ -764,6 +883,7 @@ export default function App() {
         }}
       />
       <MemoryDrawer open={memoryOpen} onClose={() => setMemoryOpen(false)} />
+      <MemberManagementDrawer open={membersOpen} onClose={() => setMembersOpen(false)} />
     </div>
   );
 }
@@ -899,11 +1019,13 @@ function WriterModeSelector({
   value,
   onChange,
   personaPackAvailable,
+  narrativeSchemaAvailable,
   disabled
 }: {
   value: WriterPrompt;
   onChange: (value: WriterPrompt) => void;
   personaPackAvailable: boolean;
+  narrativeSchemaAvailable: boolean;
   disabled: boolean;
 }) {
   const modes: Array<{
@@ -931,6 +1053,14 @@ function WriterModeSelector({
         ? '在强身份模式上加入证据化作者画像'
         : '这个作者还没有 Persona Pack',
       available: personaPackAvailable
+    },
+    {
+      value: 'mrprompt',
+      label: 'Narrative Schema',
+      title: narrativeSchemaAvailable
+        ? '使用 Narrative Schema 的 Anchoring、Selecting、Bounding、Enacting 流程'
+        : '这个作者还没有 Narrative Schema',
+      available: narrativeSchemaAvailable
     }
   ];
 

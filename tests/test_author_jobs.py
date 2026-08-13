@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from personaforge.web.author_jobs import (
     AuthorJobConfig,
     AuthorJobManager,
@@ -24,6 +26,16 @@ def test_author_job_store_persists_and_cancels_queued_job(tmp_path: Path) -> Non
     assert reloaded.author == "alice"
     assert cancelled.status == "cancelled"
     assert store.find_active("alice") is None
+
+
+def test_author_job_update_rejects_sql_identifier_injection(tmp_path: Path) -> None:
+    store = AuthorJobStore(tmp_path / "system" / "personaforge.sqlite3")
+    job = store.create(author_input="alice", author="alice", operation="create")
+
+    with pytest.raises(ValueError, match="Unsupported author job fields"):
+        store.update(job.id, **{"status = 'ready'; DROP TABLE author_jobs; --": "ready"})
+
+    assert store.get(job.id).status == "queued"
 
 
 def test_resolve_author_preview_reuses_local_profile(tmp_path: Path) -> None:

@@ -7,16 +7,21 @@ import traceback
 import mimetypes
 import time
 from contextlib import asynccontextmanager
+from collections import defaultdict, deque
 from collections.abc import Iterator
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from personaforge.web.schemas import (
+    AdminUserCreateRequest,
+    AdminUserInfo,
+    AdminUsersResponse,
     AuthStateResponse,
     AuthUserInfo,
     AuthorJobCreateRequest,
@@ -38,6 +43,12 @@ from personaforge.web.schemas import (
     UserMemoryPatchRequest,
     UserMemorySettingsPatchRequest,
     UserMemorySettingsResponse,
+    RetrievalLabelRequest,
+    RetrievalEvalJobCreateRequest,
+    RetrievalEvalJobResumeRequest,
+    GenerationRubricRequest,
+    GenerationPairwiseRequest,
+    GenerationJudgeJobRequest,
 )
 from personaforge.web.author_jobs import (
     AuthorJobConfig,
@@ -51,6 +62,30 @@ from personaforge.web.conversations import ConversationBusyError, TurnRun
 from personaforge.web.auth import AuthStore, AuthUser
 from personaforge.web.service import ChatProgress, PreparedChat, PersonaChatService, WebConfig, sources_from_parent_hits
 from personaforge.web.streaming import sse_event
+from personaforge.web.deployment_guard import (
+    DeploymentGuard,
+    DeploymentGuardConfig,
+    DeploymentGuardError,
+)
+from personaforge.web.startup_checks import run_startup_checks
+from personaforge.web.retrieval_evaluation import RetrievalEvaluationStore
+from personaforge.web.retrieval_eval_jobs import RetrievalEvalJobConfig, RetrievalEvalJobManager
+from personaforge.web.generation_evaluation import (
+    GenerationEvaluationStore,
+    GenerationJudgeManager,
+)
+from personaforge.studies.study1_service import (
+    Study1Store,
+    StudyCodeCreateRequest,
+    StudyDemoChatRequest,
+    StudyExposureRequest,
+    StudyFeedbackRequest,
+    StudyNavigateRequest,
+    StudyPairwiseRequest,
+    StudyPointwiseRequest,
+    StudyProfileRequest,
+    StudyTransitionRequest,
+)
 
 
 AUTH_COOKIE_NAME = "personaforge_session"
@@ -63,6 +98,9 @@ def create_app(
     job_manager: AuthorJobManager | None = None,
     chat_manager: ChatTaskManager | None = None,
     auth_store: AuthStore | None = None,
+    generation_judge_manager: GenerationJudgeManager | None = None,
+    retrieval_eval_job_manager: RetrievalEvalJobManager | None = None,
+    startup_report: dict[str, object] | None = None,
 ) -> FastAPI:
     mimetypes.add_type("application/javascript", ".js")
     mimetypes.add_type("text/css", ".css")
@@ -79,6 +117,30 @@ def create_app(
     )
     chat_manager = chat_manager or ChatTaskManager(service)
     auth_store = auth_store or AuthStore(config.data_dir)
+    retrieval_evaluations = RetrievalEvaluationStore(config.data_dir)
+    generation_evaluations = GenerationEvaluationStore(config.data_dir)
+    study1 = Study1Store(config.data_dir)
+    study_rate_events: dict[str, deque[float]] = defaultdict(deque)
+    study_rate_lock = Lock()
+    deployment_guard = DeploymentGuard(
+        DeploymentGuardConfig(enabled=config.deployment_guards_enabled)
+    )
+    startup_report = startup_report or run_startup_checks(
+        data_dir=config.data_dir,
+        model_name=config.model_name,
+    )
+    generation_judge_manager = generation_judge_manager or GenerationJudgeManager(
+        generation_evaluations
+    )
+    retrieval_eval_job_manager = retrieval_eval_job_manager or RetrievalEvalJobManager(
+        RetrievalEvalJobConfig(
+            data_dir=config.data_dir,
+            model_name=config.model_name,
+            embedding_device=config.embedding_device,
+            use_fp16=config.use_fp16,
+            working_dir=Path.cwd(),
+        )
+    )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -87,11 +149,15 @@ def create_app(
             service.prepare_encoder_runtime()
         job_manager.start()
         chat_manager.start()
+        generation_judge_manager.start()
+        retrieval_eval_job_manager.start()
         if has_personas:
             service.start_encoder_warmup()
         try:
             yield
         finally:
+            retrieval_eval_job_manager.stop()
+            generation_judge_manager.stop()
             chat_manager.stop()
             job_manager.stop()
 
@@ -100,6 +166,13 @@ def create_app(
     app.state.author_jobs = job_manager
     app.state.chat_tasks = chat_manager
     app.state.auth = auth_store
+    app.state.retrieval_evaluations = retrieval_evaluations
+    app.state.generation_evaluations = generation_evaluations
+    app.state.study1 = study1
+    app.state.generation_judge_jobs = generation_judge_manager
+    app.state.retrieval_eval_jobs = retrieval_eval_job_manager
+    app.state.deployment_guard = deployment_guard
+    app.state.startup_report = startup_report
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
@@ -107,6 +180,17 @@ def create_app(
         allow_headers=["*"],
         allow_credentials=True,
     )
+
+    @app.middleware("http")
+    async def security_headers(request: Request, call_next):
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "same-origin")
+        response.headers.setdefault(
+            "Permissions-Policy", "camera=(), microphone=(), geolocation=()"
+        )
+        return response
 
     local_user = AuthUser(
         id="local-user",
@@ -129,6 +213,11 @@ def create_app(
                 detail="Authentication required",
                 headers={"WWW-Authenticate": "Session"},
             )
+        return user
+
+    def current_admin(user: AuthUser = Depends(current_user)) -> AuthUser:
+        if user.role != "admin":
+            raise HTTPException(status_code=403, detail="Administrator access required")
         return user
 
     @app.get("/api/auth/state", response_model=AuthStateResponse)
@@ -165,9 +254,18 @@ def create_app(
 
     @app.post("/api/auth/login", response_model=AuthStateResponse)
     def login_auth(request: Request, payload: LoginRequest) -> JSONResponse:
+        client_key = _client_key(request)
+        if not deployment_guard.allow_login_attempt(client_key):
+            raise HTTPException(
+                status_code=429,
+                detail="登录尝试过多，请稍后再试。",
+                headers={"Retry-After": "300"},
+            )
         user = auth_store.authenticate(payload.username, payload.password)
         if user is None:
+            deployment_guard.record_login_failure(client_key)
             raise HTTPException(status_code=401, detail="用户名或密码错误")
+        deployment_guard.clear_login_failures(client_key)
         token = auth_store.create_session(user.id, days=config.session_days)
         response = JSONResponse(
             AuthStateResponse(
@@ -186,12 +284,333 @@ def create_app(
         response.delete_cookie(AUTH_COOKIE_NAME, path="/")
         return response
 
+    @app.get("/api/admin/users", response_model=AdminUsersResponse)
+    def list_admin_users(_admin: AuthUser = Depends(current_admin)) -> AdminUsersResponse:
+        return AdminUsersResponse(
+            users=[
+                AdminUserInfo(**user.to_api(), created_at=user.created_at)
+                for user in auth_store.list_users()
+            ]
+        )
+
+    @app.post("/api/admin/users", response_model=AdminUserInfo, status_code=201)
+    def create_admin_user(
+        payload: AdminUserCreateRequest,
+        _admin: AuthUser = Depends(current_admin),
+    ) -> AdminUserInfo:
+        try:
+            user = auth_store.create_user(
+                username=payload.username,
+                password=payload.password,
+                display_name=payload.display_name,
+                role=payload.role,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return AdminUserInfo(**user.to_api(), created_at=user.created_at)
+
     @app.get("/health")
     def health() -> dict[str, Any]:
+        preflight_status = str(startup_report.get("status", "warning"))
         return {
-            "status": "ok",
+            "status": "ok" if preflight_status == "ready" else "degraded",
             "embedding": service.encoder_status(),
+            "preflight": startup_report,
         }
+
+    @app.get("/api/studies/study1")
+    def study1_meta() -> dict[str, Any]:
+        return study1.public_meta()
+
+    @app.get("/api/studies/study1/studies/{study_id}")
+    def study1_meta_for_study(study_id: str) -> dict[str, Any]:
+        try:
+            return study1.public_meta(study_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Study not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    def study_client_key(request: Request) -> str:
+        # Cloudflare Tunnel passes the original address in this header. For local
+        # development it is absent and Starlette's peer address is the fallback.
+        forwarded = request.headers.get("CF-Connecting-IP") or request.headers.get(
+            "X-Forwarded-For"
+        )
+        if forwarded:
+            return forwarded.split(",", 1)[0].strip()
+        return request.client.host if request.client else "unknown"
+
+    def enforce_study_rate_limit(
+        request: Request, *, scope: str, maximum: int, window_seconds: float
+    ) -> None:
+        key = f"{scope}:{study_client_key(request)}"
+        now = time.monotonic()
+        with study_rate_lock:
+            events = study_rate_events[key]
+            while events and events[0] <= now - window_seconds:
+                events.popleft()
+            if len(events) >= maximum:
+                raise HTTPException(
+                    status_code=429,
+                    detail="请求过于频繁，请稍后再试",
+                )
+            events.append(now)
+
+    def require_study_session(
+        session_id: str,
+        x_study_session_token: str | None = Header(default=None),
+    ) -> None:
+        try:
+            study1.authorize_session(session_id, x_study_session_token)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Study session not found") from exc
+
+    @app.post("/api/studies/study1/sessions")
+    def start_study1(payload: StudyProfileRequest, request: Request) -> dict[str, Any]:
+        try:
+            enforce_study_rate_limit(
+                request, scope="study1-start", maximum=30, window_seconds=600
+            )
+            return study1.start(payload)
+        except (ValueError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/studies/study1/studies/{study_id}/sessions")
+    def start_study1_for_study(
+        study_id: str, payload: StudyProfileRequest, request: Request
+    ) -> dict[str, Any]:
+        try:
+            enforce_study_rate_limit(
+                request,
+                scope=f"study1-start:{study_id}",
+                maximum=30,
+                window_seconds=600,
+            )
+            return study1.start(payload, study_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Study not found") from exc
+        except (ValueError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/studies/study1/sessions/{session_id}")
+    def study1_session(
+        session_id: str, _access: None = Depends(require_study_session)
+    ) -> dict[str, Any]:
+        try:
+            return study1.state(session_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Study session not found") from exc
+
+    @app.put("/api/studies/study1/sessions/{session_id}/pointwise/{trial_id}")
+    def save_study1_pointwise(
+        session_id: str,
+        trial_id: str,
+        payload: StudyPointwiseRequest,
+        _access: None = Depends(require_study_session),
+    ) -> dict[str, Any]:
+        try:
+            return study1.save_pointwise(session_id, trial_id, payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Study session not found") from exc
+
+    @app.put("/api/studies/study1/sessions/{session_id}/pairwise/{trial_id}")
+    def save_study1_pairwise(
+        session_id: str,
+        trial_id: str,
+        payload: StudyPairwiseRequest,
+        _access: None = Depends(require_study_session),
+    ) -> dict[str, Any]:
+        try:
+            return study1.save_pairwise(session_id, trial_id, payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Study session not found") from exc
+
+    @app.post("/api/studies/study1/sessions/{session_id}/navigate")
+    def navigate_study1(
+        session_id: str,
+        payload: StudyNavigateRequest,
+        _access: None = Depends(require_study_session),
+    ) -> dict[str, Any]:
+        try:
+            if payload.direction == "previous":
+                return study1.navigate_previous(session_id)
+            raise ValueError("不支持的导航方向")
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Study session not found") from exc
+
+    @app.post("/api/studies/study1/sessions/{session_id}/transition")
+    def acknowledge_study1_transition(
+        session_id: str,
+        payload: StudyTransitionRequest,
+        _access: None = Depends(require_study_session),
+    ) -> dict[str, Any]:
+        try:
+            return study1.acknowledge_transition(session_id, payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Study session not found") from exc
+
+    @app.put("/api/studies/study1/sessions/{session_id}/exposure")
+    def save_study1_exposure(
+        session_id: str,
+        payload: StudyExposureRequest,
+        _access: None = Depends(require_study_session),
+    ) -> dict[str, Any]:
+        try:
+            return study1.save_exposure(session_id, payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Study session not found") from exc
+
+    @app.put("/api/studies/study1/sessions/{session_id}/feedback")
+    def save_study1_feedback(
+        session_id: str,
+        payload: StudyFeedbackRequest,
+        _access: None = Depends(require_study_session),
+    ) -> dict[str, Any]:
+        try:
+            return study1.save_feedback(session_id, payload.text)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Study session not found") from exc
+
+    @app.post("/api/studies/study1/sessions/{session_id}/demo/chat")
+    def study1_demo_chat(
+        session_id: str,
+        payload: StudyDemoChatRequest,
+        request: Request,
+        _access: None = Depends(require_study_session),
+    ) -> StreamingResponse:
+        reservation: dict[str, str] | None = None
+        try:
+            enforce_study_rate_limit(
+                request,
+                scope=f"study1-demo:{session_id}",
+                maximum=6,
+                window_seconds=600,
+            )
+            reservation = study1.reserve_demo_turn(session_id, payload.query)
+            persona = next(
+                (item for item in service.list_personas() if item.author == reservation["author"]),
+                None,
+            )
+            writer_prompt = "mrprompt" if persona and persona.narrative_schema_available else (
+                "persona_pack" if persona and persona.persona_pack_available else "strong_identity"
+            )
+            request = ChatStreamRequest(
+                author=reservation["author"],
+                session_id=reservation["conversation_id"],
+                query=payload.query,
+                query_mode="grounded",
+                writer_prompt=writer_prompt,
+                parent_top_k=20,
+                trace_capture="summary",
+            )
+            turn = _create_chat_turn(
+                chat_manager, service, request, owner_id=reservation["owner_id"]
+            )
+            study1.attach_demo_turn(reservation["reservation_id"], turn.id)
+        except (ValueError, FileNotFoundError) as exc:
+            if reservation:
+                study1.cancel_demo_turn(reservation["reservation_id"])
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception:
+            if reservation:
+                study1.cancel_demo_turn(reservation["reservation_id"])
+            raise
+        return StreamingResponse(
+            _persistent_chat_stream_events(chat_manager, turn.id, initial_turn=turn),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @app.get("/api/studies/study1/admin/overview")
+    def study1_admin_overview(
+        study_id: str | None = None,
+        _admin: AuthUser = Depends(current_admin),
+    ) -> dict[str, Any]:
+        try:
+            return study1.overview(study_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Study not found") from exc
+        except (ValueError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/studies/study1/admin/studies")
+    def study1_admin_studies(
+        _admin: AuthUser = Depends(current_admin),
+    ) -> dict[str, Any]:
+        return {"studies": study1.study_catalog()}
+
+    @app.post("/api/studies/study1/admin/codes")
+    def create_study1_codes(
+        payload: StudyCodeCreateRequest, _admin: AuthUser = Depends(current_admin)
+    ) -> dict[str, Any]:
+        try:
+            return {
+                "study_id": payload.study_id or study1.public_meta()["study_id"],
+                "codes": study1.create_codes(payload.count, payload.study_id),
+            }
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Study not found") from exc
+        except (ValueError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/studies/study1/admin/sessions/{session_id}")
+    def study1_admin_session(
+        session_id: str, _admin: AuthUser = Depends(current_admin)
+    ) -> dict[str, Any]:
+        try:
+            return study1.detail(session_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Study session not found") from exc
+
+    @app.get("/api/studies/study1/admin/export")
+    def export_study1(
+        format: str = "jsonl",
+        study_id: str | None = None,
+        _admin: AuthUser = Depends(current_admin),
+    ) -> Response:
+        try:
+            content, media_type, filename = study1.export(format, study_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Study not found") from exc
+        except (ValueError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    @app.get("/api/studies/study1/admin/analysis-bundle")
+    def export_study1_analysis_bundle(
+        study_id: str | None = None,
+        _admin: AuthUser = Depends(current_admin),
+    ) -> Response:
+        try:
+            content, filename = study1.analysis_bundle(study_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Study not found") from exc
+        except (ValueError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return Response(
+            content=content,
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
 
     @app.get("/api/memories", response_model=UserMemoriesResponse)
     def memories(user: AuthUser = Depends(current_user)) -> UserMemoriesResponse:
@@ -262,6 +681,7 @@ def create_app(
                 headline=item.headline,
                 content_count=item.content_count,
                 persona_pack_available=item.persona_pack_available,
+                narrative_schema_available=item.narrative_schema_available,
                 profile_url=item.profile_url,
                 last_synced_at=item.last_synced_at,
             )
@@ -390,7 +810,13 @@ def create_app(
         request: ChatStreamRequest,
         user: AuthUser = Depends(current_user),
     ) -> StreamingResponse:
-        turn = _create_chat_turn(chat_manager, service, request, owner_id=user.id)
+        turn = _create_chat_turn(
+            chat_manager,
+            service,
+            request,
+            owner_id=user.id,
+            deployment_guard=deployment_guard,
+        )
         return StreamingResponse(
             _persistent_chat_stream_events(chat_manager, turn.id, initial_turn=turn),
             media_type="text/event-stream",
@@ -403,7 +829,13 @@ def create_app(
         user: AuthUser = Depends(current_user),
     ) -> TurnRunResponse:
         return TurnRunResponse(
-            **_create_chat_turn(chat_manager, service, request, owner_id=user.id).to_dict()
+            **_create_chat_turn(
+                chat_manager,
+                service,
+                request,
+                owner_id=user.id,
+                deployment_guard=deployment_guard,
+            ).to_dict()
         )
 
     @app.get("/api/chat/turns/{turn_id}", response_model=TurnRunResponse)
@@ -417,9 +849,16 @@ def create_app(
     def retry_chat_turn(turn_id: str, user: AuthUser = Depends(current_user)) -> TurnRunResponse:
         try:
             chat_manager.store.get_turn_for_owner(turn_id, user.id)
+            deployment_guard.admit_chat(user.id, chat_manager.store)
             return TurnRunResponse(**chat_manager.retry(turn_id).to_dict())
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Chat turn not found") from exc
+        except DeploymentGuardError as exc:
+            raise HTTPException(
+                status_code=429,
+                detail=str(exc),
+                headers={"Retry-After": str(exc.retry_after)},
+            ) from exc
         except (ValueError, ConversationBusyError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -438,6 +877,269 @@ def create_app(
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
+
+    @app.get("/api/evaluations/retrieval/pools")
+    def retrieval_pools(author: str | None = None, user: AuthUser = Depends(current_user)) -> dict[str, Any]:
+        return {"pools": retrieval_evaluations.list_pools(user.id, author=author)}
+
+    @app.get("/api/evaluations/retrieval/jobs")
+    def retrieval_eval_jobs(user: AuthUser = Depends(current_user)) -> dict[str, Any]:
+        return {"jobs": retrieval_eval_job_manager.list()}
+
+    @app.post("/api/evaluations/retrieval/jobs")
+    def create_retrieval_eval_job(
+        payload: RetrievalEvalJobCreateRequest,
+        user: AuthUser = Depends(current_user),
+    ) -> dict[str, Any]:
+        if payload.labeler == "deepseek_api" and user.role != "admin":
+            raise HTTPException(status_code=403, detail="Only administrators can spend the server API budget")
+        try:
+            return retrieval_eval_job_manager.create(
+                author=payload.author,
+                labeler=payload.labeler,
+                split=payload.split,
+                budget_cny=payload.budget_cny,
+                owner_id=user.id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/evaluations/retrieval/jobs/{job_id}")
+    def get_retrieval_eval_job(job_id: str, user: AuthUser = Depends(current_user)) -> dict[str, Any]:
+        try:
+            return retrieval_eval_job_manager.get(job_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Retrieval evaluation job not found") from exc
+
+    @app.post("/api/evaluations/retrieval/jobs/{job_id}/resume")
+    def resume_retrieval_eval_job(
+        job_id: str,
+        payload: RetrievalEvalJobResumeRequest,
+        user: AuthUser = Depends(current_user),
+    ) -> dict[str, Any]:
+        try:
+            job = retrieval_eval_job_manager.get(job_id)
+            if job["labeler"] == "deepseek_api" and user.role != "admin":
+                raise HTTPException(status_code=403, detail="Only administrators can resume API jobs")
+            return retrieval_eval_job_manager.resume(job_id, budget_cny=payload.budget_cny)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Retrieval evaluation job not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/evaluations/retrieval/jobs/{job_id}/handoff")
+    def download_retrieval_eval_handoff(
+        job_id: str,
+        user: AuthUser = Depends(current_user),
+    ) -> FileResponse:
+        try:
+            path = retrieval_eval_job_manager.handoff_zip(job_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return FileResponse(path, media_type="application/zip", filename=path.name)
+
+    @app.post("/api/evaluations/retrieval/jobs/{job_id}/codex-review")
+    def import_retrieval_eval_codex_review(
+        job_id: str,
+        payload: dict[str, Any],
+        user: AuthUser = Depends(current_user),
+    ) -> dict[str, Any]:
+        try:
+            return retrieval_eval_job_manager.import_codex_review(job_id, payload)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/evaluations/retrieval/pools/{pool_id}")
+    def retrieval_workspace(pool_id: str, user: AuthUser = Depends(current_user)) -> dict[str, Any]:
+        try:
+            return retrieval_evaluations.workspace(pool_id, user.id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/evaluations/retrieval/pools/{pool_id}/queries/{item_id}")
+    def retrieval_query(pool_id: str, item_id: str, user: AuthUser = Depends(current_user)) -> dict[str, Any]:
+        try:
+            return retrieval_evaluations.query(pool_id, item_id, user.id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/evaluations/retrieval/pools/{pool_id}/llm-labels")
+    def retrieval_llm_label_sets(pool_id: str, user: AuthUser = Depends(current_user)) -> dict[str, Any]:
+        try:
+            return {"label_sets": retrieval_evaluations.list_llm_label_sets(pool_id)}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/evaluations/retrieval/pools/{pool_id}/llm-labels/{label_set}")
+    def retrieval_llm_workspace(
+        pool_id: str,
+        label_set: str,
+        axis: str | None = None,
+        user: AuthUser = Depends(current_user),
+    ) -> dict[str, Any]:
+        try:
+            return retrieval_evaluations.llm_workspace(pool_id, label_set, axis=axis)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/evaluations/retrieval/pools/{pool_id}/llm-labels/{label_set}/queries/{item_id}")
+    def retrieval_llm_query(
+        pool_id: str,
+        label_set: str,
+        item_id: str,
+        axis: str | None = None,
+        user: AuthUser = Depends(current_user),
+    ) -> dict[str, Any]:
+        try:
+            return retrieval_evaluations.llm_query(pool_id, label_set, item_id, axis=axis)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.put("/api/evaluations/retrieval/pools/{pool_id}/queries/{item_id}/candidates/{parent_id}")
+    def label_retrieval_candidate(
+        pool_id: str,
+        item_id: str,
+        parent_id: str,
+        payload: RetrievalLabelRequest,
+        user: AuthUser = Depends(current_user),
+    ) -> dict[str, Any]:
+        try:
+            return retrieval_evaluations.set_label(pool_id, item_id, parent_id, user.id, payload.score)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/evaluations/retrieval/pools/{pool_id}/export")
+    def export_retrieval_labels(
+        pool_id: str,
+        format: str = "jsonl",
+        user: AuthUser = Depends(current_user),
+    ) -> Response:
+        try:
+            content, media_type, filename = retrieval_evaluations.export(pool_id, user.id, format=format)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    @app.get("/api/evaluations/generation/systems")
+    def generation_systems(author: str | None = None, user: AuthUser = Depends(current_user)) -> dict[str, Any]:
+        return {"systems": generation_evaluations.list_systems(user.id, author=author)}
+
+    @app.get("/api/evaluations/generation/systems/{system_id}")
+    def generation_workspace(
+        system_id: str,
+        user: AuthUser = Depends(current_user),
+    ) -> dict[str, Any]:
+        try:
+            return generation_evaluations.workspace(system_id, user.id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/evaluations/generation/systems/{system_id}/items/{item_id}")
+    def generation_item(
+        system_id: str,
+        item_id: str,
+        user: AuthUser = Depends(current_user),
+    ) -> dict[str, Any]:
+        try:
+            return generation_evaluations.item(system_id, item_id, user.id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.put("/api/evaluations/generation/systems/{system_id}/items/{item_id}/rubric")
+    def label_generation_rubric(
+        system_id: str,
+        item_id: str,
+        payload: GenerationRubricRequest,
+        user: AuthUser = Depends(current_user),
+    ) -> dict[str, Any]:
+        try:
+            return generation_evaluations.set_rubric(
+                system_id, item_id, user.id, payload.scores, payload.note
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/evaluations/generation/comparisons/{left_id}/{right_id}")
+    def generation_comparison(
+        left_id: str,
+        right_id: str,
+        user: AuthUser = Depends(current_user),
+    ) -> dict[str, Any]:
+        try:
+            return generation_evaluations.comparison(left_id, right_id, user.id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/evaluations/generation/comparisons/{left_id}/{right_id}/items/{item_id}")
+    def generation_comparison_item(
+        left_id: str,
+        right_id: str,
+        item_id: str,
+        user: AuthUser = Depends(current_user),
+    ) -> dict[str, Any]:
+        try:
+            return generation_evaluations.comparison_item(
+                left_id, right_id, item_id, user.id
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.put("/api/evaluations/generation/comparisons/{left_id}/{right_id}/items/{item_id}")
+    def label_generation_comparison(
+        left_id: str,
+        right_id: str,
+        item_id: str,
+        payload: GenerationPairwiseRequest,
+        user: AuthUser = Depends(current_user),
+    ) -> dict[str, Any]:
+        try:
+            return generation_evaluations.set_pair_vote(
+                left_id, right_id, item_id, user.id, payload.choice
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/evaluations/generation/judge-jobs")
+    def create_generation_judge_job(
+        payload: GenerationJudgeJobRequest,
+        _user: AuthUser = Depends(current_user),
+    ) -> dict[str, Any]:
+        try:
+            return generation_judge_manager.create(
+                payload.system_id, repeats=payload.repeats
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/evaluations/generation/judge-jobs/{job_id}")
+    def generation_judge_job(
+        job_id: str,
+        _user: AuthUser = Depends(current_user),
+    ) -> dict[str, Any]:
+        try:
+            return generation_evaluations.public_judge_job(job_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     static_dir = _frontend_dist_dir()
     if static_dir.exists():
@@ -528,11 +1230,14 @@ def _create_chat_turn(
     request: ChatStreamRequest,
     *,
     owner_id: str | None = None,
+    deployment_guard: DeploymentGuard | None = None,
 ):
     author = (request.author or service.default_author() or "").strip()
     if not author:
         raise HTTPException(status_code=400, detail="No local persona index found.")
     try:
+        if deployment_guard is not None and owner_id is not None:
+            deployment_guard.admit_chat(owner_id, manager.store)
         return manager.create_turn(
             author=author,
             conversation_id=request.session_id,
@@ -547,6 +1252,12 @@ def _create_chat_turn(
         raise HTTPException(status_code=404, detail="Conversation not found") from exc
     except ConversationBusyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except DeploymentGuardError as exc:
+        raise HTTPException(
+            status_code=429,
+            detail=str(exc),
+            headers={"Retry-After": str(exc.retry_after)},
+        ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -629,15 +1340,32 @@ def _set_auth_cookie(
     )
 
 
+def _client_key(request: Request) -> str:
+    """Use the direct peer address for the local/private deployment.
+
+    We intentionally do not trust arbitrary forwarded headers here. A named
+    reverse proxy can add a trusted proxy integration later.
+    """
+
+    return str(request.client.host if request.client else "unknown")
+
+
 def run_web(config: WebConfig) -> None:
     try:
         import uvicorn
     except ImportError as exc:  # pragma: no cover - missing optional dependency.
         raise RuntimeError('Web server requires optional dependencies: pip install -e ".[web]"') from exc
 
+    from personaforge.web.startup_checks import format_startup_report
+
+    startup_report = run_startup_checks(
+        data_dir=config.data_dir,
+        model_name=config.model_name,
+    )
+    print(format_startup_report(startup_report), flush=True)
     service = PersonaChatService(config)
     if service.list_personas():
         print("Preparing BGE-M3 runtime before starting Web workers...", flush=True)
         service.prepare_encoder_runtime()
-    app = create_app(config, service=service)
+    app = create_app(config, service=service, startup_report=startup_report)
     uvicorn.run(app, host=config.host, port=config.port)

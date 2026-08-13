@@ -279,6 +279,27 @@ class ConversationStore:
             ).fetchall()
         return [_row_to_turn_run(row) for row in rows]
 
+    def count_active_turns(self, *, owner_id: str | None = None) -> int:
+        """Count queued/running turns, optionally scoped to one user.
+
+        The deployment guard uses the persisted state rather than an in-memory
+        lease, so a completed, failed, or interrupted task releases capacity
+        naturally, including after a process restart.
+        """
+
+        query = """
+            SELECT COUNT(*)
+            FROM turn_runs tr
+            JOIN conversations c ON c.id = tr.conversation_id
+            WHERE tr.status IN ('queued', 'running')
+        """
+        params: tuple[str, ...] = ()
+        if owner_id is not None:
+            query += " AND c.owner_id = ?"
+            params = (owner_id,)
+        with self._connect() as connection:
+            return int(connection.execute(query, params).fetchone()[0])
+
     def retry_turn(self, turn_id: str) -> TurnRun:
         now = utc_now_iso()
         with self._connect() as connection:

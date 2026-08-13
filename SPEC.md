@@ -1,10 +1,13 @@
 # PersonaForge Open Source SPEC
 
-这是从 `C:\PersonaForge` research 工作区拆出来的开源产品版规格。research 版继续保留实验、真实语料、消融和论文探索；开源版只保留可交付、可运行、可面试讲清楚的工程闭环。
+这是 PersonaForge 的唯一主仓库。产品功能、系统评估和人类实验工具都在这里维护，
+但必须保持模块边界：系统评估放在 `src/personaforge/eval`，人类实验工具放在
+`src/personaforge/studies`；真实语料、刺激材料和参与者数据始终只留在本地并被 Git 忽略。
+旧目录 `C:\PersonaForge` 已弃用，不再作为代码、数据或运行命令来源。
 
 ## 0. 仓库分工
 
-本仓库 `C:\PersonaForge-OpenSource` 是默认工程主线，承载面向简历、面试和开源交付的前后端、RAG、记忆、用户系统、部署、性能与工程质量建设。`C:\PersonaForge` 只用于论文、实验设计、评估研究和研究原型。用户未特别说明且任务偏工程时，默认在本仓库工作。
+本仓库 `C:\PersonaForge-OpenSource` 同时承载面向简历、面试和开源交付的前后端、RAG、记忆、用户系统、部署、性能与工程质量建设，以及论文、实验设计、评估研究和研究原型。用户未特别说明时，默认在本仓库工作。
 
 ## 1. 产品定位
 
@@ -32,7 +35,7 @@ PersonaForge Open Source 是一个 local-first 的创作者风格 RAG 工程项�
 开源版第一阶段不做这些事：
 
 - 不开源真实知乎作者语料、真实索引、auth state、`.env` 或实验数据。
-- 不把当前 research repo 里的全部消融脚本搬过去。
+- 不把真实实验数据、私有材料和无边界探索脚本提交到 Git；研究工具可以留在本仓库，但必须有明确模块边界、契约和测试。
 - 不在中央服务器代用户长期保存爬取数据。
 - 不做 hypothetical question 入库。
 - 不把 Web 做成“在线输入任意知乎用户名后由服务器代抓”的托管服务。
@@ -181,17 +184,19 @@ mock demo 仍需要 LLM key，因为 MVP 要展示真实生成链路。后续可
 - crawler 输出只落到用户本地 `data/authors/zhihu/{author_token}/raw/`。
 - 必须有速率限制、失败重试、断点续爬和最小化日志。
 
-第一版只支持 CLI 输入用户名：
+CLI 可以直接输入用户名：
 
 ```powershell
 pf crawl zhihu <author-token>
 ```
 
-Web 不直接做爬取入口。
+Web 作者库也提供用户名或主页 URL 入口，但 API 只负责创建持久化异步任务；真正的抓取、
+build 和 index 仍复用 CLI/领域模块，由服务端单 Worker 执行。任务状态可恢复，浏览器关闭
+不会取消任务。
 
 ## 8. Ingest 与索引
 
-开源版第一阶段采用当前 research 里验证过更稳定的方向：
+当前工程采用已经验证过更稳定的方向：
 
 ```text
 raw Markdown
@@ -523,8 +528,9 @@ SPEC.md
 
 ## 18. Docker Web 运行时
 
-第一版 Docker 镜像只承担已有 persona 索引的 Web 推理，不在容器中执行
-知乎抓取，因此运行依赖安装 `index + web`，不安装 Playwright。
+Docker 镜像承担 Web 推理和服务端异步作者任务，因此安装 `crawler + index + web`，
+并包含 Playwright Chromium。前端提交任务后仍由单 Worker 串行执行
+`crawl -> build -> index`，不在 API 请求线程内完成长任务。
 
 镜像采用两阶段构建：
 
@@ -547,3 +553,9 @@ Python runtime  -> 缓存第三方依赖层 + 安装当前源码 wheel + web/dis
 - `compose.yaml` 把宿主机 `data/` 绑定到 `/app/data`；模型默认使用命名卷，
   也允许通过 `PERSONAFORGE_DOCKER_MODEL_SOURCE` 复用宿主机已有缓存。
 - Compose 使用 `restart: unless-stopped`，但不会替代应用级健康检查和日志。
+- `data/` 是完整的本地运行边界，真实语料、Cookie、索引、模型、会话、评估结果和实验
+  响应均不得进入 Git 或 Docker build context。
+- 启动检查不加载模型、不调用外部 API。缺 Key 或模型未缓存时 Web 仍可启动，`/health`
+  返回 `degraded` 和可执行的修复建议。
+- GitHub Actions 在全新 Linux runner 上执行 Python 测试、React 构建、敏感信息扫描、
+  Docker build 和空数据首次启动 smoke，避免依赖开发机已有环境。

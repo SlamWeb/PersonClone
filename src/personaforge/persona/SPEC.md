@@ -31,7 +31,7 @@
 - `current`：当前调过的反 AI / 反 advice / 反契约训诫 prompt，默认使用，保证现有自用效果不被覆盖。
 - `strong_identity`：通用强身份沉浸 prompt，不写任何特定作者词汇，测试“RAG20 + 强模型是否能自行归纳作者表达身份”。
 - `persona_pack`：在 `strong_identity` 的同一基础提示词上增加证据化作者画像；RAG20、query understanding、query transform 和生成参数均保持不变，用于隔离检验 Persona Pack 的增益。
-- `mrprompt`：独立的 Narrative Schema 实验分支；按 Anchoring、Selecting、Bounding、Enacting 四步使用场景化长期记忆。它不改变 RAG、query understanding、query transform 和生成参数，也不改变默认 Chat。
+- `mrprompt`：独立的 Narrative Schema 分支；按 Anchoring、Selecting、Bounding、Enacting 四步使用场景化长期记忆。它不改变 RAG、query understanding、query transform 和生成参数。当前 Web 对具备已验证 Narrative Schema 的作者默认优先选择该分支；缺少 Schema 时回退到 Persona Pack 或 Strong Identity。
 - `rag_magic_if`：Magic If v1，保留旧版提示词，作为历史运行的可复现基线。
 - `rag_magic_if_v2`：通用的样本条件式 Magic If，不写作者特定口癖或固定结尾规则；只要求模型从当前相关历史回答中迁移表达分布，作为新一轮生成质量对照方法。
 
@@ -179,7 +179,7 @@ data/authors/zhihu/<author>/narrative_schema.json
 3. Bounding：遵守适用主题、时间和知识边界，不补写私人经历或实时事实。
 4. Enacting：把判断动作和表达信号自然写进回答，不解释 schema 或生成过程。
 
-旧的 `persona_pack` 变体继续保留用于兼容和对照；`mrprompt` 不会自动覆盖它，也没有接入前端选择器。
+旧的 `persona_pack` 变体继续保留用于兼容和对照；前端允许显式切换 Writer，默认值只决定首次进入和没有本地选择记录时的优先分支。
 
 ## 上下文打包
 

@@ -1,0 +1,90 @@
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"Microsoft YaHei, Segoe UI, sans-serif","fontSize":"16px","primaryTextColor":"#16231f","lineColor":"#66736e"},"flowchart":{"curve":"basis","htmlLabels":true,"nodeSpacing":32,"rankSpacing":42}}}%%
+flowchart TB
+    subgraph CLIENT["1. React 客户端"]
+        direction LR
+        Q["用户输入 query<br/><b>例：</b>为什么大多数人在嘲笑力工？"]
+        REQ["POST /api/chat/stream<br/><b>author</b>: &lt;author-token&gt;（选择哪个分身）<br/><b>session_id</b>: ...（绑定会话）<br/><b>query_mode</b>: grounded（启用理解、联网与 RAG）<br/><b>writer_prompt</b>: mrprompt（采用 MRPrompt）<br/><b>parent_top_k</b>: 20（最终作者全文数量）<br/><b>trace_capture</b>: summary/full（追踪粒度）"]
+        Q --> REQ
+    end
+
+    subgraph API["2. FastAPI 请求边界"]
+        direction LR
+        AUTH["鉴权与用户隔离<br/>识别 owner_id"]
+        GUARD["部署保护<br/>限流、并发额度、输入长度"]
+        TURN["SQLite 持久化 TurnRun<br/><b>status</b>: queued<br/><b>turn_id</b>: 新任务 ID<br/><b>conversation_id</b>: 会话 ID"]
+        ACCEPT["立即返回 accepted SSE<br/>React 随后监听持久化 turn events<br/>页面可离开当前会话，后台任务继续执行"]
+        AUTH --> GUARD --> TURN --> ACCEPT
+    end
+    REQ --> AUTH
+
+    subgraph WORKER["3. ChatTaskManager 后台执行"]
+        direction TB
+        CLAIM["单 Worker claim_turn<br/>queued → running<br/>避免同一任务重复执行"]
+        ASSETS["加载作者与会话资产<br/>Qdrant 子节点索引 + parents.jsonl 作者全文<br/>Narrative Schema + 已完成 turns + 会话摘要<br/>Schema 不存在时前端回退 Persona Pack 或 Strong Identity"]
+        MEMRECALL["跨会话用户记忆召回<br/>Query 与 User Memory 做 BGE-M3 Dense + Sparse<br/>RRF 后取候选 Top8，交给 Planner 决定是否使用"]
+        PLANNER["LLM 调用 ①：Turn Planner<br/>temperature=0<br/>只做指代消解、路由和深度判断，不生成作者观点"]
+        PLANJSON["TurnPlan JSON<br/><b>turn_type</b>: follow_up（本轮属于什么对话动作）<br/><b>resolved_question</b>: 补全后的独立问题（供检索）<br/><b>retrieval_policy</b>: new/reuse/none（新检索、复用、跳过）<br/><b>evidence_source_turn_id</b>: ...（reuse 时证据来自哪轮）<br/><b>needs_web</b>: true/false（是否补客观背景）<br/><b>search_queries</b>: [...]（最多 3 条 Tavily 查询）<br/><b>response_depth</b>: brief/normal/deep（控制展开程度）<br/><b>clarification_focus</b>: ...（unclear 时只追问什么）<br/><b>memory_ids</b>: [...]（最多选 4 条用户记忆）<br/><b>memory_write_policy</b>: defer/flush（记忆延后或立即刷新）"]
+        HISTORY["选择本轮会话上下文<br/>新主题：不带旧 turns<br/>短会话 ≤6 轮：保留全部<br/>长会话：最近 3 轮 + 语义相关旧 2 轮 + 更早摘要"]
+        ROUTE{"retrieval_policy"}
+        CLAIM --> ASSETS --> MEMRECALL --> PLANNER --> PLANJSON --> HISTORY --> ROUTE
+    end
+    TURN --> CLAIM
+
+    subgraph NEWPATH["4A. new：为当前问题重新建立证据"]
+        direction TB
+        WEB{"needs_web?"}
+        TAVILY["Tavily 搜索<br/>查询题目涉及的新事件、新梗或歧义词<br/>只补‘这题在说什么’，不搜索作者立场"]
+        FALLBACK["搜索失败降级<br/>objective_background 保持为空<br/>仍继续本地作者检索"]
+        TRANSFORM["LLM 调用 ②：Background + Query Transform<br/>输出客观背景 + 四路本地检索表达<br/>完整细节见《四路检索与 Parent 聚合》"]
+        RAG["BGE-M3 + Qdrant 多路检索<br/>4 路 query × Dense/Sparse<br/>Child → Parent 两级 Rank-only RRF<br/>最终 Parent Top20 全文"]
+        WEB -- "是" --> TAVILY --> TRANSFORM
+        TAVILY -. "异常" .-> FALLBACK --> TRANSFORM
+        WEB -- "否" --> TRANSFORM
+        TRANSFORM --> RAG
+    end
+
+    subgraph ALT["4B. 非 new 旁路"]
+        direction LR
+        REUSE["reuse<br/>读取 evidence_source_turn_id<br/>按上一轮 parent_ids 重载相同作者证据"]
+        NONE["none<br/>casual / unclear 等场景<br/>不查作者材料；unclear 只提出澄清问题"]
+    end
+    ROUTE -- "new" --> WEB
+    ROUTE -- "reuse" --> REUSE
+    ROUTE -- "none" --> NONE
+
+    subgraph WRITER["5. MRPrompt 上下文组装与生成"]
+        direction TB
+        PACK["build_writer_messages<br/>MRPrompt + Narrative Schema<br/>客观背景 + 用户记忆 + 会话摘要<br/>历史消息 + Parent 全文 + 当前 query<br/>完整数组见《MRPrompt 上下文窗口》"]
+        LIMIT["动态输出上限 response_token_limit<br/>参考检索 Top5 全文长度中位数<br/>brief ≈ 0.55×，normal ≈ 1×，deep ≈ 1.35×<br/>同时受全局 max_tokens 限制"]
+        GENERATE["LLM 调用 ③：Writer 流式生成<br/>temperature=0.85<br/>只输出作者式最终回答"]
+        TOKENS["Token 分批持久化<br/>更新 partial_answer<br/>追加 token SSE event<br/>记录 TTFT、生成耗时和 usage"]
+        DONE["完成回答<br/>保存 assistant message、Parent 来源、trace_id<br/>发送 done SSE，React 渲染最终文本与引用"]
+        PACK --> LIMIT --> GENERATE --> TOKENS --> DONE
+    end
+    RAG --> PACK
+    REUSE --> PACK
+    NONE --> PACK
+
+    subgraph AFTER["6. 回答后的异步维护，不阻塞用户看到答案"]
+        direction LR
+        SUMMARY["会话摘要更新<br/>始终保留最近 3 轮全文<br/>每累积 3 个可摘要旧 turn 或超过阈值时更新"]
+        MEMORY["用户长期记忆更新<br/>每 3 个新 turn 检查一次；明确‘请记住/纠正/忘记’可立即 flush<br/>Extractor 提候选 → Critic 审核 → create/supersede/forget"]
+        TRACE["Trace V1 汇总并写入作者 traces/*.json<br/>Planner JSON、搜索、四路召回、Parent 聚合<br/>Prompt 元数据、各阶段耗时、Token、记忆更新"]
+        SUMMARY --> MEMORY --> TRACE
+    end
+    DONE --> SUMMARY
+
+    classDef client fill:#edf5f1,stroke:#4f7c6f,stroke-width:1.5px,color:#16231f;
+    classDef api fill:#eef4fa,stroke:#52789a,stroke-width:1.5px,color:#16231f;
+    classDef llm fill:#fbf2e7,stroke:#a76e35,stroke-width:1.5px,color:#2b2118;
+    classDef decision fill:#fff8df,stroke:#aa842d,stroke-width:1.5px,color:#2b2617;
+    classDef data fill:#f1eff7,stroke:#786b94,stroke-width:1.5px,color:#211d2b;
+    classDef output fill:#eaf6ee,stroke:#3c8060,stroke-width:2px,color:#13271e;
+    classDef note fill:#ffffff,stroke:#8b9691,stroke-dasharray:5 4,color:#394540;
+
+    class Q,REQ client;
+    class AUTH,GUARD,TURN,ACCEPT,CLAIM,ASSETS,HISTORY api;
+    class PLANNER,TRANSFORM,GENERATE,MEMORY,SUMMARY llm;
+    class ROUTE,WEB decision;
+    class DONE output;
+    class FALLBACK note;

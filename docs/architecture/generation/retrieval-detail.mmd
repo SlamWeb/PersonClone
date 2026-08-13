@@ -1,0 +1,78 @@
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"Microsoft YaHei, Segoe UI, sans-serif","fontSize":"16px","primaryTextColor":"#16231f","lineColor":"#68746f"},"flowchart":{"curve":"basis","htmlLabels":true,"nodeSpacing":28,"rankSpacing":42}}}%%
+flowchart TB
+    INPUT["检索输入<br/><b>query</b>: 用户当前原话<br/><b>resolved_question</b>: Planner 做最小指代补全后的独立问题<br/><b>search_results</b>: Tavily 结果，可为空"]
+    QT["LLM：Background + Query Transform<br/>temperature=0，max_tokens=1400<br/>不预测作者立场，只生成客观背景和检索表达"]
+    JSON["输出 JSON<br/><b>objective_background</b>: 最多 1–2 句，只解释词义、人物、事件或梗<br/><b>retrieval_queries</b>: 固定四个对象；缺失路线自动回退 resolved_question"]
+    INPUT --> QT --> JSON
+
+    subgraph ROUTES["四路 Query Transform：同一问题的四种检索视角"]
+        direction LR
+        LIT["<b>literal_question</b><br/>保留题目字面含义<br/>多轮场景使用已补全问题，不增加新框架"]
+        EVENT["<b>event_background</b><br/>有联网结果时保留事件实体、关键词和关键事实<br/>无背景时接近 literal"]
+        MECH["<b>mechanism_scene</b><br/>改写为具体关系机制、行为动机、冲突场景和日常动作"]
+        TALK["<b>colloquial_surface</b><br/>改成知乎常见口语、网络表达和短词组合<br/>帮助 Sparse 词项命中"]
+    end
+    JSON --> LIT
+    JSON --> EVENT
+    JSON --> MECH
+    JSON --> TALK
+
+    subgraph ENCODE["每一路独立执行相同的 BGE-M3 混合召回"]
+        direction TB
+        E["BGE-M3 encode_texts(query)<br/>一次编码同时得到<br/><b>dense</b>: 语义向量<br/><b>sparse</b>: token→weight 稀疏向量"]
+        D["Qdrant Dense Top100 Child<br/>按向量语义相近度排序"]
+        S["Qdrant Sparse Top100 Child<br/>按学习得到的词项权重匹配排序"]
+        E --> D
+        E --> S
+    end
+    LIT --> E
+    EVENT --> E
+    MECH --> E
+    TALK --> E
+
+    CHILD["Child 命中记录<br/><b>node_type</b>: title / lead / passage（full 模式可有 summary）<br/><b>parent_id</b>: 指向完整回答、文章或想法<br/><b>rank</b>: 当前 Dense/Sparse 路线内名次<br/><b>score</b>: Qdrant 原始相似度，仅用于该路线排序"]
+    D --> CHILD
+    S --> CHILD
+
+    DEDUP["每条 Dense/Sparse 列表先按 Parent 去重<br/>同一长文多个 Child 命中时，只保留该路线首次出现的 Parent<br/>避免长文因切片多而重复加分"]
+    RRF1["第一层 Parent RRF：同一 transform 路线内融合 Dense + Sparse<br/><b>score(parent)</b> = Σ 1 / (60 + rank)<br/>只使用名次，不跨模型比较原始相似度<br/>每路保留 Parent Top30"]
+    CHILD --> DEDUP --> RRF1
+
+    FOUR["得到四份 Parent 排名<br/>literal / event / mechanism / colloquial<br/>每路分别保留 Parent Top30"]
+    RRF1 --> FOUR
+    RRF2["第二层跨路线 Parent RRF<br/>再次按 Parent 去重并累计四路名次贡献<br/><b>score(parent)</b> = Σ 1 / (60 + route_rank)<br/>最终截取 Parent Top20"]
+    FOUR --> RRF2
+
+    LOAD["从 parents.jsonl 加载 Top20 全文<br/>Writer 获得：标题 + 完整正文<br/>Writer 不获得：向量分数、Child 命中、路由名或本地文件名"]
+    OUTPUT["RetrieveResult<br/><b>routes</b>: 8 条 Child 路线及命中（只进 Trace）<br/><b>parents</b>: 最终 Top20 Parent（进入 Writer）<br/><b>retrieval_queries</b>: 四路 query（进入 Trace）<br/><b>timing</b>: embedding / dense / sparse / RRF / load 耗时"]
+    RRF2 --> LOAD --> OUTPUT
+
+    COLLECTION[("每位作者一个 Qdrant collection<br/>只检索当前 author 的本地索引")]
+    PARENTS[("parents.jsonl<br/>完整回答、文章与想法")]
+    D --> COLLECTION
+    S --> COLLECTION
+    LOAD --> PARENTS
+
+    RAW["Raw 开发者旁路<br/>跳过 Query Transform，仅对 resolved_question 做一次 Dense + Sparse<br/>随后执行同样的 Child→Parent RRF，最终 Parent TopK"]
+    INPUT -. "query_mode=raw" .-> RAW
+
+    NOTE["为什么是两级 RRF？<br/>第一级解决同一种 query 的 Dense/Sparse 融合；<br/>第二级解决四种 query 表述之间的融合。<br/>Parent 在某一路出现多次不会重复占便宜，但在不同路线都靠前会获得更多支持。"]
+    NOTE -.-> RRF2
+
+    classDef input fill:#edf5f1,stroke:#4f7c6f,stroke-width:1.5px,color:#16231f;
+    classDef transform fill:#fbf2e7,stroke:#a76e35,stroke-width:1.5px,color:#2b2118;
+    classDef route fill:#eef4fa,stroke:#52789a,stroke-width:1.5px,color:#16231f;
+    classDef process fill:#f7f7f5,stroke:#77827d,stroke-width:1.5px,color:#17211d;
+    classDef fusion fill:#fff8df,stroke:#aa842d,stroke-width:1.8px,color:#2b2617;
+    classDef data fill:#f1eff7,stroke:#786b94,stroke-width:1.5px,color:#211d2b;
+    classDef output fill:#eaf6ee,stroke:#3c8060,stroke-width:2px,color:#13271e;
+    classDef note fill:#ffffff,stroke:#8b9691,stroke-dasharray:5 4,color:#394540;
+
+    class INPUT input;
+    class QT,JSON transform;
+    class LIT,EVENT,MECH,TALK route;
+    class E,D,S,CHILD,DEDUP,FOUR,LOAD process;
+    class RRF1,RRF2 fusion;
+    class COLLECTION,PARENTS data;
+    class OUTPUT output;
+    class RAW,NOTE note;

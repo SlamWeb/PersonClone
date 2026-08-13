@@ -151,6 +151,14 @@ data/authors/zhihu/<author-token>/index/
 -> 回答和 trace
 ```
 
+在线生成的完整架构已经拆成三张可读图，包含请求 JSON、Turn Planner 输出、四路
+Query Transform、两级 Parent RRF、MRPrompt 消息数组、流式生成和回答后的记忆维护：
+
+- [`docs/architecture/generation/README.md`](docs/architecture/generation/README.md)：生成链路总说明。
+- [`generation-overview.svg`](docs/architecture/generation/generation-overview.svg)：从 React query 到最终回答。
+- [`retrieval-detail.svg`](docs/architecture/generation/retrieval-detail.svg)：四路 Dense/Sparse 与 Parent 聚合。
+- [`mrprompt-context.svg`](docs/architecture/generation/mrprompt-context.svg)：最终 Writer 上下文窗口。
+
 ## 4. Web 后端与前端
 
 ### 4.1 后端入口

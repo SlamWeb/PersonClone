@@ -3,12 +3,25 @@
 PersonaForge 是一个 local-first 的创作者数字分身平台：抓取公开创作者内容，构建本地
 BGE-M3 混合检索索引，再通过 FastAPI + React 提供带引用、记忆、Trace 和评估的对话体验。
 
-```text
-公开内容抓取 -> Markdown 语料 -> parent/child 节点 -> Qdrant 混合检索
--> query understanding/transform -> 作者回答生成 -> Trace 与离线评估
+```mermaid
+flowchart LR
+    A["知乎作者主页"] --> B["Crawler"]
+    B --> C["Markdown Corpus"]
+    C --> D["Parent / Child Build"]
+    D --> E["BGE-M3 + BM25 + Qdrant"]
+    Q["用户问题"] --> U["Query Understanding"]
+    U --> T["Query Transform"]
+    T --> E
+    E --> R["RRF + Parent Aggregation"]
+    R --> W["Persona Writer"]
+    M["会话与用户记忆"] --> W
+    W --> L["LLM Provider"]
+    L --> UI["React Chat"]
+    R --> V["RAG / Generate Evaluation"]
+    L --> V
 ```
 
-项目导航见 [navigation.md](navigation.md)，系统约束见 [SPEC.md](SPEC.md)。
+这张图只展示主干。项目导航见 [navigation.md](navigation.md)，系统约束见 [SPEC.md](SPEC.md)。
 
 ## 已有能力
 
@@ -116,6 +129,16 @@ Web 的 Evaluate 工作区包含：
 - Experiment：Study 1 邀请码、实验进度、参与者回放和分析导出。
 
 所有真实语料、索引、会话、API 输出和实验响应都位于 `data/`，默认不进入版本控制。
+
+## 深入架构
+
+需要继续了解实现时，再阅读[生成链路架构说明](docs/architecture/generation/README.md)：
+
+- 端到端生成链路：从 React 请求、Turn Planner 到 SSE 流式回答。
+- 四路检索链路：Dense/Sparse Child 召回、两级 Parent RRF 与全文加载。
+- MRPrompt 上下文：Narrative Schema、用户记忆、会话历史和最终 messages 数组。
+
+每张图同时提供 Mermaid 源码、SVG 和高清 PNG；关键 JSON 字段都附有中文用途说明。
 
 ## 开发验证
 

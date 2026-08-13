@@ -1,0 +1,61 @@
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"Microsoft YaHei, Segoe UI, sans-serif","fontSize":"17px","primaryTextColor":"#16231f","lineColor":"#68746f"},"flowchart":{"curve":"basis","htmlLabels":true,"nodeSpacing":28,"rankSpacing":38}}}%%
+flowchart TB
+    SCHEMA["A. 作者身份资产：narrative_schema.json<br/><b>identity</b>: 公开身份与知识边界<br/><b>global_summary</b>: 跨主题叙事概括<br/><b>core_traits</b>: 少量稳定观察姿态<br/><b>scene_facets</b>: 触发线索、情境、思考方式、表达动作与边界<br/><b>source_evidence</b>: 只用于审计，不送入 Writer"]
+    VERIFY["Schema 加载与证据核验<br/>检查版本和字段，计算 SHA-256<br/>每条 evidence 的 doc_id + excerpt 必须能在 parents.jsonl 中逐字找到"]
+    RENDER["render_narrative_schema_prompt<br/>移除审计文档 ID 与原文摘录<br/>只保留可用于本轮推理的身份锚点、场景记忆和边界"]
+    SYSTEM1["System message ①：MRPrompt<br/><b>Anchoring</b>: 此刻从什么身份位置看问题<br/><b>Selecting</b>: 只激活相关场景记忆<br/><b>Bounding</b>: 不虚构经历、实时事实或未知立场<br/><b>Enacting</b>: 把判断动作与节奏自然写成回答<br/>同时附加 Narrative Schema；不暴露生成过程"]
+    SCHEMA --> VERIFY --> RENDER --> SYSTEM1
+
+    BG["B1. objective_background<br/>题目客观背景，可为空<br/>只负责事实和语义消歧，不代表作者立场"]
+    AUTHOR["B2. Parent Top20 作者全文<br/>每篇只打包标题 + 完整正文<br/>不向 Writer 暴露向量分数、Child 命中、路由或本地文件名"]
+    USERMEM["B3. Planner 选中的用户记忆，最多 4 条<br/>描述当前用户的长期背景与偏好<br/>不是作者观点，也不是外部事实证据"]
+    SUMMARY["B4. 会话摘要<br/>主题与实体<br/>用户诉求与历史结论<br/>尚未消解的指代"]
+    DEPTH["B5. 本轮响应控制<br/><b>response_depth</b>: brief / normal / deep<br/><b>clarification_focus</b>: unclear 时只询问哪项缺失信息"]
+    PRIORITY["信息冲突时的可靠性顺序<br/>当前用户明确要求<br/>＞ 题目客观背景<br/>＞ 本轮作者原文<br/>＞ Narrative Schema<br/>＞ 用户长期记忆<br/>＞ 历史 assistant 回答<br/>＞ 模型自身常识"]
+    SYSTEM2["System message ②：dynamic_context<br/>写入可靠性顺序、响应深度、会话摘要、选中用户记忆、客观背景和作者全文<br/>明确历史 assistant 只维持连续性，不能当作作者真实发表内容"]
+    SYSTEM1 --> BG --> AUTHOR --> USERMEM --> SUMMARY --> DEPTH --> PRIORITY --> SYSTEM2
+
+    HDEC{"C. 如何选择历史消息？"}
+    HS["短会话 ≤6 轮<br/>除 new_topic 外，保留全部已完成 user/assistant turns"]
+    HL["长会话 &gt;6 轮<br/>最近 3 轮 + 与 resolved_question 语义最相关旧 2 轮<br/>其余信息由会话摘要承接"]
+    HNEW["new_topic<br/>不携带旧 turn，防止旧主题污染新问题"]
+    HISTMSG["History messages<br/>仅接受 role=user / assistant 且正文非空<br/>按原时间顺序插入消息数组"]
+    SYSTEM2 --> HDEC
+    HDEC -- "短会话" --> HS --> HISTMSG
+    HDEC -- "长会话" --> HL --> HISTMSG
+    HDEC -- "新主题" --> HNEW --> HISTMSG
+
+    QUERY["D. User message：当前原始 query<br/>Writer 最终直接面对用户刚刚输入的话<br/>resolved_question 只用于检索，不替换用户原话"]
+    ARRAY["最终 messages 数组<br/>[<br/>  { role: system, content: MRPrompt + Narrative Schema },<br/>  { role: system, content: dynamic_context },<br/>  { role: user/assistant, content: selected history }...,<br/>  { role: user, content: current query }<br/>]"]
+    HISTMSG --> QUERY --> ARRAY
+    SYSTEM1 -. "成为第 1 条 message" .-> ARRAY
+    SYSTEM2 -. "成为第 2 条 message" .-> ARRAY
+
+    LIMIT["动态 max_tokens<br/>取检索 Top5 正文 token 中位数 typical<br/><b>brief</b>: 0.55×，限制在 192..512<br/><b>normal</b>: 至少 600<br/><b>deep</b>: 1.35×，至少 900<br/>最终不超过服务 configured_max"]
+    CALL["E. Writer 流式调用<br/><b>temperature</b>: 0.85<br/><b>max_tokens</b>: 动态上限<br/><b>input</b>: messages 数组<br/><b>output</b>: 最终回答 token stream"]
+    ARRAY --> CALL
+    LIMIT --> CALL
+    ANSWER["最终回答<br/>实时送往 React，只显示回答正文<br/>引用来源由服务层根据 Parent 另行展示"]
+    CALL --> ANSWER
+
+    AFTER["F. 回答完成后的维护队列<br/>更新更早会话摘要<br/>用户记忆窗口每 3 个新 turn 检查一次<br/>明确记住、纠正或遗忘请求可立即 flush<br/>维护失败不会回滚已经生成的回答"]
+    ANSWER --> AFTER
+
+    NOTE["三种‘记忆’不要混淆<br/><b>Narrative Schema</b>：作者是谁、如何观察和表达<br/><b>Conversation Summary / History</b>：这次会话聊过什么<br/><b>User Memory</b>：当前用户是谁、有哪些长期背景与偏好"]
+    NOTE -.-> USERMEM
+
+    classDef author fill:#f1eff7,stroke:#786b94,stroke-width:1.5px,color:#211d2b;
+    classDef system fill:#fbf2e7,stroke:#a76e35,stroke-width:1.6px,color:#2b2118;
+    classDef context fill:#eef4fa,stroke:#52789a,stroke-width:1.5px,color:#16231f;
+    classDef history fill:#edf5f1,stroke:#4f7c6f,stroke-width:1.5px,color:#16231f;
+    classDef assemble fill:#fff8df,stroke:#aa842d,stroke-width:1.8px,color:#2b2617;
+    classDef output fill:#eaf6ee,stroke:#3c8060,stroke-width:2px,color:#13271e;
+    classDef note fill:#ffffff,stroke:#8b9691,stroke-dasharray:5 4,color:#394540;
+
+    class SCHEMA,VERIFY,RENDER author;
+    class SYSTEM1,SYSTEM2,CALL system;
+    class BG,AUTHOR,USERMEM,SUMMARY,DEPTH,PRIORITY context;
+    class HDEC,HS,HL,HNEW,HISTMSG,QUERY history;
+    class ARRAY,LIMIT assemble;
+    class ANSWER output;
+    class NOTE,AFTER note;

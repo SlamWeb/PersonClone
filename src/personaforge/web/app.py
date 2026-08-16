@@ -977,10 +977,11 @@ def create_app(
         pool_id: str,
         label_set: str,
         axis: str | None = None,
+        ranking: str | None = None,
         user: AuthUser = Depends(current_user),
     ) -> dict[str, Any]:
         try:
-            return retrieval_evaluations.llm_workspace(pool_id, label_set, axis=axis)
+            return retrieval_evaluations.llm_workspace(pool_id, label_set, axis=axis, ranking_id=ranking)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -990,10 +991,11 @@ def create_app(
         label_set: str,
         item_id: str,
         axis: str | None = None,
+        ranking: str | None = None,
         user: AuthUser = Depends(current_user),
     ) -> dict[str, Any]:
         try:
-            return retrieval_evaluations.llm_query(pool_id, label_set, item_id, axis=axis)
+            return retrieval_evaluations.llm_query(pool_id, label_set, item_id, axis=axis, ranking_id=ranking)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 

@@ -14,7 +14,11 @@ from threading import RLock
 from typing import Any
 
 from personaforge.eval.retrieval_judge import load_label_set
-from personaforge.eval.retrieval_metrics import compute_split_metrics
+from personaforge.eval.retrieval_metrics import (
+    compute_split_metrics,
+    compute_split_metrics_from_rankings,
+)
+from personaforge.eval.retrieval_rankings import load_ranking_snapshot
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +63,7 @@ class RetrievalEvaluationStore:
                     "labeled_count": labeled,
                     "completed": total > 0 and labeled >= total,
                     "llm_label_sets": llm_label_sets,
+                    "ranking_snapshots": self._ranking_status(files),
                     "created_at": str(files.manifest.get("created_at") or ""),
                 }
             )
@@ -91,6 +96,34 @@ class RetrievalEvaluationStore:
                 }
             )
         return sorted(results, key=lambda row: row["label_set"])
+
+    def _ranking_status(self, files: PoolFiles) -> list[dict[str, Any]]:
+        ranking_root = files.manifest_path.parent / "rankings"
+        if not ranking_root.exists():
+            return []
+        results: list[dict[str, Any]] = []
+        for manifest_path in ranking_root.glob("*/manifest.json"):
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if str(manifest.get("pool_id") or "") != str(files.manifest.get("pool_id") or ""):
+                continue
+            results.append(
+                {
+                    "ranking_id": str(manifest.get("ranking_id") or manifest_path.parent.name),
+                    "status": str(manifest.get("status") or "unknown"),
+                    "requested_depth": int(manifest.get("requested_depth") or 0),
+                    "expected_depth": int(manifest.get("expected_depth") or 0),
+                    "actual_depth_by_route": {
+                        str(key): int(value)
+                        for key, value in (manifest.get("actual_depth_by_route") or {}).items()
+                    },
+                    "query_count": int((manifest.get("counts") or {}).get("queries") or 0),
+                    "created_at": str(manifest.get("created_at") or ""),
+                }
+            )
+        return sorted(results, key=lambda row: (row["created_at"], row["ranking_id"]), reverse=True)
 
     def workspace(self, pool_id: str, user_id: str) -> dict[str, Any]:
         files = self._pool(pool_id)
@@ -206,7 +239,14 @@ class RetrievalEvaluationStore:
             )
         return sorted(results, key=lambda row: (row["updated_at"], row["label_set"]), reverse=True)
 
-    def llm_workspace(self, pool_id: str, label_set: str, *, axis: str | None = None) -> dict[str, Any]:
+    def llm_workspace(
+        self,
+        pool_id: str,
+        label_set: str,
+        *,
+        axis: str | None = None,
+        ranking_id: str | None = None,
+    ) -> dict[str, Any]:
         files = self._pool(pool_id)
         manifest, labels = self._load_llm_label_set(files, label_set)
         records = _records_for_label_manifest(self._load_records(files), manifest)
@@ -232,12 +272,26 @@ class RetrievalEvaluationStore:
                 }
             )
         score_labels = _axis_labels(labels, active_axis)
-        raw_metrics = _load_metrics(
-            label_dir=files.manifest_path.parent / "llm_labels" / label_set,
-            records=records,
-            labels=score_labels,
-            recall_scope=str(files.manifest.get("recall_scope") or "six_route_candidate_union"),
-        )
+        ranking = None
+        if ranking_id:
+            ranking_manifest_path = self._ranking_manifest_path(files, ranking_id)
+            ranking, ranking_records = load_ranking_snapshot(ranking_manifest_path)
+            raw_metrics = compute_split_metrics_from_rankings(
+                records,
+                ranking_records,
+                score_labels,
+                ranking_id=str(ranking.get("ranking_id") or ranking_id),
+                requested_depth=int(ranking.get("requested_depth") or 100),
+                recall_scope=str(files.manifest.get("recall_scope") or "frozen_qrels_candidate_pool"),
+            )
+        else:
+            ranking_records = []
+            raw_metrics = _load_metrics(
+                label_dir=files.manifest_path.parent / "llm_labels" / label_set,
+                records=records,
+                labels=score_labels,
+                recall_scope=str(files.manifest.get("recall_scope") or "six_route_candidate_union"),
+            )
         return {
             "pool": self._public_manifest(files.manifest),
             "label_set": {
@@ -257,6 +311,8 @@ class RetrievalEvaluationStore:
             "comparison": _load_v1_v2_comparison(
                 files.manifest_path.parent / "llm_labels" / label_set
             ),
+            "ranking": _public_ranking(ranking) if ranking else None,
+            "ranking_snapshots": self._ranking_status(files),
             "queries": query_rows,
         }
 
@@ -267,6 +323,7 @@ class RetrievalEvaluationStore:
         item_id: str,
         *,
         axis: str | None = None,
+        ranking_id: str | None = None,
     ) -> dict[str, Any]:
         files = self._pool(pool_id)
         manifest, labels = self._load_llm_label_set(files, label_set)
@@ -316,6 +373,24 @@ class RetrievalEvaluationStore:
                 }
             )
         gold_context = _load_gold_context(manifest, item_id)
+        ranking = None
+        if ranking_id:
+            ranking_manifest_path = self._ranking_manifest_path(files, ranking_id)
+            ranking, ranking_records = load_ranking_snapshot(ranking_manifest_path)
+            ranking_row = next(
+                (row for row in ranking_records if str(row.get("item_id") or "") == item_id),
+                None,
+            )
+            if ranking_row:
+                ranking_routes = ranking_row.get("routes") or {}
+                for candidate in public_candidates:
+                    parent_id = candidate["parent_id"]
+                    candidate["ranking_routes"] = {
+                        route: entry
+                        for route, entries in ranking_routes.items()
+                        for entry in entries
+                        if str(entry.get("parent_id") or "") == parent_id
+                    }
         return {
             "pool_id": pool_id,
             "label_set": str(manifest.get("label_set") or label_set),
@@ -324,6 +399,7 @@ class RetrievalEvaluationStore:
             "item_id": item_id,
             "query": str(record.get("query") or ""),
             **gold_context,
+            "ranking": _public_ranking(ranking) if ranking else None,
             "candidate_count": len(public_candidates),
             "labeled_count": sum(row["status"] == "completed" for row in public_candidates),
             "candidates": public_candidates,
@@ -452,6 +528,16 @@ class RetrievalEvaluationStore:
         if str(manifest.get("pool_id") or "") != str(files.manifest.get("pool_id") or ""):
             raise KeyError("LLM label set does not belong to this pool")
         return manifest, labels
+
+    @staticmethod
+    def _ranking_manifest_path(files: PoolFiles, ranking_id: str) -> Path:
+        safe_ranking_id = str(ranking_id).strip()
+        if not safe_ranking_id or Path(safe_ranking_id).name != safe_ranking_id:
+            raise KeyError("Unknown retrieval ranking")
+        path = files.manifest_path.parent / "rankings" / safe_ranking_id / "manifest.json"
+        if not path.is_file():
+            raise KeyError(f"Unknown retrieval ranking: {ranking_id}")
+        return path
 
     def _load_records(self, files: PoolFiles) -> list[dict[str, Any]]:
         modified = files.pool_path.stat().st_mtime_ns
@@ -596,10 +682,22 @@ def _load_metrics(
     metrics_path = label_dir / "metrics.json"
     if metrics_path.exists():
         try:
-            return json.loads(metrics_path.read_text(encoding="utf-8"))
+            cached = json.loads(metrics_path.read_text(encoding="utf-8"))
+            if _has_current_retrieval_metrics(cached):
+                return cached
         except (OSError, json.JSONDecodeError):
             pass
     return compute_split_metrics(records, labels, cutoff=3, recall_scope=recall_scope)
+
+
+def _has_current_retrieval_metrics(metrics: dict[str, Any]) -> bool:
+    axes = metrics.get("axes")
+    reports = axes.values() if isinstance(axes, dict) else [metrics]
+    return all(
+        isinstance(report, dict)
+        and report.get("schema_version") == "personaforge.eval.retrieval_metrics.v3"
+        for report in reports
+    )
 
 
 def _label_axes(manifest: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], str]:
@@ -713,6 +811,24 @@ def _load_gold_context(manifest: dict[str, Any], item_id: str) -> dict[str, Any]
                 result["gold_units"] = row.get("units") or []
                 break
     return result
+
+
+def _public_ranking(manifest: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not manifest:
+        return None
+    return {
+        "ranking_id": str(manifest.get("ranking_id") or ""),
+        "status": str(manifest.get("status") or "unknown"),
+        "requested_depth": int(manifest.get("requested_depth") or 0),
+        "expected_depth": int(manifest.get("expected_depth") or 0),
+        "eligible_parent_count": int(manifest.get("eligible_parent_count") or 0),
+        "actual_depth_by_route": {
+            str(key): int(value)
+            for key, value in (manifest.get("actual_depth_by_route") or {}).items()
+        },
+        "query_count": int((manifest.get("counts") or {}).get("queries") or 0),
+        "created_at": str(manifest.get("created_at") or ""),
+    }
 
 
 def _load_v1_v2_comparison(label_dir: Path) -> dict[str, Any] | None:

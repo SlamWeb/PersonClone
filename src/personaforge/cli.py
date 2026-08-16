@@ -356,6 +356,31 @@ def build_parser() -> argparse.ArgumentParser:
     eval_full_pool_parser.add_argument("--out-dir", help="Output directory beside the source pool by default.")
     eval_full_pool_parser.add_argument("--force", action="store_true", help="Replace an existing exhaustive pool.")
 
+    eval_rankings_parser = eval_subparsers.add_parser(
+        "retrieval-rankings",
+        help="Freeze independent six-route Parent rankings for RAG metrics.",
+    )
+    eval_rankings_parser.add_argument("--pool-manifest", required=True, help="Frozen Qrels pool manifest.")
+    eval_rankings_parser.add_argument("--index-dir", required=True, help="Directory containing parents.jsonl and nodes.jsonl.")
+    eval_rankings_parser.add_argument("--qdrant-path", help="Local Qdrant storage path; defaults to index-dir/qdrant.")
+    eval_rankings_parser.add_argument("--model-name", default="BAAI/bge-m3", help="Embedding model name or local path.")
+    eval_rankings_parser.add_argument(
+        "--embedding-device",
+        choices=["auto", "cpu", "cuda"],
+        default="auto",
+        help="Device for query embedding.",
+    )
+    eval_rankings_parser.add_argument("--depth", type=int, default=100, help="Parent ranking depth per route.")
+    eval_rankings_parser.add_argument("--child-top-k", type=int, default=2000, help="Initial child retrieval depth.")
+    eval_rankings_parser.add_argument("--max-child-top-k", type=int, default=10000, help="Maximum child depth after retries.")
+    eval_rankings_parser.add_argument("--per-query-parent-k", type=int, default=100)
+    eval_rankings_parser.add_argument("--rrf-k", type=int, default=60)
+    eval_rankings_parser.add_argument("--split", choices=["dev", "test", "all"], default="all")
+    eval_rankings_parser.add_argument("--ranking-id", default="six_route_parent_top100_v1")
+    eval_rankings_parser.add_argument("--out-dir", help="Optional output directory for the ranking snapshot.")
+    eval_rankings_parser.add_argument("--force", action="store_true", help="Replace an existing incomplete or completed snapshot.")
+    eval_rankings_parser.add_argument("--no-fp16", action="store_true", help="Disable fp16 when loading BGE-M3.")
+
     eval_gold_units_parser = eval_subparsers.add_parser(
         "retrieval-gold-units",
         help="Freeze Gold answer units used only by the offline retrieval Judge.",
@@ -440,6 +465,42 @@ def build_parser() -> argparse.ArgumentParser:
     )
     eval_judge_parser.add_argument("system_id", help="Immutable system ID shown by the Generate evaluation page.")
     eval_judge_parser.add_argument("--data-dir", default="data", help="Local data root containing eval runs.")
+
+    eval_profile_pack_parser = eval_subparsers.add_parser(
+        "generation-profile-pack",
+        help="Convert a train-only Persona Pack into an evaluator-only evidence profile.",
+    )
+    eval_profile_pack_parser.add_argument("--persona-pack", required=True)
+    eval_profile_pack_parser.add_argument("--out-file", required=True)
+    eval_profile_pack_parser.add_argument("--author-id")
+
+    eval_profile_corpus_parser = eval_subparsers.add_parser(
+        "generation-profile-corpus",
+        help="Build an LLM-free evidence profile from eligible historical excerpts.",
+    )
+    eval_profile_corpus_parser.add_argument("--parents", required=True, help="Author index parents.jsonl.")
+    eval_profile_corpus_parser.add_argument("--author-id", required=True)
+    eval_profile_corpus_parser.add_argument("--display-name", default="")
+    eval_profile_corpus_parser.add_argument("--eval-dataset", help="Temporal dataset used to exclude evaluation items and set cutoff.")
+    eval_profile_corpus_parser.add_argument("--max-evidence", type=int, default=24)
+    eval_profile_corpus_parser.add_argument("--out-file", required=True)
+
+    eval_pairwise_export_parser = eval_subparsers.add_parser(
+        "generation-pairwise-export",
+        help="Export a Gold-aware, evidence-profile pairwise handoff with A/B swap.",
+    )
+    eval_pairwise_export_parser.add_argument("--profile", required=True)
+    eval_pairwise_export_parser.add_argument("--left-run", required=True, help="Completed Test run runs.jsonl.")
+    eval_pairwise_export_parser.add_argument("--right-run", required=True, help="Completed Test run runs.jsonl.")
+    eval_pairwise_export_parser.add_argument("--out-dir", required=True)
+
+    eval_pairwise_import_parser = eval_subparsers.add_parser(
+        "generation-pairwise-import",
+        help="Validate and aggregate a completed offline pairwise handoff.",
+    )
+    eval_pairwise_import_parser.add_argument("--manifest", required=True)
+    eval_pairwise_import_parser.add_argument("--responses", required=True)
+    eval_pairwise_import_parser.add_argument("--out-file")
 
     web_parser = subparsers.add_parser("web", help="Start the local Web UI.")
     web_parser.add_argument("author", nargs="?", help="Creator token.")
@@ -1166,6 +1227,37 @@ def _run_eval(args: argparse.Namespace) -> int:
         print(f"- manifest: {result.manifest_path}")
         return 0
 
+    if args.eval_command == "retrieval-rankings":
+        from personaforge.eval.retrieval_rankings import (
+            RetrievalRankingConfig,
+            build_retrieval_ranking_snapshot,
+        )
+
+        index_dir = Path(args.index_dir)
+        config = RetrievalRankingConfig(
+            pool_manifest_path=Path(args.pool_manifest),
+            index_dir=index_dir,
+            qdrant_path=Path(args.qdrant_path) if args.qdrant_path else index_dir / "qdrant",
+            depth=args.depth,
+            child_top_k=args.child_top_k,
+            max_child_top_k=args.max_child_top_k,
+            per_query_parent_k=args.per_query_parent_k,
+            rrf_k=args.rrf_k,
+            split=args.split,
+            ranking_id=args.ranking_id,
+            out_dir=Path(args.out_dir) if args.out_dir else None,
+            force=args.force,
+        )
+        encoder = BgeM3Encoder(args.model_name, device=args.embedding_device, use_fp16=not args.no_fp16)
+        result = build_retrieval_ranking_snapshot(config, encoder=encoder)
+        print(f"Completed retrieval ranking snapshot {result.ranking_id}:")
+        print(f"- queries: {result.query_count}")
+        print(f"- requested depth: {result.requested_depth}")
+        print(f"- actual route depths: {result.actual_depth_by_route}")
+        print(f"- rankings: {result.rankings_path}")
+        print(f"- manifest: {result.manifest_path}")
+        return 0
+
     if args.eval_command == "retrieval-gold-units":
         from personaforge.eval.retrieval_gold_qrels import extract_gold_units
 
@@ -1320,6 +1412,69 @@ def _run_eval(args: argparse.Namespace) -> int:
         print(f"- progress: {manifest['completed']} / {manifest['total']}")
         print(f"- labels: {result['labels_path']}")
         print(f"- metrics: {result['manifest_path'].parent / 'metrics.json'}")
+        return 0
+
+    if args.eval_command == "generation-profile-pack":
+        from personaforge.eval.generation_pairwise import profile_from_persona_pack
+
+        profile = profile_from_persona_pack(
+            Path(args.persona_pack),
+            author_id=args.author_id,
+            out_path=Path(args.out_file),
+        )
+        print("Completed evidence profile from Persona Pack:")
+        print(f"- profile: {args.out_file}")
+        print(f"- author: {profile['author_id']}")
+        print(f"- evidence: {profile['stats']['evidence_count']}")
+        return 0
+
+    if args.eval_command == "generation-profile-corpus":
+        from personaforge.eval.generation_pairwise import profile_from_parent_corpus
+
+        profile = profile_from_parent_corpus(
+            Path(args.parents),
+            author_id=args.author_id,
+            display_name=args.display_name,
+            eval_dataset_path=Path(args.eval_dataset) if args.eval_dataset else None,
+            max_evidence=args.max_evidence,
+            out_path=Path(args.out_file),
+        )
+        print("Completed LLM-free evidence profile:")
+        print(f"- profile: {args.out_file}")
+        print(f"- author: {profile['author_id']}")
+        print(f"- cutoff: {profile['source']['cutoff']}")
+        print(f"- eligible parents: {profile['stats']['eligible_parent_count']}")
+        print(f"- evidence: {profile['stats']['evidence_count']}")
+        return 0
+
+    if args.eval_command == "generation-pairwise-export":
+        from personaforge.eval.generation_pairwise import build_handoff
+
+        manifest = build_handoff(
+            profile_path=Path(args.profile),
+            left_run_path=Path(args.left_run),
+            right_run_path=Path(args.right_run),
+            out_dir=Path(args.out_dir),
+        )
+        print("Completed offline pairwise handoff:")
+        print(f"- manifest: {Path(args.out_dir) / 'manifest.json'}")
+        print(f"- requests: {manifest['request_count']} ({manifest['item_count']} items x forward/swapped)")
+        print(f"- prompt hash: {manifest['prompt_hash']}")
+        return 0
+
+    if args.eval_command == "generation-pairwise-import":
+        from personaforge.eval.generation_pairwise import import_handoff
+
+        result = import_handoff(
+            manifest_path=Path(args.manifest),
+            response_path=Path(args.responses),
+            out_path=Path(args.out_file) if args.out_file else None,
+        )
+        print("Completed offline pairwise import:")
+        print(f"- result: {Path(args.out_file) if args.out_file else Path(args.manifest).parent / 'result.json'}")
+        print(f"- items: {result['summary']['item_count']}")
+        print(f"- position consistency: {result['summary']['position_consistency']}")
+        print(f"- inconsistent items: {result['summary']['inconsistent_items']}")
         return 0
 
     if args.eval_command == "judge":

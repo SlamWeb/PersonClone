@@ -228,6 +228,33 @@ def test_multi_k_metrics_include_recall_and_split_reports() -> None:
     assert set(metrics["splits"]) == {"dev", "test"}
     assert metrics["routes"]["raw_dense"]["by_cutoff"]["1"]["recall_at_k"] == 0.25
     assert metrics["routes"]["raw_dense"]["by_cutoff"]["2"]["recall_at_k"] == 1.0
+    assert metrics["routes"]["raw_dense"]["by_cutoff"]["1"]["useful_precision_at_k"] == 0.5
+    assert metrics["routes"]["raw_dense"]["by_cutoff"]["1"]["strong_recall_at_k"] == 0.5
+
+
+def test_metric_cutoffs_stop_at_frozen_route_depth() -> None:
+    records = [
+        {
+            "item_id": "dev-01",
+            "split": "dev",
+            "candidates": [
+                {
+                    "parent_id": f"p-{rank}",
+                    "route_ranks": {
+                        "raw_dense": {"rank": rank, "score": 1.0 / rank},
+                        "raw_sparse": {"rank": rank, "score": 1.0 / rank},
+                    },
+                }
+                for rank in range(1, 51)
+            ],
+        }
+    ]
+    labels = {("dev-01", f"p-{rank}"): 2 if rank == 50 else 0 for rank in range(1, 51)}
+    metrics = compute_split_metrics(records, labels, cutoff=3)
+
+    assert metrics["cutoffs"] == [1, 3, 5, 10, 20, 30, 50]
+    assert metrics["max_supported_cutoff"] == 50
+    assert metrics["routes"]["raw_dense"]["by_cutoff"]["50"]["strong_recall_at_k"] == 1.0
 
 
 def test_label_pool_is_resumable_and_web_can_read_ranked_report(tmp_path: Path) -> None:
@@ -320,7 +347,7 @@ def test_codex_review_materializes_explicit_zero_labels_only_when_complete(tmp_p
     rows = [json.loads(line) for line in result["labels_path"].read_text(encoding="utf-8").splitlines()]
     assert len(rows) == 2
     assert {(row["parent_id"], row["score"]) for row in rows} == {("parent-a", 2), ("parent-b", 0)}
-    assert result["metrics"]["cutoffs"] == [1, 3, 5, 10, 20, 30]
+    assert result["metrics"]["cutoffs"] == [1, 2]
 
 
 def test_gold_aware_qrels_are_dual_axis_resumable_and_comparable(tmp_path: Path) -> None:

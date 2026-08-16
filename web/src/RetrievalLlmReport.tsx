@@ -9,7 +9,8 @@ import {
   RetrievalLlmLabelSet,
   RetrievalLlmQuery,
   RetrievalLlmWorkspace,
-  RetrievalPoolSummary
+  RetrievalPoolSummary,
+  RetrievalRankingSummary
 } from './api';
 
 const ROUTE_ORDER = [
@@ -67,18 +68,26 @@ function scoreClass(score: RetrievalLlmCandidate['score']): string {
   return score === 2 ? 'score-2' : score === 1 ? 'score-1' : score === 0 ? 'score-0' : 'score-null';
 }
 
+function commonRankingDepth(snapshot: RetrievalRankingSummary | null | undefined): number {
+  const depths = Object.values(snapshot?.actual_depth_by_route || {}).filter((value) => value > 0);
+  return depths.length ? Math.min(...depths) : snapshot?.expected_depth || snapshot?.requested_depth || 0;
+}
+
 export function RetrievalLlmReport({ viewSwitcher, authorScope }: { viewSwitcher: ReactNode; authorScope: string | null }) {
   const [pools, setPools] = useState<RetrievalPoolSummary[]>([]);
   const [poolId, setPoolId] = useState('');
   const [labelSets, setLabelSets] = useState<RetrievalLlmLabelSet[]>([]);
   const [labelSet, setLabelSet] = useState('');
+  const [rankingId, setRankingId] = useState('');
   const [axis, setAxis] = useState('score');
   const [workspace, setWorkspace] = useState<RetrievalLlmWorkspace | null>(null);
   const [itemId, setItemId] = useState('');
   const [query, setQuery] = useState<RetrievalLlmQuery | null>(null);
   const [order, setOrder] = useState<'relevance' | 'retrieval'>('relevance');
   const [split, setSplit] = useState<ReportSplit>('all');
-  const [cutoff, setCutoff] = useState(3);
+  const [ndcgCutoff, setNdcgCutoff] = useState(10);
+  const [precisionCutoff, setPrecisionCutoff] = useState(20);
+  const [recallCutoff, setRecallCutoff] = useState(50);
   const [reportSection, setReportSection] = useState<'overview' | 'labels'>(() =>
     localStorage.getItem('pf-retrieval-report-section') === 'labels' ? 'labels' : 'overview'
   );
@@ -108,6 +117,19 @@ export function RetrievalLlmReport({ viewSwitcher, authorScope }: { viewSwitcher
     };
   }, [poolId]);
 
+  const selectedPool = useMemo(
+    () => pools.find((item) => item.pool_id === poolId) || null,
+    [poolId, pools]
+  );
+  const rankingSnapshots = selectedPool?.ranking_snapshots || [];
+  const completedRankings = rankingSnapshots.filter((item) => item.status === 'completed');
+
+  useEffect(() => {
+    setRankingId((current) => completedRankings.some((item) => item.ranking_id === current)
+      ? current
+      : completedRankings[0]?.ranking_id || '');
+  }, [poolId, completedRankings.map((item) => item.ranking_id).join(',')]);
+
   useEffect(() => {
     let active = true;
     if (!poolId || !labelSet) {
@@ -120,7 +142,7 @@ export function RetrievalLlmReport({ viewSwitcher, authorScope }: { viewSwitcher
     const requestedAxis = availableAxes.includes(axis) ? axis : selected?.default_axis || availableAxes[0] || 'score';
     if (requestedAxis !== axis) setAxis(requestedAxis);
     setLoading(true);
-    fetchRetrievalLlmWorkspace(poolId, labelSet, requestedAxis)
+    fetchRetrievalLlmWorkspace(poolId, labelSet, requestedAxis, rankingId || undefined)
       .then((next) => {
         if (!active) return;
         setWorkspace(next);
@@ -131,7 +153,7 @@ export function RetrievalLlmReport({ viewSwitcher, authorScope }: { viewSwitcher
     return () => {
       active = false;
     };
-  }, [axis, labelSet, labelSets, poolId]);
+  }, [axis, labelSet, labelSets, poolId, rankingId]);
 
   useEffect(() => {
     let active = true;
@@ -140,14 +162,14 @@ export function RetrievalLlmReport({ viewSwitcher, authorScope }: { viewSwitcher
       return;
     }
     setLoading(true);
-    fetchRetrievalLlmQuery(poolId, labelSet, itemId, axis)
+    fetchRetrievalLlmQuery(poolId, labelSet, itemId, axis, rankingId || undefined)
       .then((next) => active && setQuery(next))
       .catch((reason) => active && setError(String((reason as Error).message || reason)))
       .finally(() => active && setLoading(false));
     return () => {
       active = false;
     };
-  }, [axis, poolId, labelSet, itemId, reportSection]);
+  }, [axis, poolId, labelSet, itemId, rankingId, reportSection]);
 
   useEffect(() => {
     let active = true;
@@ -193,6 +215,28 @@ export function RetrievalLlmReport({ viewSwitcher, authorScope }: { viewSwitcher
   }, [split, workspace]);
   const currentMetrics = useMemo(() => selectedMetrics?.routes || {}, [selectedMetrics]);
   const availableCutoffs = selectedMetrics?.cutoffs?.length ? selectedMetrics.cutoffs : [selectedMetrics?.cutoff || 3];
+  const metricGroups = selectedMetrics?.cutoff_groups;
+  const supportedDepth = workspace?.ranking ? commonRankingDepth(workspace.ranking) : Number.POSITIVE_INFINITY;
+  const rankingCutoffs = (metricGroups?.ndcg?.length ? metricGroups.ndcg : availableCutoffs.filter((value) => value <= 30))
+    .filter((value) => value <= supportedDepth);
+  const precisionMetricCutoffs = (metricGroups?.precision?.length ? metricGroups.precision : rankingCutoffs)
+    .filter((value) => value <= supportedDepth);
+  const deepRecallCutoffs = (metricGroups?.recall?.length ? metricGroups.recall : availableCutoffs.filter((value) => value >= 10))
+    .filter((value) => value <= supportedDepth);
+  const recallCutoffs = deepRecallCutoffs.length
+    ? deepRecallCutoffs
+    : availableCutoffs.filter((value) => value <= supportedDepth);
+  const cutoffSignature = availableCutoffs.join(',');
+  useEffect(() => {
+    const keepOrNearest = (current: number, values: number[], fallback: number) => {
+      if (values.includes(current)) return current;
+      const belowFallback = values.filter((value) => value <= fallback);
+      return belowFallback[belowFallback.length - 1] || values[values.length - 1] || fallback;
+    };
+    setNdcgCutoff((current) => keepOrNearest(current, rankingCutoffs, 10));
+    setPrecisionCutoff((current) => keepOrNearest(current, precisionMetricCutoffs, 20));
+    setRecallCutoff((current) => keepOrNearest(current, recallCutoffs, 50));
+  }, [cutoffSignature, metricGroups, precisionMetricCutoffs.join(','), rankingCutoffs.join(','), recallCutoffs.join(',')]);
   const visibleQueries = useMemo(() => {
     const rows = workspace?.queries || [];
     return split === 'all' ? rows : rows.filter((row) => row.split === split);
@@ -229,6 +273,8 @@ export function RetrievalLlmReport({ viewSwitcher, authorScope }: { viewSwitcher
   const recallScopeLabel = recallScope === 'eligible_author_corpus_before_cutoff'
     ? `时间切分前全部${eligibleParentCount ? ` ${eligibleParentCount} 篇` : ''}作者语料`
     : '冻结六路候选并集';
+  const selectedRanking = rankingSnapshots.find((item) => item.ranking_id === rankingId) || null;
+  const selectedRankingDepth = commonRankingDepth(selectedRanking);
   const stabilityProgress = selectedLabelSet?.progress;
   return (
     <section className={`evaluation-workspace retrieval-llm-workspace ${collapsed ? 'rail-collapsed' : ''}`}>
@@ -260,6 +306,11 @@ export function RetrievalLlmReport({ viewSwitcher, authorScope }: { viewSwitcher
                 </option>;
               })}
             </select></label>
+            {rankingSnapshots.length ? <label>检索排名快照<select value={rankingId} onChange={(event) => setRankingId(event.target.value)}>
+              {rankingSnapshots.map((item: RetrievalRankingSummary) => <option key={item.ranking_id} value={item.ranking_id} disabled={item.status !== 'completed'}>
+                {item.ranking_id} · {item.status === 'completed' ? `请求 Top ${item.requested_depth} · 实际 ${commonRankingDepth(item)}` : item.status}
+              </option>)}
+            </select></label> : <div className="retrieval-overview-note">还没有独立排名快照<br /><small>完成 Parent Top100 快照后，才能显示正式 Recall@50/100。</small></div>}
             {labelSets.length ? <label>标注版本<select value={labelSet} onChange={(event) => setLabelSet(event.target.value)}>
               {labelSets.map((item) => <option key={item.label_set} value={item.label_set}>{item.label_set} · {item.completed}/{item.total}</option>)}
             </select></label> : <div className="retrieval-overview-note">当前候选池暂无 LLM 标注<br /><small>候选池仍保留在这里，方便切换到其他已有报告。</small></div>}
@@ -305,14 +356,24 @@ export function RetrievalLlmReport({ viewSwitcher, authorScope }: { viewSwitcher
               <div className="retrieval-segment" role="tablist" aria-label="数据划分">
                 {availableSplits.map((value) => <button type="button" className={split === value ? 'active' : ''} key={value} onClick={() => setSplit(value)}>{splitLabel(value)}</button>)}
               </div>
-              <label>观察深度 K
-                <select value={cutoff} onChange={(event) => setCutoff(Number(event.target.value))}>
-                  {availableCutoffs.map((value) => <option key={value} value={value}>Top {value}</option>)}
+              <label>排序质量 K
+                <select value={ndcgCutoff} onChange={(event) => setNdcgCutoff(Number(event.target.value))}>
+                  {rankingCutoffs.map((value) => <option key={value} value={value}>Top {value}</option>)}
+                </select>
+              </label>
+              <label>精确率 K
+                <select value={precisionCutoff} onChange={(event) => setPrecisionCutoff(Number(event.target.value))}>
+                  {precisionMetricCutoffs.map((value) => <option key={value} value={value}>Top {value}</option>)}
+                </select>
+              </label>
+              <label>召回率 K
+                <select value={recallCutoff} onChange={(event) => setRecallCutoff(Number(event.target.value))}>
+                  {recallCutoffs.map((value) => <option key={value} value={value}>Top {value}</option>)}
                 </select>
               </label>
               <span>{selectedMetrics?.relevant_candidate_count ?? 0} 个有用 query-parent 对 · Recall 分母：{recallScopeLabel}</span>
             </div>
-            <div className="retrieval-aggregate-explanation">下面六组数字是 <strong>{splitLabel(split)}</strong> 在当前评估维度、Top {cutoff} 下的逐题平均结果，不属于任何一道单题。</div>
+            <div className="retrieval-aggregate-explanation">下面六组数字是 <strong>{splitLabel(split)}</strong> 的逐题平均结果。nDCG 使用 0/1/2 分级相关性；Useful 表示得分至少为 1，Strong 表示得分为 2。{rankingId ? `当前使用 ${workspace?.ranking?.ranking_id || rankingId} 的独立 Parent 排名快照，请求深度 ${workspace?.ranking?.requested_depth || 100}，实际可用深度 ${selectedRankingDepth}；Recall 分母来自冻结 Qrels。` : ''}</div>
             {workspace?.comparison ? <div className="retrieval-comparison-summary">
               <strong>Gold-aware 相比旧 Query-only Judge 改判 {workspace.comparison.changed_count} / {workspace.comparison.total}</strong>
               <span>其中旧版 0 分、Gold-aware 改为 1/2 分：{workspace.comparison.v1_zero_to_v2_positive} 对</span>
@@ -320,16 +381,17 @@ export function RetrievalLlmReport({ viewSwitcher, authorScope }: { viewSwitcher
             <div className="retrieval-llm-metrics">
               {ROUTE_ORDER.filter((route) => currentMetrics[route]).map((route) => {
                 const base = currentMetrics[route];
-                const metric = base.by_cutoff?.[String(cutoff)] || base;
+                const ndcgMetric = base.by_cutoff?.[String(ndcgCutoff)] || base;
+                const precisionMetric = base.by_cutoff?.[String(precisionCutoff)] || base;
+                const recallMetric = base.by_cutoff?.[String(recallCutoff)] || base;
                 return (
                 <div className="retrieval-llm-metric" key={route}>
                   <strong>{ROUTE_LABELS[route] || route}</strong>
-                  <span title="至少命中一篇有用材料的问题比例">Hit@{cutoff} <b>{metricValue(metric.hit_at_k)}</b></span>
-                  <span title="第一篇有用材料排名倒数的平均值">MRR@{cutoff} <b>{metricValue(metric.mrr_at_k)}</b></span>
-                  <span title="同时考虑 0/1/2 相关等级与排序位置">nDCG@{cutoff} <b>{metricValue(metric.ndcg_at_k)}</b></span>
-                  <span title="前 K 篇中有用材料所占比例">Precision@{cutoff} <b>{metricValue(metric.precision_at_k)}</b></span>
-                  <span title="前 K 篇覆盖完整相关材料集合的比例">Recall@{cutoff} <b>{metricValue(metric.recall_at_k)}</b></span>
-                  <span title="前 K 位平均准确率，兼顾多个相关结果的排序位置">MAP@{cutoff} <b>{metricValue(metric.map_at_k ?? null)}</b></span>
+                  <span title="同时考虑 0/1/2 相关等级与排序位置">nDCG@{ndcgCutoff} <b>{metricValue(ndcgMetric.ndcg_at_k)}</b></span>
+                  <span title="前 K 篇中得分至少为 1 的材料比例">Useful Precision@{precisionCutoff} <b>{metricValue(precisionMetric.useful_precision_at_k ?? null)}</b></span>
+                  <span title="前 K 篇中得分为 2 的材料比例">Strong Precision@{precisionCutoff} <b>{metricValue(precisionMetric.strong_precision_at_k ?? null)}</b></span>
+                  <span title="Top K 覆盖候选池内全部 1/2 分材料的比例">Useful Recall@{recallCutoff} <b>{metricValue(recallMetric.useful_recall_at_k ?? null)}</b></span>
+                  <span title="Top K 覆盖候选池内全部 2 分材料的比例">Strong Recall@{recallCutoff} <b>{metricValue(recallMetric.strong_recall_at_k ?? null)}</b></span>
                 </div>
               );})}
             </div>
@@ -349,7 +411,11 @@ export function RetrievalLlmReport({ viewSwitcher, authorScope }: { viewSwitcher
               <div className="retrieval-order-switch"><button className={order === 'relevance' ? 'active' : ''} type="button" onClick={() => setOrder('relevance')}>相关性顺序</button><button className={order === 'retrieval' ? 'active' : ''} type="button" onClick={() => setOrder('retrieval')}>检索顺序</button></div>
             </div>
             <div className="retrieval-llm-list">
-              {orderedCandidates.map((candidate, index) => (
+              {orderedCandidates.map((candidate, index) => {
+                const actualRouteRanks = Object.keys(candidate.ranking_routes || {}).length
+                  ? candidate.ranking_routes
+                  : candidate.route_ranks;
+                return (
             <article className="retrieval-llm-card" key={candidate.parent_id}>
               <div className="retrieval-llm-card-heading">
                 <span className="retrieval-llm-rank">{order === 'relevance' ? candidate.relevance_order : index + 1}</span>
@@ -370,10 +436,11 @@ export function RetrievalLlmReport({ viewSwitcher, authorScope }: { viewSwitcher
                   {axis === 'persona_expression_support' && candidate.persona_gold_unit_ids?.length ? <><br /><b>对应 Gold 单元：</b>{candidate.persona_gold_unit_ids.join('、')}</> : null}
                   {candidate.repeat_count ? <><br /><b>稳定性：</b>{candidate.repeat_count} 次判分{candidate.exact_agreement === true ? '，完全一致' : candidate.exact_agreement === false ? '，中位数聚合' : ''}</> : null}
                 </div>
-                <div className="retrieval-route-tags">{ROUTE_ORDER.filter((route) => candidate.route_ranks[route]).map((route) => <span key={route}>{ROUTE_LABELS[route] || route} · #{candidate.route_ranks[route].rank}</span>)}</div>
+                <div className="retrieval-route-tags">{ROUTE_ORDER.filter((route) => actualRouteRanks?.[route]).map((route) => <span key={route}>{ROUTE_LABELS[route] || route} · #{actualRouteRanks?.[route].rank}</span>)}</div>
               </details>
             </article>
-              ))}
+                );
+              })}
             </div>
           </>}
         </div>

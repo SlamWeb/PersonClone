@@ -339,6 +339,7 @@ export type RetrievalPoolSummary = {
     completed: number;
     total: number;
   }>;
+  ranking_snapshots?: RetrievalRankingSummary[];
   recall_scope?: string;
   counts?: {
     queries?: number;
@@ -346,6 +347,16 @@ export type RetrievalPoolSummary = {
     eligible_parents_per_query?: number;
     unique_parents?: number;
   };
+};
+
+export type RetrievalRankingSummary = {
+  ranking_id: string;
+  status: string;
+  requested_depth: number;
+  expected_depth: number;
+  actual_depth_by_route?: Record<string, number>;
+  query_count: number;
+  created_at?: string;
 };
 
 export type RetrievalQuerySummary = {
@@ -400,6 +411,10 @@ export type RetrievalRouteMetrics = {
   precision_at_k: number | null;
   recall_at_k: number | null;
   map_at_k?: number | null;
+  useful_precision_at_k?: number | null;
+  strong_precision_at_k?: number | null;
+  useful_recall_at_k?: number | null;
+  strong_recall_at_k?: number | null;
   relevant_query_count?: number;
   no_relevant_query_count?: number;
   by_cutoff?: Record<string, Omit<RetrievalRouteMetrics, 'by_cutoff'>>;
@@ -409,6 +424,8 @@ export type RetrievalMetrics = {
   schema_version?: string;
   cutoff: number;
   cutoffs?: number[];
+  max_supported_cutoff?: number;
+  route_depths?: Record<string, number>;
   recall_scope?: string;
   relevance_threshold: number;
   query_count: number;
@@ -418,6 +435,13 @@ export type RetrievalMetrics = {
   coverage?: number;
   routes: Record<string, RetrievalRouteMetrics>;
   splits?: Record<string, RetrievalMetrics>;
+  ranking_id?: string;
+  requested_depth?: number;
+  cutoff_groups?: {
+    ndcg?: number[];
+    precision?: number[];
+    recall?: number[];
+  };
 };
 
 export type RetrievalLlmLabelSet = {
@@ -460,6 +484,10 @@ export type RetrievalLlmWorkspace = {
     v1_zero_to_v2_positive: number;
     transition_counts: Record<string, Record<string, number>>;
   } | null;
+  ranking?: RetrievalRankingSummary & {
+    eligible_parent_count?: number;
+  } | null;
+  ranking_snapshots?: RetrievalRankingSummary[];
   queries: RetrievalQuerySummary[];
 };
 
@@ -485,6 +513,7 @@ export type RetrievalLlmCandidate = {
   exact_agreement?: boolean | null;
   status: string;
   route_ranks: Record<string, { rank: number; score: number }>;
+  ranking_routes?: Record<string, { rank: number; parent_id?: string; score: number }>;
 };
 
 export type RetrievalLlmQuery = {
@@ -499,6 +528,7 @@ export type RetrievalLlmQuery = {
   candidate_count: number;
   labeled_count: number;
   candidates: RetrievalLlmCandidate[];
+  ranking?: RetrievalRankingSummary | null;
 };
 
 export type RetrievalEvalJob = {
@@ -814,9 +844,13 @@ export async function fetchRetrievalLlmLabelSets(poolId: string): Promise<Retrie
 export async function fetchRetrievalLlmWorkspace(
   poolId: string,
   labelSet: string,
-  axis?: string
+  axis?: string,
+  rankingId?: string
 ): Promise<RetrievalLlmWorkspace> {
-  const query = axis ? `?axis=${encodeURIComponent(axis)}` : '';
+  const params = new URLSearchParams();
+  if (axis) params.set('axis', axis);
+  if (rankingId) params.set('ranking', rankingId);
+  const query = params.toString() ? `?${params.toString()}` : '';
   const response = await apiFetch(
     `/api/evaluations/retrieval/pools/${encodeURIComponent(poolId)}/llm-labels/${encodeURIComponent(labelSet)}${query}`
   );
@@ -828,9 +862,13 @@ export async function fetchRetrievalLlmQuery(
   poolId: string,
   labelSet: string,
   itemId: string,
-  axis?: string
+  axis?: string,
+  rankingId?: string
 ): Promise<RetrievalLlmQuery> {
-  const query = axis ? `?axis=${encodeURIComponent(axis)}` : '';
+  const params = new URLSearchParams();
+  if (axis) params.set('axis', axis);
+  if (rankingId) params.set('ranking', rankingId);
+  const query = params.toString() ? `?${params.toString()}` : '';
   const response = await apiFetch(
     `/api/evaluations/retrieval/pools/${encodeURIComponent(poolId)}/llm-labels/${encodeURIComponent(labelSet)}` +
       `/queries/${encodeURIComponent(itemId)}${query}`

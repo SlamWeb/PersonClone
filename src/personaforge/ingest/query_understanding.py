@@ -145,19 +145,43 @@ def build_grounded_query_plan(
 
 
 def plan_web_search(query: str, *, llm: JsonChatClient, max_search_queries: int = 3) -> SearchPlan:
-    payload = llm.complete_json(
-        [
-            {"role": "system", "content": SEARCH_PLANNER_SYSTEM_PROMPT},
-            {"role": "user", "content": f"知乎问题：{query}"},
-        ],
+    messages = [
+        {"role": "system", "content": SEARCH_PLANNER_SYSTEM_PROMPT},
+        {"role": "user", "content": f"知乎问题：{query}"},
+    ]
+    payload = _complete_json_with_parse_retry(
+        llm,
+        messages,
         temperature=0.0,
         max_tokens=512,
+        retry_instruction=(
+            "上一次输出不是合法 JSON。请只输出一个完整、可解析的 JSON object，"
+            "不要 Markdown 代码围栏，不要补充解释。"
+        ),
     )
     needs_web = bool(payload.get("needs_web"))
     search_queries = _string_list(payload.get("search_queries"))[:max_search_queries]
     if not needs_web:
         search_queries = []
     return SearchPlan(needs_web=needs_web, search_queries=search_queries)
+
+
+def _complete_json_with_parse_retry(
+    llm: JsonChatClient,
+    messages: list[dict[str, str]],
+    *,
+    temperature: float,
+    max_tokens: int,
+    retry_instruction: str,
+) -> dict[str, object]:
+    """Retry only malformed model JSON; transport and provider errors still fail fast."""
+
+    try:
+        return llm.complete_json(messages, temperature=temperature, max_tokens=max_tokens)
+    except (json.JSONDecodeError, ValueError):
+        retry_messages = [dict(message) for message in messages]
+        retry_messages[0]["content"] += f"\n\n{retry_instruction}"
+        return llm.complete_json(retry_messages, temperature=temperature, max_tokens=max_tokens)
 
 
 def build_background_and_retrieval_queries(
@@ -168,20 +192,26 @@ def build_background_and_retrieval_queries(
     resolved_query: str | None = None,
 ) -> QueryTransformResult:
     has_search_results = bool(search_results)
-    payload = llm.complete_json(
-        [
-            {"role": "system", "content": BACKGROUND_TRANSFORM_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": _background_transform_user_prompt(
-                    query,
-                    search_results,
-                    resolved_query=resolved_query,
-                ),
-            },
-        ],
+    messages = [
+        {"role": "system", "content": BACKGROUND_TRANSFORM_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": _background_transform_user_prompt(
+                query,
+                search_results,
+                resolved_query=resolved_query,
+            ),
+        },
+    ]
+    payload = _complete_json_with_parse_retry(
+        llm,
+        messages,
         temperature=0.0,
         max_tokens=1400,
+        retry_instruction=(
+            "上一次输出不是合法 JSON。请严格按要求重新输出完整 JSON object，"
+            "retrieval_queries 必须包含四个 route，不能输出 Markdown 或解释文字。"
+        ),
     )
     background = str(payload.get("objective_background") or "").strip() if has_search_results else ""
     fallback_query = (resolved_query or query).strip() or query

@@ -168,6 +168,31 @@ pf eval retrieval-core `
 标签独立保存到 SQLite，刷新和服务重启后继续；同一标签允许修订。后续 `Recall@K`、
 `nDCG@K`、`MRR` 和无有用结果率均从这份冻结标注派生，K 与候选池大小分开设置。
 
+正式多作者报告以分级 `nDCG`、Useful/Strong Precision 和 Useful/Strong Recall 为主：
+
+- `nDCG@K` 直接使用 0/1/2 相关等级，gain 分别为 0/1/3。
+- Useful 指标签至少为 1；Strong 指标签等于 2。
+- Precision 的常用观察深度为 1/3/5/10/20/30。
+- Recall 使用更深的 10/20/30/50/100；Qrels 候选池大小与待评估方法的排名深度相互独立。只要该方法另外冻结了 Parent Top K 排名，就可以在既有 Qrels 上计算 Recall@K，无需重新标注候选池。
+- 大语料作者假设六路 Top50 并集覆盖主要相关材料，Recall 分母为该候选池内全部已标注相关材料；因此它是候选池边界内的 Recall，不外推为未标注全语料的绝对 Recall。
+- 前端根据待评估方法排名快照的各路实际可用深度自动提供 K，并同时展示“请求深度”和“实际深度”。当前排名快照只有 Top30 时不能直接显示 Recall@100；应在不改变 Qrels 的前提下，本地重新生成该方法的 Parent Top100 排名快照。
+
+独立排名快照使用本地索引生成，不调用 LLM API，也不会修改已有 Qrels：
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m personaforge.cli eval retrieval-rankings `
+  --pool-manifest <冻结候选池 manifest.json> `
+  --index-dir <作者 index 目录> `
+  --model-name <本地 BGE-M3 路径> `
+  --embedding-device cuda `
+  --depth 100
+```
+
+快照会写入候选池下的 `rankings/<ranking_id>/`，包括每道题六条路线的有序
+Parent 列表和配置清单。前端只展示已经完成的快照；没有快照的作者或方法不显示
+Recall@100，实际语料不足时也不提供超过实际深度的 K，避免把 Top30 结果误当成深度检索结果。
+
 ### 卢诗翰离线评估
 
 卢诗翰使用独立数据集 `lu-shi-han-89-temporal-v0`，固定为 Dev 10 + Test 20。候选池
@@ -249,10 +274,26 @@ Gold Judge 使用 `gold-judge-v1.0`，输入严格限定为同一题的 question
 和 D6 可以分别汇总为“内容忠实度、语言表达相似度、自然表达”，但不把六维压成一个
 总分，也不能用 D6 抬高作者相似性。
 
-LLM 系统比较不再调用直接 Pairwise Judge。每个系统独立完成六维 Gold Judge 后，在
-同题上计算分差、W/T/L 和置信区间，避免此前观测到的候选首位偏差。人工 AB 仍作为
-独立构念：在展示 Gold 的前提下强制选择整体更像作者的 A 或 B，系统身份隐藏，A/B
-顺序按用户、系统对和题目稳定随机，刷新后不变。
+LLM 系统比较保留两种互补视角：六维 Gold Judge 继续用于单篇诊断；新增证据驱动的
+Profile Pairwise Judge 用于直接比较两个生成方法。后者输入严格固定为：当前问题、
+同题作者 Gold、作者历史证据 Profile、候选 A、候选 B。Profile 只能作为带原文出处的
+评审证据，不能当作写作规范；候选身份和方法名不进入给 Judge 看的候选正文。
+
+Pairwise Judge 必须对每道 Test 题生成 forward 和 swapped 两份请求。每份请求都要求
+在 A/B 中选择一篇，并返回低/中/高信心、最多若干条 Profile 证据 ID、Gold 方向证据
+和一句比较理由；不提供平局选项。两次选择映射到同一个系统时记为 position-consistent，
+不一致时该题不计入胜率，只进入不稳定样本复核。Pairwise 不是把六维分数重新压成总分，
+它回答的是“在这道题上哪种方法更像作者”。
+
+当前实现使用离线 handoff：`generation-profile-pack` 可把已有 train-only Persona
+Pack 转成评审专用档案，`generation-profile-corpus` 在没有总结档案时从时间边界内的
+历史 parent 抽取确定性的原文证据，`generation-pairwise-export` 生成绑定哈希的正反
+任务，`generation-pairwise-import` 校验并汇总回填结果。上述命令都不调用 LLM API；
+Profile 和候选内容的来源、哈希、题目数和 Prompt 哈希都写入 manifest。
+
+生成评估中的人工 AB 仍是独立构念：在展示 Gold 的前提下强制选择整体更像作者的 A 或 B，
+系统身份隐藏，A/B 顺序按用户、系统对和题目稳定随机，刷新后不变。自动 Pairwise Judge
+和人工 AB 的数据不能混为同一标签，但可以用一致性、换位稳定性和人工抽样校准来共同解释。
 
 Web 发起 Judge 时只创建持久化异步任务。任务可以离开页面继续执行，服务重启后未完成
 任务允许恢复；相同 system SHA、Judge prompt hash、模型和重复次数的完成结果应复用。
@@ -262,7 +303,8 @@ Judge 结果写入对应 run 下的 `judges/gold-v1/<job-id>/`，不覆盖生成
 
 - 不重爬、不重切片、不重 embedding、不重建 Qdrant collection。
 - 不把真实语料或 eval 输出提交到仓库。
-- 不做直接 LLM Pairwise Judge、rewrite，或用单一总分替代六维结果。
+- 不把 Profile Pairwise Judge 当成六维总分，也不把不一致的换位结果强行计入胜率。
+- 不调用付费 API 生成离线 Profile 或 Codex handoff；只有明确启动 API Judge 任务时才允许联网。
 - 不把 test 当作日常调参集。常规实验跑 dev，候选最终方案才跑 test。
 
 ## 验收

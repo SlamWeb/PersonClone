@@ -193,6 +193,27 @@ python -m personaforge.cli eval retrieval-rankings `
 Parent 列表和配置清单。前端只展示已经完成的快照；没有快照的作者或方法不显示
 Recall@100，实际语料不足时也不提供超过实际深度的 K，避免把 Top30 结果误当成深度检索结果。
 
+### 跨作者 RAG 总览
+
+Web 的 LLM 检索报告提供“所有作者”入口。该入口只读取各作者已经完成的
+`llm_labels/*/metrics.json`（必要时使用同一份冻结标注本地重算），不重新召回、不重新标注、
+也不调用模型 API。聚合口径固定为作者宏平均：每位作者先独立得到六条路线的指标，
+再让作者等权参与平均；材料多的作者不会因为 query-parent 对更多而自动占更大权重。
+
+如果一个作者的 Dev 与 Test 被拆成两个完成的标注任务，先在作者内部按题目数合并，
+再进入跨作者平均。页面显示当前实际纳入的作者、标注版本和跳过原因；没有同一评估维度或
+没有对应完整标注的作者不能悄悄进入分母。`全部 / Dev / Test` 和 `内容支撑 /
+作者表达支撑` 仍然可以独立切换。全局指标是工程诊断用的宏平均，不替代按作者查看的
+单作者报告，也不把不同作者的 Qrels 直接拼成一个微平均分数。
+
+为避免前端每次切换维度或数据划分都重新解析大文件，Web 进程会缓存标签集、已计算指标和
+跨作者总览。缓存键包含候选池、标注清单和标签文件的修改时间与大小；标注任务写入新结果后
+会自动失效。重启服务会清空内存缓存，但不会改变或删除任何评估数据。
+
+跨作者总览只请求跨作者接口支持的两条支撑维度；进入该页面时不复用单作者候选池、标签集
+和逐题请求。全局请求的错误必须显示为读取失败，不能继续显示加载中，避免把后端异常误判为
+报告尚未完成。
+
 ### 卢诗翰离线评估
 
 卢诗翰使用独立数据集 `lu-shi-han-89-temporal-v0`，固定为 Dev 10 + Test 20。候选池
@@ -562,3 +583,21 @@ Transform 融合路线整体显著优于原问题单路检索，纯 BM25 整体�
 对。`candidate_first_v1` 的 DeepSeek 双轴标注完整结束，正式 label set 为
 `gold_aware_candidate_first_deepseek_v1_dev`。该记录只用于验证多作者、缓存、预算、恢复和
 前端发现链路，不把 dev 指标解释为最终泛化结论。
+
+### 静水 Test 的无 API 页面验证标签
+
+在没有可用外部 API 时，`ban-ma-ban-ma-30-2` 的 Test20 使用
+`scripts/build_offline_proxy_test_labels.py` 从该作者已完成的 Dev 双轴标签校准字符
+TF-IDF 特征分类器，离线生成 3460 个题目-parent 对的 `content_support` 与
+`persona_expression_support` 0/1/2 标签。结果目录为：
+
+```text
+data/eval/ban-ma-ban-ma-30-2-temporal-fbe0192530/retrieval_pool/
+  all30_exhaustive_qrels_v2/llm_labels/codex_offline_proxy_test_v1/
+```
+
+该标签集明确写入 `provisional=true`、`not_gold=true` 和
+`external_api_called=false`，只用于验证五作者跨作者总览、K 切换和前端展示，不能
+冒充人工标注、DeepSeek Judge 或正式 Gold。正式研究或简历中的结果仍应替换为人工
+或经过审核的 Judge 标签。当前 Test 跨作者总览按作者等权平均；不同作者若排名深度
+不一致，超出共同深度的 K 不应被解释为五作者完整平均。

@@ -338,6 +338,8 @@ export type RetrievalPoolSummary = {
     status: string;
     completed: number;
     total: number;
+    label_source?: string;
+    provisional?: boolean;
   }>;
   ranking_snapshots?: RetrievalRankingSummary[];
   recall_scope?: string;
@@ -424,6 +426,8 @@ export type RetrievalMetrics = {
   schema_version?: string;
   cutoff: number;
   cutoffs?: number[];
+  available_cutoffs?: number[];
+  partial_cutoffs?: number[];
   max_supported_cutoff?: number;
   route_depths?: Record<string, number>;
   recall_scope?: string;
@@ -448,6 +452,8 @@ export type RetrievalLlmLabelSet = {
   label_set: string;
   status: string;
   model: string;
+  label_source?: string;
+  provisional?: boolean;
   prompt_version: string;
   completed: number;
   total: number;
@@ -489,6 +495,28 @@ export type RetrievalLlmWorkspace = {
   } | null;
   ranking_snapshots?: RetrievalRankingSummary[];
   queries: RetrievalQuerySummary[];
+};
+
+export type RetrievalGlobalAuthor = {
+  author: string;
+  pool_ids: string[];
+  label_sets: string[];
+  effective_split: string;
+  query_count: number;
+  routes: string[];
+};
+
+export type RetrievalGlobalReport = {
+  schema_version?: string;
+  active_axis: string;
+  axes: Record<string, { label?: string; values?: number[] }>;
+  split: 'all' | 'dev' | 'test';
+  available_splits: Array<'all' | 'dev' | 'test'>;
+  total_authors: number;
+  included_authors: number;
+  skipped_authors: Array<{ author: string; reason: string }>;
+  authors: RetrievalGlobalAuthor[];
+  metrics: RetrievalMetrics;
 };
 
 export type RetrievalLlmCandidate = {
@@ -816,6 +844,18 @@ export async function fetchRetrievalPools(author?: string | null): Promise<Retri
   if (!response.ok) throw new Error(await apiError(response, '无法读取检索评估集'));
   const payload = await response.json();
   return payload.pools || [];
+}
+
+export async function fetchRetrievalGlobalReport(
+  axis?: string,
+  split: 'all' | 'dev' | 'test' = 'all'
+): Promise<RetrievalGlobalReport> {
+  const params = new URLSearchParams();
+  if (axis) params.set('axis', axis);
+  params.set('split', split);
+  const response = await apiFetch(`/api/evaluations/retrieval/global?${params.toString()}`);
+  if (!response.ok) throw new Error(await apiError(response, '无法读取跨作者检索总览'));
+  return response.json();
 }
 
 export async function fetchRetrievalWorkspace(poolId: string): Promise<RetrievalWorkspace> {

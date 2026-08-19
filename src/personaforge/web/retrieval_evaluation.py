@@ -38,6 +38,12 @@ class RetrievalEvaluationStore:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = RLock()
         self._pool_cache: dict[str, tuple[int, list[dict[str, Any]]]] = {}
+        self._label_set_cache: dict[
+            str,
+            tuple[tuple[tuple[int, int], tuple[int, int]], dict[str, Any], dict[tuple[str, str], dict[str, Any]]],
+        ] = {}
+        self._metrics_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
+        self._global_report_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
         self._initialize()
 
     def list_pools(self, user_id: str, author: str | None = None) -> list[dict[str, Any]]:
@@ -82,7 +88,7 @@ class RetrievalEvaluationStore:
         results: list[dict[str, Any]] = []
         for manifest_path in label_root.glob("*/manifest.json"):
             try:
-                manifest, _labels = load_label_set(manifest_path)
+                manifest, _labels = self._load_label_set_cached(manifest_path)
             except (OSError, json.JSONDecodeError, KeyError, TypeError):
                 continue
             if str(manifest.get("pool_id") or "") != str(files.manifest.get("pool_id") or ""):
@@ -93,6 +99,8 @@ class RetrievalEvaluationStore:
                     "status": str(manifest.get("status") or "unknown"),
                     "completed": int(manifest.get("completed") or 0),
                     "total": int(manifest.get("total") or 0),
+                    "label_source": str(manifest.get("label_source") or manifest.get("labeler") or ""),
+                    "provisional": bool(manifest.get("provisional") or manifest.get("not_gold")),
                 }
             )
         return sorted(results, key=lambda row: row["label_set"])
@@ -203,7 +211,7 @@ class RetrievalEvaluationStore:
         records = self._load_records(files)
         for manifest_path in label_root.glob("*/manifest.json"):
             try:
-                manifest, labels = load_label_set(manifest_path)
+                manifest, labels = self._load_label_set_cached(manifest_path)
             except (OSError, json.JSONDecodeError, KeyError, TypeError):
                 continue
             if str(manifest.get("pool_id") or "") != pool_id:
@@ -211,10 +219,12 @@ class RetrievalEvaluationStore:
             label_records = _records_for_label_manifest(records, manifest)
             axes, default_axis = _label_axes(manifest)
             score_labels = _axis_labels(labels, default_axis)
-            raw_metrics = _load_metrics(
+            raw_metrics = self._load_metrics_cached(
                 manifest_path.parent,
+                files.pool_path,
                 label_records,
                 score_labels,
+                metric_axis=default_axis,
                 recall_scope=str(files.manifest.get("recall_scope") or "six_route_candidate_union"),
             )
             metrics = _metrics_for_axis(raw_metrics, default_axis)
@@ -223,6 +233,8 @@ class RetrievalEvaluationStore:
                     "label_set": str(manifest.get("label_set") or manifest_path.parent.name),
                     "status": str(manifest.get("status") or "unknown"),
                     "model": str(manifest.get("model") or ""),
+                    "label_source": str(manifest.get("label_source") or manifest.get("labeler") or ""),
+                    "provisional": bool(manifest.get("provisional") or manifest.get("not_gold")),
                     "prompt_version": str(manifest.get("prompt_version") or ""),
                     "completed": int(manifest.get("completed") or len(score_labels)),
                     "total": int(
@@ -286,10 +298,12 @@ class RetrievalEvaluationStore:
             )
         else:
             ranking_records = []
-            raw_metrics = _load_metrics(
-                label_dir=files.manifest_path.parent / "llm_labels" / label_set,
-                records=records,
-                labels=score_labels,
+            raw_metrics = self._load_metrics_cached(
+                files.manifest_path.parent / "llm_labels" / label_set,
+                files.pool_path,
+                records,
+                score_labels,
+                metric_axis=active_axis,
                 recall_scope=str(files.manifest.get("recall_scope") or "six_route_candidate_union"),
             )
         return {
@@ -315,6 +329,200 @@ class RetrievalEvaluationStore:
             "ranking_snapshots": self._ranking_status(files),
             "queries": query_rows,
         }
+
+    def global_llm_report(
+        self,
+        *,
+        axis: str | None = None,
+        split: str = "all",
+    ) -> dict[str, Any]:
+        """Aggregate compatible LLM retrieval reports across authors.
+
+        The aggregation is deliberately macro-averaged: one author contributes
+        one report, regardless of how many candidate pairs their corpus has.
+        When an author only has separate Dev/Test label runs, those runs are
+        merged within that author before the cross-author average is computed.
+        No retrieval or LLM call is performed here; this reads the frozen
+        reports already materialized under ``data/eval``.
+        """
+
+        if split not in {"all", "dev", "test"}:
+            raise ValueError("split must be all, dev, or test")
+
+        discovered_pools = self._discover()
+        cache_key = (
+            str(axis or ""),
+            split,
+            _global_report_signature(discovered_pools),
+        )
+        with self._lock:
+            cached_report = self._global_report_cache.get(cache_key)
+            if cached_report is not None:
+                return cached_report
+
+        discovered_authors = sorted(
+            {
+                str(files.manifest.get("author") or "").strip()
+                for files in discovered_pools.values()
+                if str(files.manifest.get("author") or "").strip()
+            }
+        )
+        candidates_by_author: dict[str, list[dict[str, Any]]] = {
+            author: [] for author in discovered_authors
+        }
+        available_axes: dict[str, dict[str, Any]] = {}
+        available_splits: set[str] = set()
+        resolved_axis: str | None = None
+
+        for files in discovered_pools.values():
+            author = str(files.manifest.get("author") or "").strip()
+            if not author:
+                continue
+            label_root = files.manifest_path.parent / "llm_labels"
+            if not label_root.exists():
+                continue
+            records = self._load_records(files)
+            for manifest_path in label_root.glob("*/manifest.json"):
+                try:
+                    label_manifest, labels = self._load_label_set_cached(manifest_path)
+                except (OSError, json.JSONDecodeError, KeyError, TypeError):
+                    continue
+                if str(label_manifest.get("pool_id") or "") != str(files.manifest.get("pool_id") or ""):
+                    continue
+                if str(label_manifest.get("status") or "") != "completed":
+                    continue
+                label_records = _records_for_label_manifest(records, label_manifest)
+                axes, default_axis = _label_axes(label_manifest)
+                active_axis = str(axis or default_axis)
+                if active_axis not in axes:
+                    continue
+                if resolved_axis is None:
+                    resolved_axis = active_axis
+                available_axes.update({str(key): dict(value) for key, value in axes.items()})
+                raw_metrics = self._load_metrics_cached(
+                    manifest_path.parent,
+                    files.pool_path,
+                    label_records,
+                    _axis_labels(labels, active_axis),
+                    metric_axis=active_axis,
+                    recall_scope=str(files.manifest.get("recall_scope") or "six_route_candidate_union"),
+                )
+                axis_metrics = _metrics_for_axis(raw_metrics, active_axis)
+                selected_splits = {
+                    str(value).strip()
+                    for value in (label_manifest.get("selected_splits") or [])
+                    if str(value).strip() in {"dev", "test"}
+                }
+                # An empty selection is the historical convention for a
+                # report covering the complete available pool.
+                coverage = selected_splits or {
+                    str(row.get("split") or "")
+                    for row in label_records
+                    if str(row.get("split") or "") in {"dev", "test"}
+                }
+                if not coverage:
+                    coverage = {"all"}
+                available_splits.update(coverage)
+                candidates_by_author[author].append(
+                    {
+                        "files": files,
+                        "label_manifest": label_manifest,
+                        "label_set": str(label_manifest.get("label_set") or manifest_path.parent.name),
+                        "metrics": axis_metrics,
+                        "coverage": coverage,
+                        "updated_at": str(label_manifest.get("updated_at") or ""),
+                    }
+                )
+
+        included: list[dict[str, Any]] = []
+        skipped: list[dict[str, str]] = []
+        for author in discovered_authors:
+            selected = _select_global_author_reports(candidates_by_author.get(author, []), split)
+            if not selected:
+                reason = "没有完成且包含当前评估维度的 LLM 标注"
+                if split != "all" and candidates_by_author.get(author):
+                    reason = f"没有覆盖 {split.upper()} 的完整 LLM 标注"
+                skipped.append({"author": author, "reason": reason})
+                continue
+            reports = [
+                _metrics_for_requested_split(candidate["metrics"], split, candidate["coverage"])
+                for candidate in selected
+            ]
+            reports = [report for report in reports if isinstance(report, dict) and report.get("routes")]
+            if not reports:
+                skipped.append({"author": author, "reason": "标注存在，但没有可用的指标报告"})
+                continue
+            author_metrics = _combine_metric_reports(reports, weights=[_metric_query_count(report) for report in reports])
+            included.append(
+                {
+                    "author": author,
+                    "pool_ids": sorted({str(candidate["files"].manifest.get("pool_id") or "") for candidate in selected}),
+                    "label_sets": [str(candidate["label_set"]) for candidate in selected],
+                    "effective_split": split if split != "all" else (
+                        "all" if any("all" in candidate["coverage"] for candidate in selected) else " + ".join(sorted({value for candidate in selected for value in candidate["coverage"]}))
+                    ),
+                    "query_count": int(author_metrics.get("query_count") or 0),
+                    "routes": sorted((author_metrics.get("routes") or {}).keys()),
+                    "metrics": author_metrics,
+                }
+            )
+
+        global_metrics = _combine_metric_reports(
+            [row["metrics"] for row in included],
+            weights=[1.0 for _row in included],
+        )
+        for route, route_metrics in (global_metrics.get("routes") or {}).items():
+            route_metrics["author_count"] = sum(
+                route in (row.get("routes") or []) for row in included
+            )
+        # The cross-author selector must not expose a partial K as if it were
+        # a five-author average. Keep the union for audit, but publish only
+        # cutoffs supported by every included author on every route.
+        author_cutoff_sets: list[set[int]] = []
+        for row in included:
+            route_cutoff_sets = [
+                {
+                    int(cutoff)
+                    for cutoff in (route_metrics.get("by_cutoff") or {})
+                    if str(cutoff).isdigit()
+                }
+                for route_metrics in (row.get("metrics", {}).get("routes") or {}).values()
+            ]
+            route_cutoff_sets = [values for values in route_cutoff_sets if values]
+            if route_cutoff_sets:
+                author_cutoff_sets.append(set.intersection(*route_cutoff_sets))
+        if author_cutoff_sets:
+            common_cutoffs = sorted(set.intersection(*author_cutoff_sets))
+            all_cutoffs = sorted(set.union(*author_cutoff_sets))
+            global_metrics["cutoffs"] = common_cutoffs
+            global_metrics["available_cutoffs"] = all_cutoffs
+            global_metrics["partial_cutoffs"] = [
+                cutoff for cutoff in all_cutoffs if cutoff not in common_cutoffs
+            ]
+        if not available_splits:
+            available_splits = {"all"}
+        if "all" not in available_splits and included:
+            available_splits.add("all")
+        ordered_splits = [value for value in ("all", "dev", "test") if value in available_splits]
+
+        result = {
+            "schema_version": "personaforge.eval.retrieval_global_report.v1",
+            "active_axis": resolved_axis or str(axis or ""),
+            "axes": available_axes,
+            "split": split,
+            "available_splits": ordered_splits,
+            "total_authors": len(discovered_authors),
+            "included_authors": len(included),
+            "skipped_authors": skipped,
+            "authors": [
+                {key: value for key, value in row.items() if key != "metrics"}
+                for row in included
+            ],
+            "metrics": global_metrics,
+        }
+        with self._lock:
+            self._global_report_cache[cache_key] = result
+        return result
 
     def llm_query(
         self,
@@ -524,10 +732,76 @@ class RetrievalEvaluationStore:
         manifest_path = files.manifest_path.parent / "llm_labels" / safe_label_set / "manifest.json"
         if not manifest_path.exists():
             raise KeyError(f"Unknown LLM label set: {label_set}")
-        manifest, labels = load_label_set(manifest_path)
+        manifest, labels = self._load_label_set_cached(manifest_path)
         if str(manifest.get("pool_id") or "") != str(files.manifest.get("pool_id") or ""):
             raise KeyError("LLM label set does not belong to this pool")
         return manifest, labels
+
+    def _load_label_set_cached(
+        self,
+        manifest_path: Path,
+    ) -> tuple[dict[str, Any], dict[tuple[str, str], dict[str, Any]]]:
+        """Load a machine-label run once until its manifest or labels change."""
+
+        manifest_path = manifest_path.expanduser().resolve()
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raise
+        labels_path = manifest_path.parent / str(manifest.get("labels_file") or "labels.jsonl")
+        signature = (_path_signature(manifest_path), _path_signature(labels_path))
+        cache_key = str(manifest_path)
+        with self._lock:
+            cached = self._label_set_cache.get(cache_key)
+            if cached and cached[0] == signature:
+                return cached[1], cached[2]
+        loaded_manifest, labels = load_label_set(manifest_path)
+        with self._lock:
+            self._label_set_cache[cache_key] = (signature, loaded_manifest, labels)
+        return loaded_manifest, labels
+
+    def _load_metrics_cached(
+        self,
+        label_dir: Path,
+        pool_path: Path,
+        records: list[dict[str, Any]],
+        labels: dict[tuple[str, str], int],
+        *,
+        metric_axis: str,
+        recall_scope: str,
+    ) -> dict[str, Any]:
+        """Reuse computed metrics while the frozen pool or labels are unchanged."""
+
+        label_dir = label_dir.expanduser().resolve()
+        label_manifest_path = label_dir / "manifest.json"
+        try:
+            label_manifest = json.loads(label_manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            label_manifest = {}
+        labels_path = label_dir / str(label_manifest.get("labels_file") or "labels.jsonl")
+        record_signature = (
+            len(records),
+            str(records[0].get("item_id") or "") if records else "",
+            str(records[-1].get("item_id") or "") if records else "",
+            tuple(sorted({str(row.get("split") or "") for row in records})),
+        )
+        cache_key = (
+            str(label_dir),
+            _path_signature(pool_path),
+            _path_signature(label_manifest_path),
+            _path_signature(labels_path),
+            record_signature,
+            metric_axis,
+            recall_scope,
+        )
+        with self._lock:
+            cached = self._metrics_cache.get(cache_key)
+            if cached is not None:
+                return cached
+        result = _load_metrics(label_dir, records, labels, recall_scope=recall_scope)
+        with self._lock:
+            self._metrics_cache[cache_key] = result
+        return result
 
     @staticmethod
     def _ranking_manifest_path(files: PoolFiles, ranking_id: str) -> Path:
@@ -652,6 +926,42 @@ class RetrievalEvaluationStore:
         }
 
 
+def _path_signature(path: Path) -> tuple[int, int]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return (0, 0)
+    return (int(stat.st_mtime_ns), int(stat.st_size))
+
+
+def _global_report_signature(pools: dict[str, PoolFiles]) -> tuple[Any, ...]:
+    """Return a cheap invalidation key without reading large JSONL files."""
+
+    signature: list[tuple[Any, ...]] = []
+    for pool_id, files in sorted(pools.items()):
+        signature.append(
+            (
+                pool_id,
+                _path_signature(files.manifest_path),
+                _path_signature(files.pool_path),
+            )
+        )
+        label_root = files.manifest_path.parent / "llm_labels"
+        if not label_root.exists():
+            continue
+        for manifest_path in sorted(label_root.glob("*/manifest.json")):
+            signature.append((str(manifest_path), _path_signature(manifest_path)))
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                manifest = {}
+            labels_path = manifest_path.parent / str(manifest.get("labels_file") or "labels.jsonl")
+            signature.append((str(labels_path), _path_signature(labels_path)))
+            metrics_path = manifest_path.parent / "metrics.json"
+            signature.append((str(metrics_path), _path_signature(metrics_path)))
+    return tuple(signature)
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -744,6 +1054,174 @@ def _metrics_for_axis(metrics: dict[str, Any], axis: str) -> dict[str, Any]:
             raise KeyError(f"Metrics do not contain retrieval label axis: {axis}")
         return selected
     return metrics
+
+
+_METRIC_SUM_KEYS = {
+    "query_count",
+    "candidate_count",
+    "judged_candidate_count",
+    "judged_query_count",
+    "fully_judged_query_count",
+    "unjudged_query_count",
+    "relevant_candidate_count",
+    "relevant_query_count",
+    "no_relevant_query_count",
+}
+
+
+def _metric_query_count(metrics: dict[str, Any]) -> float:
+    try:
+        return max(1.0, float(metrics.get("query_count") or 0))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def _numeric_average(values: list[tuple[float, float]]) -> float | None:
+    if not values:
+        return None
+    total_weight = sum(weight for _value, weight in values)
+    if total_weight <= 0:
+        return None
+    return sum(value * weight for value, weight in values) / total_weight
+
+
+def _combine_metric_maps(
+    reports: list[dict[str, Any]],
+    weights: list[float],
+) -> dict[str, Any]:
+    """Merge metric dictionaries while preserving by-cutoff values.
+
+    Rate fields are weighted means. Count fields are summed so the returned
+    report remains auditable. The caller controls the weights: query counts
+    when merging split runs within one author, and equal weights when taking
+    the macro average across authors.
+    """
+
+    result: dict[str, Any] = {}
+    keys = sorted({key for report in reports for key in report})
+    for key in keys:
+        values = [(report.get(key), weights[index]) for index, report in enumerate(reports) if key in report]
+        if key == "by_cutoff":
+            cutoff_keys = sorted({str(cutoff) for value, _weight in values if isinstance(value, dict) for cutoff in value})
+            result[key] = {
+                cutoff: _combine_metric_maps(
+                    [value[cutoff] for value, _weight in values if isinstance(value, dict) and cutoff in value],
+                    [weight for value, weight in values if isinstance(value, dict) and cutoff in value],
+                )
+                for cutoff in cutoff_keys
+            }
+            continue
+        if key in {"cutoffs", "available_cutoffs"}:
+            flattened = {
+                int(item)
+                for value, _weight in values
+                if isinstance(value, (list, tuple))
+                for item in value
+                if str(item).isdigit()
+            }
+            result[key] = sorted(flattened)
+            continue
+        if key in {"route", "schema_version", "ranking_id", "recall_scope"}:
+            result[key] = next((value for value, _weight in values if value not in {None, ""}), None)
+            continue
+        numeric_values: list[tuple[float, float]] = []
+        for value, weight in values:
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                numeric_values.append((float(value), weight))
+        if numeric_values:
+            if key in _METRIC_SUM_KEYS:
+                result[key] = sum(value for value, _weight in numeric_values)
+            else:
+                result[key] = _numeric_average(numeric_values)
+        else:
+            result[key] = next((value for value, _weight in values if value is not None), None)
+    return result
+
+
+def _combine_metric_reports(
+    reports: list[dict[str, Any]],
+    *,
+    weights: list[float] | None = None,
+) -> dict[str, Any]:
+    if not reports:
+        return {"routes": {}, "query_count": 0}
+    effective_weights = weights or [1.0 for _report in reports]
+    if len(effective_weights) != len(reports):
+        effective_weights = [1.0 for _report in reports]
+    result = _combine_metric_maps(reports, effective_weights)
+    result["routes"] = {}
+    routes = sorted({route for report in reports for route in (report.get("routes") or {})})
+    for route in routes:
+        route_reports = [report["routes"][route] for report in reports if route in (report.get("routes") or {})]
+        route_weights = [
+            effective_weights[index]
+            for index, report in enumerate(reports)
+            if route in (report.get("routes") or {})
+        ]
+        result["routes"][route] = _combine_metric_maps(route_reports, route_weights)
+    # Some historical metric files only materialized ``by_cutoff`` and
+    # omitted the convenience list consumed by the web selector. Rebuild it
+    # from the aggregate so K switching never falls back to one value.
+    cutoff_keys = sorted(
+        {
+            int(cutoff)
+            for cutoff in (result.get("by_cutoff") or {})
+            if str(cutoff).isdigit()
+        }
+    )
+    if cutoff_keys:
+        result["cutoffs"] = cutoff_keys
+        result["available_cutoffs"] = cutoff_keys
+    # ``splits`` are intentionally removed: the caller has already selected
+    # one split, and carrying nested split averages would be misleading.
+    result.pop("splits", None)
+    return result
+
+
+def _metrics_for_requested_split(
+    metrics: dict[str, Any],
+    split: str,
+    coverage: set[str],
+) -> dict[str, Any]:
+    if split == "all" and "all" in coverage:
+        return metrics
+    splits = metrics.get("splits") or {}
+    if split in {"dev", "test"}:
+        selected = splits.get(split)
+        if isinstance(selected, dict):
+            return selected
+    for name in ("dev", "test"):
+        if name in coverage and isinstance(splits.get(name), dict):
+            return splits[name]
+    return metrics
+
+
+def _select_global_author_reports(
+    candidates: list[dict[str, Any]],
+    split: str,
+) -> list[dict[str, Any]]:
+    if not candidates:
+        return []
+    ordered = sorted(
+        candidates,
+        key=lambda row: (str(row.get("updated_at") or ""), str(row.get("label_set") or "")),
+        reverse=True,
+    )
+    if split in {"dev", "test"}:
+        matching = [row for row in ordered if split in row.get("coverage", set()) or "all" in row.get("coverage", set())]
+        return matching[:1]
+    complete = [row for row in ordered if "all" in row.get("coverage", set())]
+    if complete:
+        return complete[:1]
+    # Some authors were labeled in two resumable tasks, one for Dev and one
+    # for Test. Keep the newest run for each split and merge them within the
+    # author before the macro average.
+    selected: list[dict[str, Any]] = []
+    for name in ("dev", "test"):
+        match = next((row for row in ordered if name in row.get("coverage", set())), None)
+        if match is not None:
+            selected.append(match)
+    return selected
 
 
 def _axis_evidence(label: dict[str, Any], axis: str) -> str:

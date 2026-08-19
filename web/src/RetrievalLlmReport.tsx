@@ -1,6 +1,7 @@
 import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
-import { BarChart3, ExternalLink, ListChecks, LoaderCircle, PanelLeftClose, PanelLeftOpen } from 'lucide-react';
+import { BarChart3, ExternalLink, Globe2, ListChecks, LoaderCircle, PanelLeftClose, PanelLeftOpen } from 'lucide-react';
 import {
+  fetchRetrievalGlobalReport,
   fetchRetrievalLlmLabelSets,
   fetchRetrievalLlmQuery,
   fetchRetrievalLlmWorkspace,
@@ -9,6 +10,7 @@ import {
   RetrievalLlmLabelSet,
   RetrievalLlmQuery,
   RetrievalLlmWorkspace,
+  RetrievalGlobalReport,
   RetrievalPoolSummary,
   RetrievalRankingSummary
 } from './api';
@@ -88,9 +90,11 @@ export function RetrievalLlmReport({ viewSwitcher, authorScope }: { viewSwitcher
   const [ndcgCutoff, setNdcgCutoff] = useState(10);
   const [precisionCutoff, setPrecisionCutoff] = useState(20);
   const [recallCutoff, setRecallCutoff] = useState(50);
-  const [reportSection, setReportSection] = useState<'overview' | 'labels'>(() =>
-    localStorage.getItem('pf-retrieval-report-section') === 'labels' ? 'labels' : 'overview'
-  );
+  const [reportSection, setReportSection] = useState<'overview' | 'global' | 'labels'>(() => {
+    const stored = localStorage.getItem('pf-retrieval-report-section');
+    return stored === 'labels' || stored === 'global' ? stored : 'overview';
+  });
+  const [globalReport, setGlobalReport] = useState<RetrievalGlobalReport | null>(null);
   const [collapsed, setCollapsed] = useState(() => localStorage.getItem('pf-retrieval-llm-sidebar') === 'true');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -98,11 +102,21 @@ export function RetrievalLlmReport({ viewSwitcher, authorScope }: { viewSwitcher
 
   useEffect(() => {
     let active = true;
+    if (reportSection === 'global') {
+      setLabelSets([]);
+      setLabelSet('');
+      setWorkspace(null);
+      setQuery(null);
+      return () => {
+        active = false;
+      };
+    }
     if (!poolId) {
       setLabelSets([]);
       setLabelSet('');
       return;
     }
+    setError('');
     setLoading(true);
     fetchRetrievalLlmLabelSets(poolId)
       .then((items) => {
@@ -115,7 +129,7 @@ export function RetrievalLlmReport({ viewSwitcher, authorScope }: { viewSwitcher
     return () => {
       active = false;
     };
-  }, [poolId]);
+  }, [poolId, reportSection]);
 
   const selectedPool = useMemo(
     () => pools.find((item) => item.pool_id === poolId) || null,
@@ -132,6 +146,13 @@ export function RetrievalLlmReport({ viewSwitcher, authorScope }: { viewSwitcher
 
   useEffect(() => {
     let active = true;
+    if (reportSection === 'global') {
+      setWorkspace(null);
+      setItemId('');
+      return () => {
+        active = false;
+      };
+    }
     if (!poolId || !labelSet) {
       setWorkspace(null);
       setItemId('');
@@ -153,7 +174,7 @@ export function RetrievalLlmReport({ viewSwitcher, authorScope }: { viewSwitcher
     return () => {
       active = false;
     };
-  }, [axis, labelSet, labelSets, poolId, rankingId]);
+  }, [axis, labelSet, labelSets, poolId, rankingId, reportSection]);
 
   useEffect(() => {
     let active = true;
@@ -185,11 +206,35 @@ export function RetrievalLlmReport({ viewSwitcher, authorScope }: { viewSwitcher
     };
   }, [authorScope]);
 
+  useEffect(() => {
+    let active = true;
+    if (reportSection !== 'global') return () => { active = false; };
+    const requestedAxis = axis === 'score' ? 'content_support' : axis;
+    if (requestedAxis !== axis) setAxis(requestedAxis);
+    setGlobalReport(null);
+    setError('');
+    setLoading(true);
+    fetchRetrievalGlobalReport(requestedAxis, split)
+      .then((next) => {
+        if (!active) return;
+        setGlobalReport(next);
+        if (next.active_axis && next.active_axis !== requestedAxis) setAxis(next.active_axis);
+        if (next.available_splits.length && !next.available_splits.includes(split)) {
+          setSplit(next.available_splits[0]);
+        }
+      })
+      .catch((reason) => active && setError(String((reason as Error).message || reason)))
+      .finally(() => active && setLoading(false));
+    return () => {
+      active = false;
+    };
+  }, [axis, reportSection, split]);
+
   const selectedLabelSet = useMemo(
     () => labelSets.find((item) => item.label_set === labelSet) || labelSets[0],
     [labelSet, labelSets]
   );
-  const availableSplits = useMemo<ReportSplit[]>(() => {
+  const localAvailableSplits = useMemo<ReportSplit[]>(() => {
     const selected = (selectedLabelSet?.selected_splits || []).filter(
       (value): value is 'dev' | 'test' => value === 'dev' || value === 'test'
     );
@@ -200,23 +245,30 @@ export function RetrievalLlmReport({ viewSwitcher, authorScope }: { viewSwitcher
     if (present.has('test')) result.push('test');
     return result;
   }, [selectedLabelSet, workspace]);
+  const availableSplits = reportSection === 'global'
+    ? (globalReport?.available_splits || ['all'])
+    : localAvailableSplits;
   useEffect(() => {
     if (!availableSplits.includes(split)) setSplit(availableSplits[0] || 'all');
   }, [availableSplits, split]);
   const splitLabel = (value: ReportSplit) => {
+    if (reportSection === 'global') return value === 'all' ? '全部作者' : SPLIT_NAMES[value];
     const rows = workspace?.queries || [];
     const count = value === 'all' ? rows.length : rows.filter((row) => row.split === value).length;
     return `${SPLIT_NAMES[value]} ${count} 题`;
   };
   const selectedMetrics = useMemo(() => {
+    if (reportSection === 'global') return globalReport?.metrics || null;
     if (!workspace) return null;
     if (split === 'all') return workspace.metrics;
     return workspace.metrics.splits?.[split] || workspace.metrics;
-  }, [split, workspace]);
+  }, [globalReport, reportSection, split, workspace]);
   const currentMetrics = useMemo(() => selectedMetrics?.routes || {}, [selectedMetrics]);
   const availableCutoffs = selectedMetrics?.cutoffs?.length ? selectedMetrics.cutoffs : [selectedMetrics?.cutoff || 3];
   const metricGroups = selectedMetrics?.cutoff_groups;
-  const supportedDepth = workspace?.ranking ? commonRankingDepth(workspace.ranking) : Number.POSITIVE_INFINITY;
+  const supportedDepth = reportSection === 'global'
+    ? Number.POSITIVE_INFINITY
+    : workspace?.ranking ? commonRankingDepth(workspace.ranking) : Number.POSITIVE_INFINITY;
   const rankingCutoffs = (metricGroups?.ndcg?.length ? metricGroups.ndcg : availableCutoffs.filter((value) => value <= 30))
     .filter((value) => value <= supportedDepth);
   const precisionMetricCutoffs = (metricGroups?.precision?.length ? metricGroups.precision : rankingCutoffs)
@@ -258,12 +310,12 @@ export function RetrievalLlmReport({ viewSwitcher, authorScope }: { viewSwitcher
     scrollRef.current?.scrollTo({ top: 0 });
   }, [itemId, reportSection]);
 
-  const selectReportSection = (next: 'overview' | 'labels') => {
+  const selectReportSection = (next: 'overview' | 'global' | 'labels') => {
     setReportSection(next);
     localStorage.setItem('pf-retrieval-report-section', next);
   };
 
-  if (!poolId || !pools.length) {
+  if (reportSection !== 'global' && (!poolId || !pools.length)) {
     return <div className="evaluation-empty"><strong>还没有冻结的检索候选池</strong><p>先生成冻结候选池，再完成机器相关性标注。</p></div>;
   }
 
@@ -287,11 +339,25 @@ export function RetrievalLlmReport({ viewSwitcher, authorScope }: { viewSwitcher
             </button>
           </div>
           {viewSwitcher}
-          <nav className="retrieval-report-navigation" aria-label="LLM 检索报告页面">
-            <button type="button" className={reportSection === 'overview' ? 'active' : ''} onClick={() => selectReportSection('overview')}><BarChart3 size={17} />指标总览</button>
-            <button type="button" className={reportSection === 'labels' ? 'active' : ''} onClick={() => selectReportSection('labels')}><ListChecks size={17} />逐题标注</button>
-          </nav>
-          <div className="evaluation-dataset-controls">
+            <nav className="retrieval-report-navigation" aria-label="LLM 检索报告页面">
+              <button type="button" className={reportSection === 'overview' ? 'active' : ''} onClick={() => selectReportSection('overview')}><BarChart3 size={17} />指标总览</button>
+              <button type="button" className={reportSection === 'global' ? 'active' : ''} onClick={() => selectReportSection('global')}><Globe2 size={17} />所有作者</button>
+              <button type="button" className={reportSection === 'labels' ? 'active' : ''} onClick={() => selectReportSection('labels')}><ListChecks size={17} />逐题标注</button>
+            </nav>
+          {reportSection === 'global' ? <div className="retrieval-global-sidebar-note">
+            <strong>跨作者总览</strong>
+            <span>按作者等权平均，不受左侧当前作者选择影响。</span>
+            <small>{globalReport
+              ? `已纳入 ${globalReport.included_authors} / ${globalReport.total_authors} 位作者`
+              : loading
+                ? '正在读取作者报告…'
+                : error
+                  ? `读取失败：${error}`
+                  : '暂无可用报告'}</small>
+            {globalReport && Object.keys(globalReport.axes).length > 1 ? <label>评估维度<select value={axis} onChange={(event) => setAxis(event.target.value)}>
+              {Object.keys(globalReport.axes).map((value) => <option key={value} value={value}>{globalReport.axes[value]?.label || AXIS_LABELS[value] || value}</option>)}
+            </select></label> : null}
+          </div> : <div className="evaluation-dataset-controls">
             <label>候选池<select value={poolId} onChange={(event) => setPoolId(event.target.value)}>
               {pools.map((pool) => {
                 const labelSets = pool.llm_label_sets || [];
@@ -312,12 +378,12 @@ export function RetrievalLlmReport({ viewSwitcher, authorScope }: { viewSwitcher
               </option>)}
             </select></label> : <div className="retrieval-overview-note">还没有独立排名快照<br /><small>完成 Parent Top100 快照后，才能显示正式 Recall@50/100。</small></div>}
             {labelSets.length ? <label>标注版本<select value={labelSet} onChange={(event) => setLabelSet(event.target.value)}>
-              {labelSets.map((item) => <option key={item.label_set} value={item.label_set}>{item.label_set} · {item.completed}/{item.total}</option>)}
+              {labelSets.map((item) => <option key={item.label_set} value={item.label_set}>{item.label_set} · {item.provisional ? '离线代理' : item.model || '未知来源'} · {item.completed}/{item.total}</option>)}
             </select></label> : <div className="retrieval-overview-note">当前候选池暂无 LLM 标注<br /><small>候选池仍保留在这里，方便切换到其他已有报告。</small></div>}
             {labelSets.length && availableAxes.length > 1 ? <label>评估维度<select value={axis} onChange={(event) => setAxis(event.target.value)}>
               {availableAxes.map((value) => <option key={value} value={value}>{selectedLabelSet?.axes?.[value]?.label || AXIS_LABELS[value] || value}</option>)}
             </select></label> : null}
-          </div>
+          </div>}
           {reportSection === 'labels' && labelSets.length ? (
             <nav className="evaluation-query-list" aria-label="LLM 检索评估问题">
               {visibleQueries.map((row) => (
@@ -327,16 +393,17 @@ export function RetrievalLlmReport({ viewSwitcher, authorScope }: { viewSwitcher
                 </button>
               ))}
             </nav>
-          ) : reportSection === 'labels' ? <div className="retrieval-overview-note">当前候选池暂无逐题标注。</div> : <div className="retrieval-overview-note">总览展示当前数据划分内所有问题的平均检索指标，不随单题变化。</div>}
+          ) : reportSection === 'labels' ? <div className="retrieval-overview-note">当前候选池暂无逐题标注。</div> : reportSection === 'global' ? <div className="retrieval-overview-note">跨作者页面展示已完成同口径报告的宏平均；单作者诊断请切回“指标总览”。</div> : <div className="retrieval-overview-note">总览展示当前数据划分内所有问题的平均检索指标，不随单题变化。</div>}
         </aside>
       ) : null}
       <main className="evaluation-reader retrieval-llm-reader">
         {collapsed ? <button className="evaluation-rail-reveal" type="button" title="展开评估栏" onClick={() => { setCollapsed(false); localStorage.setItem('pf-retrieval-llm-sidebar', 'false'); }}><PanelLeftOpen size={18} /><span>RAG 评估</span></button> : null}
         <header className="evaluation-question-header retrieval-llm-header">
-          <span>{reportSection === 'overview' ? '检索评估 · 聚合结果' : labelSets.length ? `${splitLabel(split)} · ${visibleQueries.findIndex((row) => row.item_id === itemId) + 1 || '-'} / ${visibleQueries.length || 0}` : '逐题标注'}</span>
-          <h1>{!labelSets.length ? '当前候选池暂无 LLM 报告' : reportSection === 'overview' ? '六路检索指标总览' : query?.query || '正在读取问题'}</h1>
+          <span>{reportSection === 'global' ? '检索评估 · 跨作者总览' : reportSection === 'overview' ? '检索评估 · 聚合结果' : labelSets.length ? `${splitLabel(split)} · ${visibleQueries.findIndex((row) => row.item_id === itemId) + 1 || '-'} / ${visibleQueries.length || 0}` : '逐题标注'}</span>
+          <h1>{reportSection === 'global' ? '所有作者 RAG 指标总览' : !labelSets.length ? '当前候选池暂无 LLM 报告' : reportSection === 'overview' ? '六路检索指标总览' : query?.query || '正在读取问题'}</h1>
           <div className="retrieval-llm-meta">
-            {!labelSets.length ? '请从左侧切换到已有标注的候选池，或先创建 LLM 检索标注任务。' : <>{reportSection === 'overview' ? `${splitLabel(split)}的逐题指标平均值` : `标注者：${selectedLabelSet?.model || '未知'}`} · 稳定完成 {selectedLabelSet?.completed}/{selectedLabelSet?.total}
+             {reportSection === 'global' ? `${splitLabel(split)} · ${globalReport?.active_axis ? (AXIS_LABELS[globalReport.active_axis] || globalReport.active_axis) : '检索维度'} · 作者宏平均` : !labelSets.length ? '请从左侧切换到已有标注的候选池，或先创建 LLM 检索标注任务。' : <>{reportSection === 'overview' ? `${splitLabel(split)}的逐题指标平均值` : `标注者：${selectedLabelSet?.model || '未知'}`} · 稳定完成 {selectedLabelSet?.completed}/{selectedLabelSet?.total}
+             {selectedLabelSet?.provisional ? <span className="retrieval-provisional-note"> · 离线代理标签，仅用于工程验证</span> : null}
             {selectedLabelSet?.status !== 'completed' && stabilityProgress ? (
               <span>
                 {' '}· 已有首遍 {stabilityProgress.pass1_completed ?? 0}
@@ -348,10 +415,10 @@ export function RetrievalLlmReport({ viewSwitcher, authorScope }: { viewSwitcher
           </div>
         </header>
         <div className="retrieval-llm-scroll" ref={scrollRef}>
-          {!labelSets.length ? <div className="evaluation-empty retrieval-report-unavailable">
+          {reportSection !== 'global' && !labelSets.length ? <div className="evaluation-empty retrieval-report-unavailable">
             <strong>这个候选池已经建立，但还没有机器标注</strong>
             <p>候选池本身不是报告。请从左侧切换到带有“已有标注”的候选池，或者在“评估任务”中先创建标注。</p>
-          </div> : reportSection === 'overview' ? <>
+          </div> : reportSection === 'overview' || reportSection === 'global' ? <>
             <div className="retrieval-metric-controls">
               <div className="retrieval-segment" role="tablist" aria-label="数据划分">
                 {availableSplits.map((value) => <button type="button" className={split === value ? 'active' : ''} key={value} onClick={() => setSplit(value)}>{splitLabel(value)}</button>)}
@@ -371,10 +438,10 @@ export function RetrievalLlmReport({ viewSwitcher, authorScope }: { viewSwitcher
                   {recallCutoffs.map((value) => <option key={value} value={value}>Top {value}</option>)}
                 </select>
               </label>
-              <span>{selectedMetrics?.relevant_candidate_count ?? 0} 个有用 query-parent 对 · Recall 分母：{recallScopeLabel}</span>
+              <span>{reportSection === 'global' ? `已纳入 ${globalReport?.included_authors || 0} 位作者 · 作者等权平均` : `${selectedMetrics?.relevant_candidate_count ?? 0} 个有用 query-parent 对 · Recall 分母：${recallScopeLabel}`}</span>
             </div>
-            <div className="retrieval-aggregate-explanation">下面六组数字是 <strong>{splitLabel(split)}</strong> 的逐题平均结果。nDCG 使用 0/1/2 分级相关性；Useful 表示得分至少为 1，Strong 表示得分为 2。{rankingId ? `当前使用 ${workspace?.ranking?.ranking_id || rankingId} 的独立 Parent 排名快照，请求深度 ${workspace?.ranking?.requested_depth || 100}，实际可用深度 ${selectedRankingDepth}；Recall 分母来自冻结 Qrels。` : ''}</div>
-            {workspace?.comparison ? <div className="retrieval-comparison-summary">
+            <div className="retrieval-aggregate-explanation">{reportSection === 'global' ? <><strong>作者宏平均：</strong>每位作者先独立计算六路指标，再让作者等权参与平均；材料更多的作者不会自动占更大权重。当前只汇总已有兼容完整标注的作者，K 选择只展示所有纳入作者和六条路线共同支持的深度。</> : <>下面六组数字是 <strong>{splitLabel(split)}</strong> 的逐题平均结果。nDCG 使用 0/1/2 分级相关性；Useful 表示得分至少为 1，Strong 表示得分为 2。{rankingId ? `当前使用 ${workspace?.ranking?.ranking_id || rankingId} 的独立 Parent 排名快照，请求深度 ${workspace?.ranking?.requested_depth || 100}，实际可用深度 ${selectedRankingDepth}；Recall 分母来自冻结 Qrels。` : ''}</>}</div>
+            {reportSection === 'overview' && workspace?.comparison ? <div className="retrieval-comparison-summary">
               <strong>Gold-aware 相比旧 Query-only Judge 改判 {workspace.comparison.changed_count} / {workspace.comparison.total}</strong>
               <span>其中旧版 0 分、Gold-aware 改为 1/2 分：{workspace.comparison.v1_zero_to_v2_positive} 对</span>
             </div> : null}
@@ -395,6 +462,23 @@ export function RetrievalLlmReport({ viewSwitcher, authorScope }: { viewSwitcher
                 </div>
               );})}
             </div>
+            {reportSection === 'global' ? <div className="retrieval-global-authors">
+              <div className="retrieval-global-authors-heading">
+                <div><strong>作者纳入情况</strong><span>每行代表一位作者；上方指标卡是这些作者的等权平均。</span></div>
+                <b>{globalReport?.included_authors || 0} / {globalReport?.total_authors || 0}</b>
+              </div>
+              <div className="retrieval-global-author-list">
+                {(globalReport?.authors || []).map((author) => <div className="retrieval-global-author-row" key={author.author}>
+                  <strong>{author.author}</strong>
+                  <span>{author.effective_split === 'all' ? '全部数据' : author.effective_split.toUpperCase()}</span>
+                  <span>{author.query_count} 题</span>
+                  <small>{author.label_sets.join(' + ')}</small>
+                </div>)}
+                {(globalReport?.skipped_authors || []).map((author) => <div className="retrieval-global-author-row skipped" key={`skipped-${author.author}`}>
+                  <strong>{author.author}</strong><span>未纳入</span><small>{author.reason}</small>
+                </div>)}
+              </div>
+            </div> : null}
           </> : <>
             {query?.gold_answer ? <details className="retrieval-gold-panel">
               <summary>查看作者原回答与判断锚点</summary>

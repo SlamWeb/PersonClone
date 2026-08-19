@@ -882,6 +882,17 @@ def create_app(
     def retrieval_pools(author: str | None = None, user: AuthUser = Depends(current_user)) -> dict[str, Any]:
         return {"pools": retrieval_evaluations.list_pools(user.id, author=author)}
 
+    @app.get("/api/evaluations/retrieval/global")
+    def retrieval_global_report(
+        axis: str | None = None,
+        split: str = "all",
+        user: AuthUser = Depends(current_user),
+    ) -> dict[str, Any]:
+        try:
+            return retrieval_evaluations.global_llm_report(axis=axis, split=split)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     @app.get("/api/evaluations/retrieval/jobs")
     def retrieval_eval_jobs(user: AuthUser = Depends(current_user)) -> dict[str, Any]:
         return {"jobs": retrieval_eval_job_manager.list()}

@@ -6,7 +6,10 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from personaforge.web.app import create_app
-from personaforge.web.retrieval_evaluation import RetrievalEvaluationStore
+from personaforge.web.retrieval_evaluation import (
+    RetrievalEvaluationStore,
+    _combine_metric_reports,
+)
 from personaforge.web.service import WebConfig
 
 
@@ -348,3 +351,37 @@ def test_gold_aware_v2_report_supports_axes_gold_and_exhaustive_recall(tmp_path:
         assert report["candidates"][0]["parent_id"] == "parent-b"
         assert report["candidates"][0]["score"] == 2
         assert report["candidates"][0]["persona_gold_unit_ids"] == ["expression-1"]
+
+        global_report = client.get(
+            "/api/evaluations/retrieval/global"
+            "?axis=persona_expression_support&split=dev"
+        ).json()
+        assert global_report["active_axis"] == "persona_expression_support"
+        assert global_report["included_authors"] == 1
+        assert global_report["total_authors"] == 1
+        assert global_report["split"] == "dev"
+
+
+def test_global_metric_combination_is_equal_author_macro_average() -> None:
+    """Cross-author summaries must not let a larger query set dominate."""
+
+    author_a = {
+        "query_count": 2,
+        "routes": {
+            "raw_dense": {"ndcg_at_k": 0.2, "hit_at_k": 0.4, "relevant_query_count": 1},
+        },
+    }
+    author_b = {
+        "query_count": 20,
+        "routes": {
+            "raw_dense": {"ndcg_at_k": 0.8, "hit_at_k": 1.0, "relevant_query_count": 18},
+        },
+    }
+
+    macro = _combine_metric_reports([author_a, author_b], weights=[1.0, 1.0])
+    assert macro["routes"]["raw_dense"]["ndcg_at_k"] == 0.5
+    assert macro["routes"]["raw_dense"]["hit_at_k"] == 0.7
+    assert macro["routes"]["raw_dense"]["relevant_query_count"] == 19.0
+
+    within_author = _combine_metric_reports([author_a, author_b], weights=[2.0, 20.0])
+    assert round(within_author["routes"]["raw_dense"]["ndcg_at_k"], 6) == round(0.745454545, 6)

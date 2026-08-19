@@ -4,4 +4,4 @@ $env:PERSONAFORGE_BGE_M3_USE_FP16 = "1"
 & "D:\Anaconda4.7g\envs\personaforge\python.exe" -m personaforge.cli web wu-ren-jun-28 `
   --port 8000 `
   --embedding-device cuda `
-  --model-name C:\PersonaForge\data\models\bge-m3
+  --model-name "C:\PersonaForge\data\models\bge-m3"

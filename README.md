@@ -1,7 +1,13 @@
-# PersonaForge
+# PersonClone
 
-PersonaForge 是一个 local-first 的创作者数字分身平台。它从公开内容构建作者知识库，结合
+PersonClone 是一个 local-first 的多作者数字分身 RAG 平台。它从公开内容构建作者知识库，结合
 混合检索、会话记忆与 Persona Writer，生成带来源、可追踪、可评估的个性化回答。
+
+**[在线体验](https://personclone.com)** · **[GitHub](https://github.com/SlamWeb/PersonClone)**
+
+> 在线站点采用受邀账号登录，避免公开接口滥用和 API 额度消耗。
+
+![PersonClone Chat 产品界面](docs/assets/personclone-chat-home.png)
 
 ## 系统架构
 
@@ -43,8 +49,8 @@ flowchart LR
 准备 [Git](https://git-scm.com/) 和 [Docker Desktop](https://www.docker.com/products/docker-desktop/)，然后执行：
 
 ```powershell
-git clone https://github.com/SlamWeb/PersonaForge-.git
-cd PersonaForge-
+git clone https://github.com/SlamWeb/PersonClone.git
+cd PersonClone
 Copy-Item .env.example .env
 ```
 

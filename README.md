@@ -3,7 +3,7 @@
 PersonClone 是一个 local-first 的多作者数字分身 RAG 平台。它从公开内容构建作者知识库，结合
 混合检索、会话记忆与 Persona Writer，生成带来源、可追踪、可评估的个性化回答。
 
-**[在线体验](https://personclone.com)** · **[GitHub](https://github.com/SlamWeb/PersonClone)**
+**[在线体验](https://personclone.com)**
 
 > 在线站点采用受邀账号登录，避免公开接口滥用和 API 额度消耗。
 

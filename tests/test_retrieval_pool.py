@@ -12,7 +12,12 @@ from personaforge.eval.retrieval_pool import (
     derive_core_pool,
     make_pool_record,
 )
-from personaforge.ingest.retrieve import ChildHit, ParentHit
+from personaforge.ingest.query_understanding import RetrievalQuery
+from personaforge.ingest.retrieve import (
+    ChildHit,
+    ParentHit,
+    fuse_transformed_dense_parent_rankings,
+)
 
 
 def test_bm25_uses_existing_nodes_and_excludes_future_parents(tmp_path: Path) -> None:
@@ -81,6 +86,35 @@ def test_pool_record_unions_routes_and_rejects_holdout_leaks() -> None:
             query_trace={},
             excluded_parent_ids={"future"},
         )
+
+
+def test_transformed_dense_route_reuses_only_dense_child_hits() -> None:
+    queries = [
+        RetrievalQuery(route="literal_question", query="问题一"),
+        RetrievalQuery(route="mechanism_scene", query="问题二"),
+    ]
+    child_routes = {
+        "literal_question:dense": [
+            ChildHit(1, 0.9, "n1", "p1", "passage", "一", "a.md", "literal_question:dense"),
+            ChildHit(2, 0.8, "n2", "p2", "passage", "二", "b.md", "literal_question:dense"),
+        ],
+        "literal_question:sparse": [
+            ChildHit(1, 0.99, "n3", "p3", "passage", "三", "c.md", "literal_question:sparse"),
+        ],
+        "mechanism_scene:dense": [
+            ChildHit(1, 0.7, "n4", "p2", "passage", "二", "b.md", "mechanism_scene:dense"),
+        ],
+    }
+
+    ranked = fuse_transformed_dense_parent_rankings(
+        queries,
+        child_routes,
+        per_query_parent_k=10,
+        parent_top_k=10,
+    )
+
+    assert [hit.parent_id for hit in ranked] == ["p2", "p1"]
+    assert "p3" not in {hit.parent_id for hit in ranked}
 
 
 def test_derive_core_pool_keeps_any_route_head_and_shares_label_namespace(tmp_path: Path) -> None:

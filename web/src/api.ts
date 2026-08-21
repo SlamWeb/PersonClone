@@ -359,6 +359,19 @@ export type RetrievalRankingSummary = {
   actual_depth_by_route?: Record<string, number>;
   query_count: number;
   created_at?: string;
+  reranker?: {
+    model: string;
+    representation: string;
+    base_routes: string[];
+    reranked_routes: string[];
+    candidate_depth: number;
+    batch_size: number;
+    max_length: number;
+    pair_count: number;
+    truncated_pair_count: number;
+    truncated_pair_rate?: number | null;
+    timing_ms?: Record<string, { mean?: number | null; p95?: number | null; total?: number | null }>;
+  } | null;
 };
 
 export type RetrievalQuerySummary = {
@@ -369,6 +382,27 @@ export type RetrievalQuerySummary = {
   candidate_count: number;
   labeled_count: number;
   completed: boolean;
+  qrels?: RetrievalQrelsSummary;
+  route_metrics?: Record<string, RetrievalQueryRouteMetrics>;
+};
+
+export type RetrievalQrelsSummary = {
+  candidate_count: number;
+  labeled_count: number;
+  unlabelled_count: number;
+  zero_count: number;
+  useful_count: number;
+  strong_count: number;
+  useful_recall_denominator: number;
+  strong_recall_denominator: number;
+  coverage: number;
+};
+
+export type RetrievalQueryRouteMetrics = {
+  route: string;
+  route_depth: number;
+  available_cutoffs: number[];
+  by_cutoff: Record<string, RetrievalRouteMetrics>;
 };
 
 export type RetrievalWorkspace = {
@@ -410,6 +444,7 @@ export type RetrievalRouteMetrics = {
   hit_at_k: number | null;
   mrr_at_k: number | null;
   ndcg_at_k: number | null;
+  linear_ndcg_at_k?: number | null;
   precision_at_k: number | null;
   recall_at_k: number | null;
   map_at_k?: number | null;
@@ -419,6 +454,38 @@ export type RetrievalRouteMetrics = {
   strong_recall_at_k?: number | null;
   relevant_query_count?: number;
   no_relevant_query_count?: number;
+  strict_metric_query_count?: number;
+  qrels_label_count?: number;
+  qrels_unlabelled_count?: number;
+  qrels_zero_count?: number;
+  qrels_relevant_count?: number;
+  qrels_useful_count?: number;
+  qrels_strong_count?: number;
+  useful_qrels_per_query_mean?: number | null;
+  useful_qrels_per_query_median?: number | null;
+  strong_qrels_per_query_mean?: number | null;
+  strong_qrels_per_query_median?: number | null;
+  unjudged_top_count?: number;
+  pool_outside_count?: number;
+  pool_outside_rate?: number;
+  useful_recall_macro_at_k?: number | null;
+  strong_recall_macro_at_k?: number | null;
+  useful_recall_micro_at_k?: number | null;
+  strong_recall_micro_at_k?: number | null;
+  useful_recall_min_at_k?: number | null;
+  useful_recall_median_at_k?: number | null;
+  useful_recall_max_at_k?: number | null;
+  useful_recall_zero_query_count?: number;
+  useful_recall_one_query_count?: number;
+  strong_recall_min_at_k?: number | null;
+  strong_recall_median_at_k?: number | null;
+  strong_recall_max_at_k?: number | null;
+  strong_recall_zero_query_count?: number;
+  strong_recall_one_query_count?: number;
+  useful_recall_micro_numerator?: number;
+  useful_recall_micro_denominator?: number;
+  strong_recall_micro_numerator?: number;
+  strong_recall_micro_denominator?: number;
   by_cutoff?: Record<string, Omit<RetrievalRouteMetrics, 'by_cutoff'>>;
 };
 
@@ -436,6 +503,11 @@ export type RetrievalMetrics = {
   candidate_count?: number;
   judged_candidate_count?: number;
   relevant_candidate_count?: number;
+  qrels_label_count?: number;
+  qrels_unlabelled_count?: number;
+  qrels_zero_count?: number;
+  qrels_useful_count?: number;
+  qrels_strong_count?: number;
   coverage?: number;
   routes: Record<string, RetrievalRouteMetrics>;
   splits?: Record<string, RetrievalMetrics>;
@@ -541,7 +613,24 @@ export type RetrievalLlmCandidate = {
   exact_agreement?: boolean | null;
   status: string;
   route_ranks: Record<string, { rank: number; score: number }>;
-  ranking_routes?: Record<string, { rank: number; parent_id?: string; score: number }>;
+  ranking_routes?: Record<string, {
+    rank: number;
+    parent_id?: string;
+    score: number;
+    base_rank?: number;
+    base_score?: number;
+    rerank_score?: number | null;
+    reranked?: boolean;
+    input_tokens?: number | null;
+    input_truncated?: boolean | null;
+    evidence?: {
+      node_id?: string;
+      node_type?: string;
+      index?: number;
+      characters?: number;
+      text?: string;
+    };
+  }>;
 };
 
 export type RetrievalLlmQuery = {
@@ -555,6 +644,8 @@ export type RetrievalLlmQuery = {
   gold_units?: Record<string, Array<{ id?: string; text?: string }>>;
   candidate_count: number;
   labeled_count: number;
+  qrels?: RetrievalQrelsSummary;
+  route_metrics?: Record<string, RetrievalQueryRouteMetrics>;
   candidates: RetrievalLlmCandidate[];
   ranking?: RetrievalRankingSummary | null;
 };

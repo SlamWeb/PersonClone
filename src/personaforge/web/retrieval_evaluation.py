@@ -15,6 +15,7 @@ from typing import Any
 
 from personaforge.eval.retrieval_judge import load_label_set
 from personaforge.eval.retrieval_metrics import (
+    compute_query_diagnostics,
     compute_split_metrics,
     compute_split_metrics_from_rankings,
 )
@@ -129,6 +130,7 @@ class RetrievalEvaluationStore:
                     },
                     "query_count": int((manifest.get("counts") or {}).get("queries") or 0),
                     "created_at": str(manifest.get("created_at") or ""),
+                    "reranker": _public_reranker(manifest.get("reranker")),
                 }
             )
         return sorted(results, key=lambda row: (row["created_at"], row["ranking_id"]), reverse=True)
@@ -264,6 +266,7 @@ class RetrievalEvaluationStore:
         records = _records_for_label_manifest(self._load_records(files), manifest)
         axes, default_axis = _label_axes(manifest)
         active_axis = _validate_axis(axis, axes, default_axis)
+        score_labels = _axis_labels(labels, active_axis)
         query_rows = []
         for index, record in enumerate(records, start=1):
             item_id = str(record.get("item_id") or "")
@@ -281,10 +284,11 @@ class RetrievalEvaluationStore:
                     "candidate_count": len(candidate_ids),
                     "labeled_count": labeled_count,
                     "completed": labeled_count >= len(candidate_ids) and bool(candidate_ids),
+                    "qrels": compute_query_diagnostics(record, score_labels)["qrels"],
                 }
             )
-        score_labels = _axis_labels(labels, active_axis)
         ranking = None
+        query_ranking = None
         if ranking_id:
             ranking_manifest_path = self._ranking_manifest_path(files, ranking_id)
             ranking, ranking_records = load_ranking_snapshot(ranking_manifest_path)
@@ -306,6 +310,18 @@ class RetrievalEvaluationStore:
                 metric_axis=active_axis,
                 recall_scope=str(files.manifest.get("recall_scope") or "six_route_candidate_union"),
             )
+        ranking_by_item = {
+            str(row.get("item_id") or ""): row
+            for row in ranking_records
+        }
+        for row, record in zip(query_rows, records):
+            diagnostics = compute_query_diagnostics(
+                record,
+                score_labels,
+                ranking=ranking_by_item.get(str(record.get("item_id") or "")),
+            )
+            row["qrels"] = diagnostics["qrels"]
+            row["route_metrics"] = diagnostics["routes"]
         return {
             "pool": self._public_manifest(files.manifest),
             "label_set": {
@@ -582,6 +598,7 @@ class RetrievalEvaluationStore:
             )
         gold_context = _load_gold_context(manifest, item_id)
         ranking = None
+        query_ranking = None
         if ranking_id:
             ranking_manifest_path = self._ranking_manifest_path(files, ranking_id)
             ranking, ranking_records = load_ranking_snapshot(ranking_manifest_path)
@@ -590,6 +607,7 @@ class RetrievalEvaluationStore:
                 None,
             )
             if ranking_row:
+                query_ranking = ranking_row
                 ranking_routes = ranking_row.get("routes") or {}
                 for candidate in public_candidates:
                     parent_id = candidate["parent_id"]
@@ -599,6 +617,11 @@ class RetrievalEvaluationStore:
                         for entry in entries
                         if str(entry.get("parent_id") or "") == parent_id
                     }
+        diagnostics = compute_query_diagnostics(
+            record,
+            _axis_labels(labels, active_axis),
+            ranking=query_ranking,
+        )
         return {
             "pool_id": pool_id,
             "label_set": str(manifest.get("label_set") or label_set),
@@ -610,6 +633,8 @@ class RetrievalEvaluationStore:
             "ranking": _public_ranking(ranking) if ranking else None,
             "candidate_count": len(public_candidates),
             "labeled_count": sum(row["status"] == "completed" for row in public_candidates),
+            "qrels": diagnostics["qrels"],
+            "route_metrics": diagnostics["routes"],
             "candidates": public_candidates,
         }
 
@@ -1005,7 +1030,7 @@ def _has_current_retrieval_metrics(metrics: dict[str, Any]) -> bool:
     reports = axes.values() if isinstance(axes, dict) else [metrics]
     return all(
         isinstance(report, dict)
-        and report.get("schema_version") == "personaforge.eval.retrieval_metrics.v3"
+        and report.get("schema_version") == "personaforge.eval.retrieval_metrics.v4"
         for report in reports
     )
 
@@ -1066,6 +1091,28 @@ _METRIC_SUM_KEYS = {
     "relevant_candidate_count",
     "relevant_query_count",
     "no_relevant_query_count",
+    "strict_metric_query_count",
+    "qrels_label_count",
+    "qrels_unlabelled_count",
+    "qrels_zero_count",
+    "qrels_relevant_count",
+    "qrels_useful_count",
+    "qrels_strong_count",
+    "unjudged_top_count",
+    "pool_outside_count",
+    "useful_recall_micro_numerator",
+    "useful_recall_micro_denominator",
+    "strong_recall_micro_numerator",
+    "strong_recall_micro_denominator",
+    "useful_recall_zero_query_count",
+    "useful_recall_one_query_count",
+    "strong_recall_zero_query_count",
+    "strong_recall_one_query_count",
+}
+
+_METRIC_DERIVED_KEYS = {
+    "useful_recall_micro_at_k",
+    "strong_recall_micro_at_k",
 }
 
 
@@ -1124,6 +1171,8 @@ def _combine_metric_maps(
         if key in {"route", "schema_version", "ranking_id", "recall_scope"}:
             result[key] = next((value for value, _weight in values if value not in {None, ""}), None)
             continue
+        if key in _METRIC_DERIVED_KEYS:
+            continue
         numeric_values: list[tuple[float, float]] = []
         for value, weight in values:
             if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -1135,7 +1184,30 @@ def _combine_metric_maps(
                 result[key] = _numeric_average(numeric_values)
         else:
             result[key] = next((value for value, _weight in values if value is not None), None)
+    _refresh_micro_recall(result)
     return result
+
+
+def _refresh_micro_recall(metrics: dict[str, Any]) -> None:
+    """Recompute pooled recall after count aggregation.
+
+    Macro recall is averaged per query. Micro recall is derived from pooled
+    useful/strong numerators and denominators, so it must never be averaged as
+    an ordinary rate when combining authors or splits.
+    """
+
+    for prefix in ("useful", "strong"):
+        numerator = metrics.get(f"{prefix}_recall_micro_numerator")
+        denominator = metrics.get(f"{prefix}_recall_micro_denominator")
+        if isinstance(numerator, (int, float)) and isinstance(denominator, (int, float)) and denominator:
+            metrics[f"{prefix}_recall_micro_at_k"] = numerator / denominator
+        else:
+            metrics[f"{prefix}_recall_micro_at_k"] = None
+    by_cutoff = metrics.get("by_cutoff")
+    if isinstance(by_cutoff, dict):
+        for value in by_cutoff.values():
+            if isinstance(value, dict):
+                _refresh_micro_recall(value)
 
 
 def _combine_metric_reports(
@@ -1306,6 +1378,26 @@ def _public_ranking(manifest: dict[str, Any] | None) -> dict[str, Any] | None:
         },
         "query_count": int((manifest.get("counts") or {}).get("queries") or 0),
         "created_at": str(manifest.get("created_at") or ""),
+        "reranker": _public_reranker(manifest.get("reranker")),
+    }
+
+
+def _public_reranker(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    timing = value.get("timing_ms") if isinstance(value.get("timing_ms"), dict) else {}
+    return {
+        "model": str(value.get("model") or ""),
+        "representation": str(value.get("representation") or ""),
+        "base_routes": [str(route) for route in value.get("base_routes") or []],
+        "reranked_routes": [str(route) for route in value.get("reranked_routes") or []],
+        "candidate_depth": int(value.get("candidate_depth") or 0),
+        "batch_size": int(value.get("batch_size") or 0),
+        "max_length": int(value.get("max_length") or 0),
+        "pair_count": int(value.get("pair_count") or 0),
+        "truncated_pair_count": int(value.get("truncated_pair_count") or 0),
+        "truncated_pair_rate": value.get("truncated_pair_rate"),
+        "timing_ms": timing,
     }
 
 

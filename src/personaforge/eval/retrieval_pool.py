@@ -24,6 +24,7 @@ from personaforge.ingest.retrieve import (
     ParentHit,
     fuse_parent_hits,
     fuse_parent_rankings,
+    fuse_transformed_dense_parent_rankings,
     load_parents,
     retrieve_parents,
     retrieve_parents_for_queries,
@@ -44,6 +45,7 @@ ROUTE_ORDER = (
     "raw_dense",
     "raw_sparse",
     "raw_hybrid_rrf",
+    "transformed_dense_rrf",
     "transformed_rrf",
     "raw_bm25",
     "transformed_dense_bm25_rrf",
@@ -87,8 +89,8 @@ def build_exhaustive_retrieval_pool(
 ) -> RetrievalPoolResult:
     """Freeze every parent visible at the temporal cutoff for every eval query.
 
-    The source six-route pool supplies immutable query plans and route ranks. A
-    parent absent from all six routes is still included with empty
+    The source route pool supplies immutable query plans and route ranks. A
+    parent absent from all routes is still included with empty
     ``route_ranks`` so corpus-wide recall has a real denominator.
     """
 
@@ -205,8 +207,8 @@ def build_exhaustive_retrieval_pool(
         "dataset_sha256": dataset_manifest.get("dataset_sha256"),
         "excluded_parent_ids_sha256": dataset_manifest.get("excluded_parent_ids_sha256"),
         "source_parents_sha256": dataset_manifest.get("source_parents_sha256"),
-        "source_six_route_pool_id": source_pool_id,
-        "source_six_route_pool_sha256": source_manifest.get("pool_sha256"),
+        "source_route_pool_id": source_pool_id,
+        "source_route_pool_sha256": source_manifest.get("pool_sha256"),
         "eligible_parent_ids_sha256": hashlib.sha256(
             json.dumps(eligible_parent_ids, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         ).hexdigest(),
@@ -327,8 +329,8 @@ def build_retrieval_pool(
         raise ValueError(f"No {config.split!r} items found in {config.dataset_path}.")
 
     dataset_id = config.dataset_id or str(dataset_manifest.get("dataset_id") or config.dataset_path.parent.name)
-    pool_id = f"{dataset_id}.{config.split}.six_route_retrieval_pool.v1"
-    default_dir_name = f"{config.split}_six_route_v1"
+    pool_id = f"{dataset_id}.{config.split}.seven_route_retrieval_pool.v1"
+    default_dir_name = f"{config.split}_seven_route_v1"
     out_dir = config.out_dir or config.dataset_path.parent / "retrieval_pool" / default_dir_name
     pool_path = out_dir / "pool.jsonl"
     manifest_path = out_dir / "manifest.json"
@@ -399,6 +401,13 @@ def build_retrieval_pool(
             rrf_k=config.rrf_k,
             exclude_parent_ids=excluded_parent_ids,
         )
+        transformed_dense = fuse_transformed_dense_parent_rankings(
+            plan.transform.retrieval_queries,
+            transformed_result.routes,
+            rrf_k=config.rrf_k,
+            per_query_parent_k=config.per_query_parent_k,
+            parent_top_k=config.route_parent_k,
+        )
 
         dense_bm25_per_query: dict[str, list[ParentHit]] = {}
         for retrieval_query in plan.transform.retrieval_queries:
@@ -428,6 +437,7 @@ def build_retrieval_pool(
             "raw_dense": raw_dense,
             "raw_sparse": raw_sparse,
             "raw_hybrid_rrf": raw.parents,
+            "transformed_dense_rrf": transformed_dense,
             "transformed_rrf": transformed_result.parents,
             "raw_bm25": bm25_parents,
             "transformed_dense_bm25_rrf": transformed_dense_bm25,

@@ -7,7 +7,7 @@ routes is judged once, while every route keeps its own rank for evaluation.
 from __future__ import annotations
 
 import math
-from statistics import fmean
+from statistics import fmean, median
 from typing import Any, Mapping, Sequence
 
 
@@ -15,9 +15,13 @@ PREFERRED_ROUTE_ORDER = (
     "raw_dense",
     "raw_sparse",
     "raw_hybrid_rrf",
+    "raw_hybrid_rrf_reranked",
+    "transformed_dense_rrf",
     "transformed_rrf",
+    "transformed_rrf_reranked",
     "raw_bm25",
     "transformed_dense_bm25_rrf",
+    "transformed_dense_bm25_rrf_reranked",
 )
 DEFAULT_CUTOFFS = (1, 3, 5, 10, 20, 30, 50, 100, 200)
 RANKING_NDCG_CUTOFFS = (1, 3, 5, 10, 20, 30)
@@ -81,7 +85,7 @@ def compute_retrieval_metrics(
         for candidate in record.get("candidates") or []
     )
     return {
-        "schema_version": "personaforge.eval.retrieval_metrics.v3",
+        "schema_version": "personaforge.eval.retrieval_metrics.v4",
         "cutoff": effective_cutoff,
         "cutoffs": requested_cutoffs,
         "max_supported_cutoff": max_supported_cutoff,
@@ -147,10 +151,11 @@ def compute_split_metrics_from_rankings(
     """Compute metrics from independent ordered Parent rankings.
 
     ``records`` defines the judged Qrels universe, while ``ranking_records``
-    defines the actual output of each route.  A ranked parent outside Qrels is
-    counted as zero relevance and exposed through ``pool_outside_*`` fields.
-    This is intentionally separate from :func:`compute_split_metrics`, which
-    evaluates the old route-rank fields embedded in a candidate pool.
+    defines the actual output of each route. A ranked parent outside Qrels is
+    unknown, not an explicit zero label. It is exposed through
+    ``unjudged_top_count`` and excluded from strict per-query metrics. This is
+    intentionally separate from :func:`compute_split_metrics`, which evaluates
+    the old route-rank fields embedded in a candidate pool.
     """
 
     if requested_depth < 1:
@@ -218,6 +223,9 @@ def compute_split_metrics_from_rankings(
     candidate_count = sum(len(record.get("candidates") or []) for record in records)
     judged_candidate_count = len(labelled_pairs)
     relevant_candidate_count = sum(score >= 1 for score in labelled_pairs.values())
+    qrels_zero_count = sum(score == 0 for score in labelled_pairs.values())
+    qrels_useful_count = sum(score >= 1 for score in labelled_pairs.values())
+    qrels_strong_count = sum(score == 2 for score in labelled_pairs.values())
     report = {
         "schema_version": "personaforge.eval.retrieval_metrics.v4",
         "ranking_id": ranking_id,
@@ -240,6 +248,11 @@ def compute_split_metrics_from_rankings(
         "candidate_count": candidate_count,
         "judged_candidate_count": judged_candidate_count,
         "relevant_candidate_count": relevant_candidate_count,
+        "qrels_label_count": judged_candidate_count,
+        "qrels_unlabelled_count": max(candidate_count - judged_candidate_count, 0),
+        "qrels_zero_count": qrels_zero_count,
+        "qrels_useful_count": qrels_useful_count,
+        "qrels_strong_count": qrels_strong_count,
         "coverage": judged_candidate_count / candidate_count if candidate_count else 0.0,
         "routes": route_stats,
     }
@@ -275,6 +288,7 @@ def _compute_ranked_route_at_k(
     recall_enabled: bool,
 ) -> dict[str, Any]:
     ndcg_values: list[float] = []
+    linear_ndcg_values: list[float] = []
     precision_values: list[float] = []
     useful_precision_values: list[float] = []
     strong_precision_values: list[float] = []
@@ -291,6 +305,16 @@ def _compute_ranked_route_at_k(
     qrels_useful_count = 0
     qrels_strong_count = 0
     valid_recall_queries = 0
+    qrels_unlabelled_count = 0
+    qrels_zero_count = 0
+    useful_recall_numerator = 0
+    useful_recall_denominator = 0
+    strong_recall_numerator = 0
+    strong_recall_denominator = 0
+    unjudged_top_count = 0
+    strict_metric_query_count = 0
+    useful_qrels_per_query: list[float] = []
+    strong_qrels_per_query: list[float] = []
 
     for record in records:
         item_id = str(record.get("item_id") or "")
@@ -311,12 +335,25 @@ def _compute_ranked_route_at_k(
             if label_item_id == item_id and parent_id in qrels_ids
         }
         qrels_label_count += len(item_labels)
+        qrels_unlabelled_count += max(len(qrels_ids) - len(item_labels), 0)
+        qrels_zero_count += sum(score == 0 for score in item_labels.values())
         qrels_relevant_count += sum(score >= 1 for score in item_labels.values())
         qrels_useful_count += sum(score >= 1 for score in item_labels.values())
         qrels_strong_count += sum(score == 2 for score in item_labels.values())
+        useful_total = sum(score >= 1 for score in item_labels.values())
+        strong_total = sum(score == 2 for score in item_labels.values())
+        useful_qrels_per_query.append(float(useful_total))
+        strong_qrels_per_query.append(float(strong_total))
         outside = sum(str(entry.get("parent_id") or "") not in qrels_ids for entry in top)
         outside_counts.append(float(outside))
-        scores = [item_labels.get(str(entry.get("parent_id") or ""), 0) for entry in top]
+        top_labels = [item_labels.get(str(entry.get("parent_id") or "")) for entry in top]
+        unjudged_top_count += sum(value is None for value in top_labels)
+        if any(value is None for value in top_labels):
+            # An unknown ranked item may be relevant. Do not silently turn it
+            # into a negative label; retain only audit counters for this row.
+            continue
+        strict_metric_query_count += 1
+        scores = [int(value) for value in top_labels]
         useful = [score >= 1 for score in scores]
         strong = [score == 2 for score in scores]
         if precision_enabled:
@@ -328,14 +365,22 @@ def _compute_ranked_route_at_k(
             ideal_scores = sorted(item_labels.values(), reverse=True)[: len(top)]
             ideal = _dcg([_gain(score) for score in ideal_scores])
             ndcg_values.append(_dcg([_gain(score) for score in scores]) / ideal if ideal else 0.0)
+            linear_ideal = _dcg([_linear_gain(score) for score in ideal_scores])
+            linear_ndcg_values.append(
+                _dcg([_linear_gain(score) for score in scores]) / linear_ideal
+                if linear_ideal
+                else 0.0
+            )
         if recall_enabled:
-            useful_total = sum(score >= 1 for score in item_labels.values())
-            strong_total = sum(score == 2 for score in item_labels.values())
             if useful_total:
                 useful_recall_values.append(sum(useful) / useful_total)
+                useful_recall_numerator += sum(useful)
+                useful_recall_denominator += useful_total
                 valid_recall_queries += 1
             if strong_total:
                 strong_recall_values.append(sum(strong) / strong_total)
+                strong_recall_numerator += sum(strong)
+                strong_recall_denominator += strong_total
             # Useful relevance is the main recall axis for backwards-compatible
             # ``recall_at_k``; strong recall is reported separately.
             if useful_total:
@@ -364,17 +409,26 @@ def _compute_ranked_route_at_k(
         "cutoff": cutoff,
         "query_count": query_count,
         "ranked_query_count": sum(1 for row in records if (ranking_by_item.get(str(row.get("item_id") or "")) or {}).get("routes", {}).get(route)),
+        "strict_metric_query_count": strict_metric_query_count,
         "candidate_count": ranked_count,
         "valid_recall_query_count": valid_recall_queries,
         "qrels_label_count": qrels_label_count,
+        "qrels_unlabelled_count": qrels_unlabelled_count,
+        "qrels_zero_count": qrels_zero_count,
         "qrels_relevant_count": qrels_relevant_count,
         "qrels_useful_count": qrels_useful_count,
         "qrels_strong_count": qrels_strong_count,
+        "useful_qrels_per_query_mean": _mean_or_none(useful_qrels_per_query),
+        "useful_qrels_per_query_median": median(useful_qrels_per_query) if useful_qrels_per_query else None,
+        "strong_qrels_per_query_mean": _mean_or_none(strong_qrels_per_query),
+        "strong_qrels_per_query_median": median(strong_qrels_per_query) if strong_qrels_per_query else None,
         "pool_outside_count": int(sum(outside_counts)),
         "pool_outside_rate": round(sum(outside_counts) / ranked_count, 6) if ranked_count else 0.0,
+        "unjudged_top_count": unjudged_top_count,
         "hit_at_k": _mean_or_none(hits),
         "mrr_at_k": _mean_or_none(reciprocal_ranks),
         "ndcg_at_k": _mean_or_none(ndcg_values),
+        "linear_ndcg_at_k": _mean_or_none(linear_ndcg_values),
         "precision_at_k": _mean_or_none(precision_values),
         "recall_at_k": _mean_or_none(recall_values),
         "map_at_k": _mean_or_none(average_precisions),
@@ -382,6 +436,22 @@ def _compute_ranked_route_at_k(
         "strong_precision_at_k": _mean_or_none(strong_precision_values),
         "useful_recall_at_k": _mean_or_none(useful_recall_values),
         "strong_recall_at_k": _mean_or_none(strong_recall_values),
+        "useful_recall_macro_at_k": _mean_or_none(useful_recall_values),
+        "strong_recall_macro_at_k": _mean_or_none(strong_recall_values),
+        "useful_recall_micro_numerator": useful_recall_numerator,
+        "useful_recall_micro_denominator": useful_recall_denominator,
+        "strong_recall_micro_numerator": strong_recall_numerator,
+        "strong_recall_micro_denominator": strong_recall_denominator,
+        "useful_recall_micro_at_k": (
+            useful_recall_numerator / useful_recall_denominator
+            if useful_recall_denominator else None
+        ),
+        "strong_recall_micro_at_k": (
+            strong_recall_numerator / strong_recall_denominator
+            if strong_recall_denominator else None
+        ),
+        **_recall_distribution_fields(useful_recall_values, "useful"),
+        **_recall_distribution_fields(strong_recall_values, "strong"),
     }
 
 
@@ -473,6 +543,7 @@ def _compute_route_at_k(
         "hit_at_k": None,
         "mrr_at_k": None,
         "ndcg_at_k": None,
+        "linear_ndcg_at_k": None,
         "precision_at_k": None,
         "recall_at_k": None,
         "map_at_k": None,
@@ -482,10 +553,31 @@ def _compute_route_at_k(
         "strong_recall_at_k": None,
         "relevant_query_count": 0,
         "no_relevant_query_count": 0,
+        "qrels_label_count": 0,
+        "qrels_unlabelled_count": 0,
+        "qrels_zero_count": 0,
+        "qrels_relevant_count": 0,
+        "qrels_useful_count": 0,
+        "qrels_strong_count": 0,
+        "useful_qrels_per_query_mean": None,
+        "useful_qrels_per_query_median": None,
+        "strong_qrels_per_query_mean": None,
+        "strong_qrels_per_query_median": None,
+        "useful_recall_micro_at_k": None,
+        "strong_recall_micro_at_k": None,
+        "useful_recall_macro_at_k": None,
+        "strong_recall_macro_at_k": None,
+        "useful_recall_micro_numerator": 0,
+        "useful_recall_micro_denominator": 0,
+        "strong_recall_micro_numerator": 0,
+        "strong_recall_micro_denominator": 0,
+        "strict_metric_query_count": 0,
+        "unjudged_top_count": 0,
     }
     hits: list[float] = []
     reciprocal_ranks: list[float] = []
     ndcgs: list[float] = []
+    linear_ndcgs: list[float] = []
     precisions: list[float] = []
     recalls: list[float] = []
     average_precisions: list[float] = []
@@ -493,6 +585,12 @@ def _compute_route_at_k(
     strong_precisions: list[float] = []
     useful_recalls: list[float] = []
     strong_recalls: list[float] = []
+    useful_recall_numerator = 0
+    useful_recall_denominator = 0
+    strong_recall_numerator = 0
+    strong_recall_denominator = 0
+    useful_qrels_per_query: list[float] = []
+    strong_qrels_per_query: list[float] = []
 
     for record in records:
         item_id = str(record.get("item_id") or "")
@@ -501,6 +599,14 @@ def _compute_route_at_k(
         stats["candidate_count"] += len(ranked)
         ranked_labels = [labels.get((item_id, _parent_id(candidate))) for candidate in ranked]
         stats["judged_candidate_count"] += sum(value is not None for value in ranked_labels)
+        all_labels = [labels.get((item_id, _parent_id(candidate))) for candidate in all_candidates]
+        stats["qrels_label_count"] += sum(value is not None for value in all_labels)
+        stats["qrels_unlabelled_count"] += sum(value is None for value in all_labels)
+        stats["qrels_zero_count"] += sum(value == 0 for value in all_labels)
+        stats["qrels_relevant_count"] += sum(value is not None and int(value) >= relevance_threshold for value in all_labels)
+        stats["qrels_useful_count"] += sum(value is not None and int(value) >= 1 for value in all_labels)
+        stats["qrels_strong_count"] += sum(value == 2 for value in all_labels)
+        stats["unjudged_top_count"] += sum(value is None for value in ranked_labels)
         if not ranked or any(value is None for value in ranked_labels):
             continue
 
@@ -509,6 +615,7 @@ def _compute_route_at_k(
         useful = [score >= 1 for score in scores]
         strong = [score == 2 for score in scores]
         stats["judged_query_count"] += 1
+        stats["strict_metric_query_count"] += 1
         hits.append(1.0 if any(relevant) else 0.0)
         reciprocal_ranks.append(
             next((1.0 / index for index, value in enumerate(relevant, start=1) if value), 0.0)
@@ -517,7 +624,6 @@ def _compute_route_at_k(
         useful_precisions.append(sum(useful) / cutoff)
         strong_precisions.append(sum(strong) / cutoff)
 
-        all_labels = [labels.get((item_id, _parent_id(candidate))) for candidate in all_candidates]
         if any(value is None for value in all_labels):
             continue
         stats["fully_judged_query_count"] += 1
@@ -527,13 +633,27 @@ def _compute_route_at_k(
         total_relevant = sum(score >= relevance_threshold for score in all_scores)
         total_useful = sum(score >= 1 for score in all_scores)
         total_strong = sum(score == 2 for score in all_scores)
+        useful_qrels_per_query.append(float(total_useful))
+        strong_qrels_per_query.append(float(total_strong))
         if total_useful:
             useful_recalls.append(sum(useful) / total_useful)
+            useful_recall_numerator += sum(useful)
+            useful_recall_denominator += total_useful
         if total_strong:
             strong_recalls.append(sum(strong) / total_strong)
+            strong_recall_numerator += sum(strong)
+            strong_recall_denominator += total_strong
         if total_relevant:
             stats["relevant_query_count"] += 1
             ndcgs.append(_dcg([_gain(score) for score in scores]) / ideal_dcg if ideal_dcg else 0.0)
+            linear_ideal_dcg = _dcg(
+                sorted((_linear_gain(score) for score in all_scores), reverse=True)[: len(scores)]
+            )
+            linear_ndcgs.append(
+                _dcg([_linear_gain(score) for score in scores]) / linear_ideal_dcg
+                if linear_ideal_dcg
+                else 0.0
+            )
             recalls.append(sum(relevant) / total_relevant)
             precision_sum = sum(
                 sum(relevant[:index]) / index
@@ -553,6 +673,7 @@ def _compute_route_at_k(
     stats["hit_at_k"] = _mean_or_none(hits)
     stats["mrr_at_k"] = _mean_or_none(reciprocal_ranks)
     stats["ndcg_at_k"] = _mean_or_none(ndcgs)
+    stats["linear_ndcg_at_k"] = _mean_or_none(linear_ndcgs)
     stats["precision_at_k"] = _mean_or_none(precisions)
     stats["recall_at_k"] = _mean_or_none(recalls)
     stats["map_at_k"] = _mean_or_none(average_precisions)
@@ -560,8 +681,114 @@ def _compute_route_at_k(
     stats["strong_precision_at_k"] = _mean_or_none(strong_precisions)
     stats["useful_recall_at_k"] = _mean_or_none(useful_recalls)
     stats["strong_recall_at_k"] = _mean_or_none(strong_recalls)
+    stats["useful_recall_macro_at_k"] = _mean_or_none(useful_recalls)
+    stats["strong_recall_macro_at_k"] = _mean_or_none(strong_recalls)
+    stats["useful_recall_micro_numerator"] = useful_recall_numerator
+    stats["useful_recall_micro_denominator"] = useful_recall_denominator
+    stats["strong_recall_micro_numerator"] = strong_recall_numerator
+    stats["strong_recall_micro_denominator"] = strong_recall_denominator
+    stats["useful_recall_micro_at_k"] = (
+        useful_recall_numerator / useful_recall_denominator
+        if useful_recall_denominator else None
+    )
+    stats["strong_recall_micro_at_k"] = (
+        strong_recall_numerator / strong_recall_denominator
+        if strong_recall_denominator else None
+    )
+    stats.update(_recall_distribution_fields(useful_recalls, "useful"))
+    stats.update(_recall_distribution_fields(strong_recalls, "strong"))
+    stats["useful_qrels_per_query_mean"] = _mean_or_none(useful_qrels_per_query)
+    stats["useful_qrels_per_query_median"] = median(useful_qrels_per_query) if useful_qrels_per_query else None
+    stats["strong_qrels_per_query_mean"] = _mean_or_none(strong_qrels_per_query)
+    stats["strong_qrels_per_query_median"] = median(strong_qrels_per_query) if strong_qrels_per_query else None
     stats["unjudged_query_count"] = max(query_count - len(hits), 0)
     return stats
+
+
+def compute_query_diagnostics(
+    record: Mapping[str, Any],
+    labels: Mapping[tuple[str, str], int],
+    *,
+    cutoffs: Sequence[int] = DEFAULT_CUTOFFS,
+    ranking: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return auditable Qrels counts and route metrics for one query.
+
+    This is deliberately a read-only projection over frozen records. It is
+    used by the report UI so a user can move from an author average to the
+    exact question, route, K, and judged-material denominator without running
+    retrieval or an LLM call again.
+    """
+
+    item_id = str(record.get("item_id") or "")
+    candidates = list(record.get("candidates") or [])
+    candidate_ids = [str(candidate.get("parent_id") or "") for candidate in candidates]
+    labelled_scores = [
+        int(labels[(item_id, parent_id)])
+        for parent_id in candidate_ids
+        if (item_id, parent_id) in labels
+    ]
+    qrels = {
+        "candidate_count": len(candidate_ids),
+        "labeled_count": len(labelled_scores),
+        "unlabelled_count": max(len(candidate_ids) - len(labelled_scores), 0),
+        "zero_count": sum(score == 0 for score in labelled_scores),
+        "useful_count": sum(score >= 1 for score in labelled_scores),
+        "strong_count": sum(score == 2 for score in labelled_scores),
+        "useful_recall_denominator": sum(score >= 1 for score in labelled_scores),
+        "strong_recall_denominator": sum(score == 2 for score in labelled_scores),
+    }
+    qrels["coverage"] = (
+        qrels["labeled_count"] / qrels["candidate_count"]
+        if qrels["candidate_count"]
+        else 0.0
+    )
+
+    if ranking is not None:
+        route_names = list((ranking.get("routes") or {}).keys())
+        ranking_by_item = {item_id: ranking}
+        ranking_mode = True
+    else:
+        route_names = discover_routes([record])
+        ranking_by_item = {}
+        ranking_mode = False
+    ordered_routes = [route for route in PREFERRED_ROUTE_ORDER if route in route_names]
+    ordered_routes.extend(sorted(set(route_names).difference(ordered_routes)))
+    normalised_cutoffs = _normalise_metric_cutoffs(cutoffs, "query metric")
+    route_metrics: dict[str, Any] = {}
+    for route in ordered_routes:
+        if ranking_mode:
+            depth = _route_max_depth(ranking_by_item, route)
+            by_cutoff = {
+                str(k): _compute_ranked_route_at_k(
+                    [record],
+                    ranking_by_item,
+                    labels,
+                    route=route,
+                    cutoff=k,
+                    ndcg_enabled=True,
+                    precision_enabled=True,
+                    recall_enabled=True,
+                )
+                for k in normalised_cutoffs
+                if k <= depth
+            }
+        else:
+            depth = _route_depths([record]).get(route, 0)
+            by_cutoff = {
+                str(k): _compute_route_at_k(
+                    [record], labels, route=route, cutoff=k, relevance_threshold=1
+                )
+                for k in normalised_cutoffs
+                if k <= depth
+            }
+        route_metrics[route] = {
+            "route": route,
+            "route_depth": depth,
+            "available_cutoffs": sorted(int(k) for k in by_cutoff),
+            "by_cutoff": by_cutoff,
+        }
+    return {"qrels": qrels, "routes": route_metrics}
 
 
 def _normalise_cutoffs(
@@ -578,6 +805,26 @@ def _normalise_cutoffs(
         return [cutoff]
     values.append(max_supported_cutoff)
     return sorted({value for value in values if value <= max_supported_cutoff})
+
+
+def _recall_distribution_fields(values: Sequence[float], prefix: str) -> dict[str, Any]:
+    """Expose the shape of per-query recall, not just its average."""
+
+    if not values:
+        return {
+            f"{prefix}_recall_min_at_k": None,
+            f"{prefix}_recall_median_at_k": None,
+            f"{prefix}_recall_max_at_k": None,
+            f"{prefix}_recall_zero_query_count": 0,
+            f"{prefix}_recall_one_query_count": 0,
+        }
+    return {
+        f"{prefix}_recall_min_at_k": round(min(values), 6),
+        f"{prefix}_recall_median_at_k": round(float(median(values)), 6),
+        f"{prefix}_recall_max_at_k": round(max(values), 6),
+        f"{prefix}_recall_zero_query_count": sum(value == 0 for value in values),
+        f"{prefix}_recall_one_query_count": sum(value == 1 for value in values),
+    }
 
 
 def _route_depths(records: Sequence[Mapping[str, Any]]) -> dict[str, int]:
@@ -616,6 +863,12 @@ def _label_score(label: Any) -> int:
 
 def _gain(score: int) -> float:
     return float((2**score) - 1)
+
+
+def _linear_gain(score: int) -> float:
+    """Use the annotated 0/1/2 relevance score directly as the gain."""
+
+    return float(max(score, 0))
 
 
 def _dcg(values: Sequence[float]) -> float:

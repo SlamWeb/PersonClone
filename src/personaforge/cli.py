@@ -308,7 +308,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     eval_pool_parser = eval_subparsers.add_parser(
         "retrieval-pool",
-        help="Freeze a six-route retrieval candidate pool for relevance evaluation.",
+        help="Freeze a seven-route retrieval candidate pool for relevance evaluation.",
     )
     eval_pool_parser.add_argument("author", help="Creator token.")
     eval_pool_parser.add_argument("--dataset", required=True, help="Path to dataset.jsonl from pf eval prepare.")
@@ -358,7 +358,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     eval_rankings_parser = eval_subparsers.add_parser(
         "retrieval-rankings",
-        help="Freeze independent six-route Parent rankings for RAG metrics.",
+        help="Freeze independent seven-route Parent rankings for RAG metrics.",
     )
     eval_rankings_parser.add_argument("--pool-manifest", required=True, help="Frozen Qrels pool manifest.")
     eval_rankings_parser.add_argument("--index-dir", required=True, help="Directory containing parents.jsonl and nodes.jsonl.")
@@ -376,10 +376,47 @@ def build_parser() -> argparse.ArgumentParser:
     eval_rankings_parser.add_argument("--per-query-parent-k", type=int, default=100)
     eval_rankings_parser.add_argument("--rrf-k", type=int, default=60)
     eval_rankings_parser.add_argument("--split", choices=["dev", "test", "all"], default="all")
-    eval_rankings_parser.add_argument("--ranking-id", default="six_route_parent_top100_v1")
+    eval_rankings_parser.add_argument("--ranking-id", default="seven_route_parent_top100_v1")
     eval_rankings_parser.add_argument("--out-dir", help="Optional output directory for the ranking snapshot.")
     eval_rankings_parser.add_argument("--force", action="store_true", help="Replace an existing incomplete or completed snapshot.")
     eval_rankings_parser.add_argument("--no-fp16", action="store_true", help="Disable fp16 when loading BGE-M3.")
+
+    eval_rerank_parser = eval_subparsers.add_parser(
+        "retrieval-rerank",
+        help="Append BGE cross-encoder reranked routes to a frozen Parent ranking snapshot.",
+    )
+    eval_rerank_parser.add_argument("--base-ranking-manifest", required=True)
+    eval_rerank_parser.add_argument("--index-dir", required=True, help="Directory containing nodes.jsonl.")
+    eval_rerank_parser.add_argument(
+        "--model-name",
+        default="BAAI/bge-reranker-v2-m3",
+        help="Reranker model name or local path.",
+    )
+    eval_rerank_parser.add_argument("--cache-dir", help="Optional Hugging Face model cache directory.")
+    eval_rerank_parser.add_argument(
+        "--device",
+        choices=["auto", "cpu", "cuda"],
+        default="auto",
+    )
+    eval_rerank_parser.add_argument("--candidate-depth", type=int, default=100)
+    eval_rerank_parser.add_argument("--batch-size", type=int, default=2)
+    eval_rerank_parser.add_argument("--max-length", type=int, default=1024)
+    eval_rerank_parser.add_argument(
+        "--routes",
+        nargs="+",
+        default=[
+            "raw_hybrid_rrf",
+            "transformed_rrf",
+            "transformed_dense_bm25_rrf",
+        ],
+    )
+    eval_rerank_parser.add_argument(
+        "--ranking-id",
+        default="seven_route_parent_top100_bge_reranker_v2_m3_v1",
+    )
+    eval_rerank_parser.add_argument("--out-dir")
+    eval_rerank_parser.add_argument("--force", action="store_true")
+    eval_rerank_parser.add_argument("--no-fp16", action="store_true")
 
     eval_gold_units_parser = eval_subparsers.add_parser(
         "retrieval-gold-units",
@@ -1254,6 +1291,42 @@ def _run_eval(args: argparse.Namespace) -> int:
         print(f"- queries: {result.query_count}")
         print(f"- requested depth: {result.requested_depth}")
         print(f"- actual route depths: {result.actual_depth_by_route}")
+        print(f"- rankings: {result.rankings_path}")
+        print(f"- manifest: {result.manifest_path}")
+        return 0
+
+    if args.eval_command == "retrieval-rerank":
+        from personaforge.eval.retrieval_reranker import (
+            BgeCrossEncoderReranker,
+            RetrievalRerankerConfig,
+            build_reranked_ranking_snapshot,
+        )
+
+        reranker = BgeCrossEncoderReranker(
+            args.model_name,
+            device=args.device,
+            use_fp16=not args.no_fp16,
+            batch_size=args.batch_size,
+            max_length=args.max_length,
+            cache_dir=Path(args.cache_dir) if args.cache_dir else None,
+        )
+        config = RetrievalRerankerConfig(
+            base_ranking_manifest_path=Path(args.base_ranking_manifest),
+            index_dir=Path(args.index_dir),
+            ranking_id=args.ranking_id,
+            routes=tuple(args.routes),
+            candidate_depth=args.candidate_depth,
+            max_length=args.max_length,
+            batch_size=args.batch_size,
+            out_dir=Path(args.out_dir) if args.out_dir else None,
+            force=args.force,
+        )
+        result = build_reranked_ranking_snapshot(config, reranker=reranker)
+        print(f"Completed retrieval reranking snapshot {result.ranking_id}:")
+        print(f"- queries: {result.query_count}")
+        print(f"- reranked routes: {', '.join(result.reranked_routes)}")
+        print(f"- pairs: {result.pair_count}")
+        print(f"- inputs above max length: {result.truncated_pair_count}")
         print(f"- rankings: {result.rankings_path}")
         print(f"- manifest: {result.manifest_path}")
         return 0

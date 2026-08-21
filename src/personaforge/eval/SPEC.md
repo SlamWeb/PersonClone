@@ -171,6 +171,7 @@ pf eval retrieval-core `
 正式多作者报告以分级 `nDCG`、Useful/Strong Precision 和 Useful/Strong Recall 为主：
 
 - `nDCG@K` 直接使用 0/1/2 相关等级，gain 分别为 0/1/3。
+- `linear nDCG@K` 直接使用标注分数作为 gain，0/1/2 分别为 0/1/2；它与指数 nDCG 并列展示，不替换旧指标。
 - Useful 指标签至少为 1；Strong 指标签等于 2。
 - Precision 的常用观察深度为 1/3/5/10/20/30。
 - Recall 使用更深的 10/20/30/50/100；Qrels 候选池大小与待评估方法的排名深度相互独立。只要该方法另外冻结了 Parent Top K 排名，就可以在既有 Qrels 上计算 Recall@K，无需重新标注候选池。
@@ -192,6 +193,36 @@ python -m personaforge.cli eval retrieval-rankings `
 快照会写入候选池下的 `rankings/<ranking_id>/`，包括每道题六条路线的有序
 Parent 列表和配置清单。前端只展示已经完成的快照；没有快照的作者或方法不显示
 Recall@100，实际语料不足时也不提供超过实际深度的 K，避免把 Top30 结果误当成深度检索结果。
+
+### Child 证据 Cross-Encoder 重排
+
+离线检索评估可以在冻结的 Parent Top100 排名上追加 BGE reranker 消融，不修改原排名、
+Qrels 或 Chat 链路。默认模型为 `BAAI/bge-reranker-v2-m3`，一份本地权重供全部作者复用：
+
+```powershell
+pf eval retrieval-rerank `
+  --base-ranking-manifest <rankings/seven_route_parent_top100_v1/manifest.json> `
+  --index-dir <作者 index 目录> `
+  --model-name D:\PersonaForge-Models\bge-reranker-v2-m3 `
+  --device cuda --candidate-depth 100 --batch-size 2 --max-length 1024
+```
+
+推理适配层直接使用官方 `transformers` 的
+`AutoModelForSequenceClassification` 路径，而不依赖 `FlagReranker` 的内部预处理实现；
+这是为了兼容当前项目的 Transformers 5 环境，模型权重、pair 输入和原始 logit 排序语义
+不变。
+
+Parent 仍是候选、Qrels 和指标的唯一单位。每个 Parent 的 cross-encoder 输入固定为
+`原问题 + 标题 + 该检索路线命中的最佳 passage child`；如果旧排名快照没有记录 passage，
+才回退到该 Parent 的首个 passage，再回退到 lead/title。这样不让长文长度直接抬高得分，
+同时保留 `parent_id` 与已有标注的严格对应。1024 是本项目在 6GB 显存上的工程截断值，
+不是模型的理论最大上下文。
+
+第一版只为三条已有强基线追加 `_reranked` 路线：原问题 Dense+Sparse RRF、四路变换
+Dense+Sparse RRF、四路变换 Dense+BM25 RRF。重排候选深度固定 Parent Top100，排序只看
+cross-encoder 分数，原始排名仅在同分时打破平局。快照额外保存原/新排名、reranker 分数、
+实际 evidence passage、token 长度、截断标记与耗时，供逐题审计。正式比较必须在同一作者、
+同一时间切分、同一 Qrels 与同一 K 下报告 baseline 到 reranked 的指标差值。
 
 ### 跨作者 RAG 总览
 
@@ -601,3 +632,72 @@ data/eval/ban-ma-ban-ma-30-2-temporal-fbe0192530/retrieval_pool/
 冒充人工标注、DeepSeek Judge 或正式 Gold。正式研究或简历中的结果仍应替换为人工
 或经过审核的 Judge 标签。当前 Test 跨作者总览按作者等权平均；不同作者若排名深度
 不一致，超出共同深度的 K 不应被解释为五作者完整平均。
+
+### 细粒度 RAG 报告口径（2026-08）
+
+RAG 报告固定提供三层观察范围：全部作者、单作者、单道题。每层都必须区分显式
+`0/1/2` 标签和未标注项：0 是 Judge 明确判断无用，未标注是未知，不能作为 0 参与
+指标。Qrels 摘要至少包含已标注数、未标注数、0 分数、1 分数、2 分数、Useful 总数
+（1+2）和 Strong 总数（2）。
+
+每条路线的 Useful/Strong Recall 同时输出题目宏平均和 query-parent 微平均。宏平均先
+计算每道题再平均，回答“通常一题表现如何”；微平均汇总所有题目的命中数与分母，回答
+“所有 query-parent 对合起来覆盖了多少”。跨作者主指标仍为作者等权宏平均，微平均只作
+补充，不能让材料更多的作者主导结论。报告同时保留 Useful/Strong Qrels 分母、未标注
+数量、严格纳入指标的题数和 Recall 的最小/中位数/最大诊断字段。
+
+独立 Parent 排名快照遇到 Qrels 外的 parent 时视为未知。受未知影响的题目不进入严格的
+nDCG、Precision、Recall 等聚合分母，但仍计入排名深度和未知计数；页面必须把这种情况
+显示出来，不能把未知材料静默当成 0 分。
+
+`compute_query_diagnostics` 是 Web 单题报告的唯一离线投影入口，返回当前题的 Qrels
+分布、六条路线和各 K 指标。它不重新召回、不调用 API，也不修改冻结标签。
+
+### 2026-08 Query Transform Dense 对照路线
+
+为拆分“Query Transform 的收益”和“加入 Sparse 的收益”，新版本候选池与独立排名快照
+增加第七条路线 `transformed_dense_rrf`：四个冻结的 Query Transform 结果分别只走
+BGE-M3 Dense，先在每个变换查询内部按 Parent 首命中折叠，再跨四个变换查询做 Parent
+RRF。它与 `transformed_rrf` 使用完全相同的四个变换查询、child 深度和 RRF 参数，唯一
+差别是后者在每个变换查询内部同时融合 Dense 与 Sparse。因此两者可以直接作为消融对照：
+
+```text
+Query Transform + Dense      -> transformed_dense_rrf
+Query Transform + Dense/Sparse -> transformed_rrf
+```
+
+该路线复用已经冻结的 `query_plans`，不会新增 Query Understanding、联网或 LLM API 调用。
+它会在一次 `retrieve_parents_for_queries` 已经计算出的 Dense child 结果上做轻量投影，
+避免重复编码。旧的六路候选池、六路标签和六路排名快照保持只读兼容；只有重新构建七路
+候选池或七路排名快照后，前端才会显示这条路线的逐题与聚合指标。推荐命名为：
+
+```text
+<split>_seven_route_v1/
+seven_route_parent_top100_v1/
+```
+
+新路线仍使用同一份冻结 Qrels，不重新标注；若使用完整 Qrels，直接重建独立七路
+`retrieval-rankings` 快照即可计算各个 K 的指标。
+
+### Reranker 定向人工审计（2026-08）
+
+当 reranker 与 baseline 的指标出现反常下降时，不直接据此重标全库，也不覆盖正式
+Qrels。先建立独立审计版本：从旧 Qrels 下下降最明显、提升最明显和接近持平的题目中
+分层抽样，取 baseline 与 reranker Top5 的 Parent 并集，由审计者同时阅读问题、作者
+原回答和完整候选 Parent，重新判断 `content_support=0/1/2`。该审计只诊断两类问题：
+
+1. 原 Qrels 是否把直接支撑材料误标为 0，或把宽泛主题材料过度标为 2；
+2. reranker 是否确实把局部语义相近、但不支撑作者目标答案的材料提前。
+
+`reranker_audit_v1` 固定覆盖 10 道分层抽样题、77 个 query-parent 对。原 Qrels 保持
+只读，审计标签、Top5 对照指标和 20 条盲审复核包分别保存为 `audit_scores.json`、
+`metrics.json` 和 `user_review_20.md`。计算入口为：
+
+```text
+scripts/analyze_reranker_audit.py
+```
+
+由于题目是为诊断而分层抽样，不是随机样本，审计结果只能回答“标注噪声与真实
+reranker 副作用是否同时存在”，不能替代完整 Dev/Test benchmark，也不能直接写成
+全局提升。20 条用户复核优先抽取旧标签与审计标签分歧最大的材料，并隐藏双方分数，
+避免锚定效应。

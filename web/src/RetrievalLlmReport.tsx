@@ -19,18 +19,32 @@ const ROUTE_ORDER = [
   'raw_dense',
   'raw_sparse',
   'raw_hybrid_rrf',
+  'raw_hybrid_rrf_reranked',
+  'transformed_dense_rrf',
   'transformed_rrf',
+  'transformed_rrf_reranked',
   'raw_bm25',
-  'transformed_dense_bm25_rrf'
+  'transformed_dense_bm25_rrf',
+  'transformed_dense_bm25_rrf_reranked'
 ];
 
 const ROUTE_LABELS: Record<string, string> = {
   raw_dense: '原问题 Dense',
   raw_sparse: '原问题 Sparse',
   raw_hybrid_rrf: '原问题 Dense + Sparse RRF',
+  raw_hybrid_rrf_reranked: '原问题 Hybrid + BGE Reranker',
+  transformed_dense_rrf: '四路变换 Dense RRF',
   transformed_rrf: '四路变换 Dense + Sparse RRF',
+  transformed_rrf_reranked: '四路变换 Hybrid + BGE Reranker',
   raw_bm25: '原问题 BM25',
-  transformed_dense_bm25_rrf: '四路变换 Dense + BM25 RRF'
+  transformed_dense_bm25_rrf: '四路变换 Dense + BM25 RRF',
+  transformed_dense_bm25_rrf_reranked: '四路变换 Dense + BM25 + BGE Reranker'
+};
+
+const RERANK_BASELINES: Record<string, string> = {
+  raw_hybrid_rrf_reranked: 'raw_hybrid_rrf',
+  transformed_rrf_reranked: 'transformed_rrf',
+  transformed_dense_bm25_rrf_reranked: 'transformed_dense_bm25_rrf'
 };
 
 type ReportSplit = 'all' | 'dev' | 'test';
@@ -59,6 +73,23 @@ function metricValue(value: number | null): string {
   return value === null ? '—' : value.toFixed(3);
 }
 
+function metricDelta(value: number | null | undefined, baseline: number | null | undefined): string | null {
+  if (typeof value !== 'number' || typeof baseline !== 'number') return null;
+  const delta = value - baseline;
+  return `${delta >= 0 ? '+' : ''}${delta.toFixed(3)}`;
+}
+
+function countValue(value: number | null | undefined): string {
+  return typeof value === 'number' ? String(value) : '—';
+}
+
+function recallDistribution(metric: Record<string, unknown> | null | undefined, prefix: 'useful' | 'strong'): string {
+  if (!metric) return '分布：—';
+  const value = (key: string) => metricValue(typeof metric[key] === 'number' ? metric[key] as number : null);
+  const count = (key: string) => countValue(typeof metric[key] === 'number' ? metric[key] as number : null);
+  return `${prefix === 'useful' ? 'Useful' : 'Strong'} Recall 分布 ${value(`${prefix}_recall_min_at_k`)} / ${value(`${prefix}_recall_median_at_k`)} / ${value(`${prefix}_recall_max_at_k`)} · 0分题 ${count(`${prefix}_recall_zero_query_count`)} · 1分题 ${count(`${prefix}_recall_one_query_count`)}`;
+}
+
 function scoreLabel(score: RetrievalLlmCandidate['score']): string {
   if (score === 2) return '明显有用';
   if (score === 1) return '有一定帮助';
@@ -85,7 +116,9 @@ export function RetrievalLlmReport({ viewSwitcher, authorScope }: { viewSwitcher
   const [workspace, setWorkspace] = useState<RetrievalLlmWorkspace | null>(null);
   const [itemId, setItemId] = useState('');
   const [query, setQuery] = useState<RetrievalLlmQuery | null>(null);
-  const [order, setOrder] = useState<'relevance' | 'retrieval'>('relevance');
+  const [order, setOrder] = useState<'relevance' | 'retrieval' | 'route'>('relevance');
+  const [queryRoute, setQueryRoute] = useState('');
+  const [queryCutoff, setQueryCutoff] = useState(10);
   const [split, setSplit] = useState<ReportSplit>('all');
   const [ndcgCutoff, setNdcgCutoff] = useState(10);
   const [precisionCutoff, setPrecisionCutoff] = useState(20);
@@ -299,12 +332,37 @@ export function RetrievalLlmReport({ viewSwitcher, authorScope }: { viewSwitcher
   }, [itemId, visibleQueries]);
   const orderedCandidates = useMemo(() => {
     if (!query) return [];
+    const activeRoute = queryRoute || ROUTE_ORDER.find((route) => query.route_metrics?.[route]) || '';
+    if (order === 'route' && activeRoute) {
+      const rankOf = (candidate: RetrievalLlmCandidate) => (
+        candidate.ranking_routes?.[activeRoute]?.rank
+        ?? candidate.route_ranks?.[activeRoute]?.rank
+        ?? Number.MAX_SAFE_INTEGER
+      );
+      return [...query.candidates].sort((left, right) => {
+        const rankDelta = rankOf(left) - rankOf(right);
+        return rankDelta || left.relevance_order - right.relevance_order;
+      });
+    }
     if (order === 'relevance') return query.candidates;
     return [...query.candidates].sort((left, right) => {
       if (left.best_route_rank !== right.best_route_rank) return left.best_route_rank - right.best_route_rank;
       return left.relevance_order - right.relevance_order;
     });
-  }, [order, query]);
+  }, [order, query, queryRoute]);
+
+  const queryRoutes = useMemo(
+    () => ROUTE_ORDER.filter((route) => query?.route_metrics?.[route]),
+    [query]
+  );
+  const selectedQueryRoute = queryRoute && queryRoutes.includes(queryRoute)
+    ? queryRoute
+    : queryRoutes[0] || '';
+  const queryCutoffs = query?.route_metrics?.[selectedQueryRoute]?.available_cutoffs || [];
+  const selectedQueryCutoff = queryCutoffs.includes(queryCutoff)
+    ? queryCutoff
+    : queryCutoffs[queryCutoffs.length - 1] || 1;
+  const selectedQueryRouteMetric = query?.route_metrics?.[selectedQueryRoute]?.by_cutoff?.[String(selectedQueryCutoff)] || null;
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: 0 });
@@ -328,6 +386,13 @@ export function RetrievalLlmReport({ viewSwitcher, authorScope }: { viewSwitcher
   const selectedRanking = rankingSnapshots.find((item) => item.ranking_id === rankingId) || null;
   const selectedRankingDepth = commonRankingDepth(selectedRanking);
   const stabilityProgress = selectedLabelSet?.progress;
+  const qrels = selectedMetrics ? {
+    labeled: selectedMetrics.qrels_label_count ?? selectedMetrics.judged_candidate_count ?? 0,
+    unlabelled: selectedMetrics.qrels_unlabelled_count ?? 0,
+    zero: selectedMetrics.qrels_zero_count ?? 0,
+    useful: selectedMetrics.qrels_useful_count ?? selectedMetrics.relevant_candidate_count ?? 0,
+    strong: selectedMetrics.qrels_strong_count ?? 0,
+  } : null;
   return (
     <section className={`evaluation-workspace retrieval-llm-workspace ${collapsed ? 'rail-collapsed' : ''}`}>
       {!collapsed ? (
@@ -389,7 +454,7 @@ export function RetrievalLlmReport({ viewSwitcher, authorScope }: { viewSwitcher
               {visibleQueries.map((row) => (
                 <button key={row.item_id} className={row.item_id === itemId ? 'active' : ''} type="button" onClick={() => setItemId(row.item_id)}>
                   <span className="query-ordinal">{row.ordinal}</span>
-                  <span className="query-list-copy"><strong>{row.query}</strong><small>{row.labeled_count} / {row.candidate_count}</small></span>
+                  <span className="query-list-copy"><strong>{row.query}</strong><small>已标 {row.labeled_count} / {row.candidate_count}{row.qrels ? ` · 0/1/2：${row.qrels.zero_count}/${Math.max(row.qrels.useful_count - row.qrels.strong_count, 0)}/${row.qrels.strong_count}` : ''}</small></span>
                 </button>
               ))}
             </nav>
@@ -400,7 +465,7 @@ export function RetrievalLlmReport({ viewSwitcher, authorScope }: { viewSwitcher
         {collapsed ? <button className="evaluation-rail-reveal" type="button" title="展开评估栏" onClick={() => { setCollapsed(false); localStorage.setItem('pf-retrieval-llm-sidebar', 'false'); }}><PanelLeftOpen size={18} /><span>RAG 评估</span></button> : null}
         <header className="evaluation-question-header retrieval-llm-header">
           <span>{reportSection === 'global' ? '检索评估 · 跨作者总览' : reportSection === 'overview' ? '检索评估 · 聚合结果' : labelSets.length ? `${splitLabel(split)} · ${visibleQueries.findIndex((row) => row.item_id === itemId) + 1 || '-'} / ${visibleQueries.length || 0}` : '逐题标注'}</span>
-          <h1>{reportSection === 'global' ? '所有作者 RAG 指标总览' : !labelSets.length ? '当前候选池暂无 LLM 报告' : reportSection === 'overview' ? '六路检索指标总览' : query?.query || '正在读取问题'}</h1>
+          <h1>{reportSection === 'global' ? '所有作者 RAG 指标总览' : !labelSets.length ? '当前候选池暂无 LLM 报告' : reportSection === 'overview' ? '多路检索指标总览' : query?.query || '正在读取问题'}</h1>
           <div className="retrieval-llm-meta">
              {reportSection === 'global' ? `${splitLabel(split)} · ${globalReport?.active_axis ? (AXIS_LABELS[globalReport.active_axis] || globalReport.active_axis) : '检索维度'} · 作者宏平均` : !labelSets.length ? '请从左侧切换到已有标注的候选池，或先创建 LLM 检索标注任务。' : <>{reportSection === 'overview' ? `${splitLabel(split)}的逐题指标平均值` : `标注者：${selectedLabelSet?.model || '未知'}`} · 稳定完成 {selectedLabelSet?.completed}/{selectedLabelSet?.total}
              {selectedLabelSet?.provisional ? <span className="retrieval-provisional-note"> · 离线代理标签，仅用于工程验证</span> : null}
@@ -438,9 +503,17 @@ export function RetrievalLlmReport({ viewSwitcher, authorScope }: { viewSwitcher
                   {recallCutoffs.map((value) => <option key={value} value={value}>Top {value}</option>)}
                 </select>
               </label>
-              <span>{reportSection === 'global' ? `已纳入 ${globalReport?.included_authors || 0} 位作者 · 作者等权平均` : `${selectedMetrics?.relevant_candidate_count ?? 0} 个有用 query-parent 对 · Recall 分母：${recallScopeLabel}`}</span>
+                  <span>{reportSection === 'global' ? `已纳入 ${globalReport?.included_authors || 0} 位作者 · 作者等权平均` : `${qrels?.useful ?? 0} 个有用 query-parent 对 · Recall 分母：${recallScopeLabel}`}</span>
             </div>
-            <div className="retrieval-aggregate-explanation">{reportSection === 'global' ? <><strong>作者宏平均：</strong>每位作者先独立计算六路指标，再让作者等权参与平均；材料更多的作者不会自动占更大权重。当前只汇总已有兼容完整标注的作者，K 选择只展示所有纳入作者和六条路线共同支持的深度。</> : <>下面六组数字是 <strong>{splitLabel(split)}</strong> 的逐题平均结果。nDCG 使用 0/1/2 分级相关性；Useful 表示得分至少为 1，Strong 表示得分为 2。{rankingId ? `当前使用 ${workspace?.ranking?.ranking_id || rankingId} 的独立 Parent 排名快照，请求深度 ${workspace?.ranking?.requested_depth || 100}，实际可用深度 ${selectedRankingDepth}；Recall 分母来自冻结 Qrels。` : ''}</>}</div>
+             <div className="retrieval-aggregate-explanation">{reportSection === 'global' ? <><strong>作者宏平均：</strong>每位作者先独立计算各路线指标，再让作者等权参与平均；材料更多的作者不会自动占更大权重。当前只汇总已有兼容完整标注的作者，K 选择只展示所有纳入作者和可用路线共同支持的深度。跨作者页面显示汇总数量和微平均；每道题的 Recall 分布请进入“逐题标注”查看。</> : <>下面各组数字是 <strong>{splitLabel(split)}</strong> 的逐题平均结果。指数 nDCG 使用 0/1/2 的指数增益，线性 nDCG 直接使用 0/1/2 作为增益；Useful 表示得分至少为 1，Strong 表示得分为 2。{rankingId ? `当前使用 ${workspace?.ranking?.ranking_id || rankingId} 的独立 Parent 排名快照，请求深度 ${workspace?.ranking?.requested_depth || 100}，实际可用深度 ${selectedRankingDepth}；Recall 分母来自冻结 Qrels。` : ''}</>}</div>
+            {qrels ? <div className="retrieval-qrels-summary" aria-label="Qrels 标注分布">
+              <div><span>已标注</span><strong>{countValue(qrels.labeled)}</strong></div>
+              <div className="qrels-zero"><span>0 分 无用</span><strong>{countValue(qrels.zero)}</strong></div>
+              <div className="qrels-one"><span>1 分 有帮助</span><strong>{countValue(Math.max(qrels.useful - qrels.strong, 0))}</strong></div>
+              <div className="qrels-two"><span>2 分 明显有用</span><strong>{countValue(qrels.strong)}</strong></div>
+              <div className="qrels-unknown"><span>未标注</span><strong>{countValue(qrels.unlabelled)}</strong></div>
+              <small>Useful = 1+2；未标注不按 0 分计入指标。跨作者页面的数量是纳入作者合计，指标主口径仍是作者宏平均。</small>
+            </div> : null}
             {reportSection === 'overview' && workspace?.comparison ? <div className="retrieval-comparison-summary">
               <strong>Gold-aware 相比旧 Query-only Judge 改判 {workspace.comparison.changed_count} / {workspace.comparison.total}</strong>
               <span>其中旧版 0 分、Gold-aware 改为 1/2 分：{workspace.comparison.v1_zero_to_v2_positive} 对</span>
@@ -451,14 +524,28 @@ export function RetrievalLlmReport({ viewSwitcher, authorScope }: { viewSwitcher
                 const ndcgMetric = base.by_cutoff?.[String(ndcgCutoff)] || base;
                 const precisionMetric = base.by_cutoff?.[String(precisionCutoff)] || base;
                 const recallMetric = base.by_cutoff?.[String(recallCutoff)] || base;
+                const baselineRoute = RERANK_BASELINES[route];
+                const baseline = baselineRoute ? currentMetrics[baselineRoute] : null;
+                const baselineNdcg = baseline?.by_cutoff?.[String(ndcgCutoff)] || baseline;
+                const baselinePrecision = baseline?.by_cutoff?.[String(precisionCutoff)] || baseline;
+                const ndcgDelta = metricDelta(ndcgMetric.ndcg_at_k, baselineNdcg?.ndcg_at_k);
+                const precisionDelta = metricDelta(precisionMetric.useful_precision_at_k, baselinePrecision?.useful_precision_at_k);
                 return (
-                <div className="retrieval-llm-metric" key={route}>
+                <div className={`retrieval-llm-metric ${baselineRoute ? 'reranked' : ''}`} key={route}>
                   <strong>{ROUTE_LABELS[route] || route}</strong>
-                  <span title="同时考虑 0/1/2 相关等级与排序位置">nDCG@{ndcgCutoff} <b>{metricValue(ndcgMetric.ndcg_at_k)}</b></span>
-                  <span title="前 K 篇中得分至少为 1 的材料比例">Useful Precision@{precisionCutoff} <b>{metricValue(precisionMetric.useful_precision_at_k ?? null)}</b></span>
+                  {baselineRoute ? <small className="retrieval-rerank-baseline">对比 {ROUTE_LABELS[baselineRoute] || baselineRoute}</small> : null}
+                   <span title="使用 0/1/2 的指数增益，2 分材料的增益为 3">指数 nDCG@{ndcgCutoff} <b>{metricValue(ndcgMetric.ndcg_at_k)}</b>{ndcgDelta ? <em className={ndcgDelta.startsWith('-') ? 'negative' : 'positive'}>{ndcgDelta}</em> : null}</span>
+                   <span title="直接使用 0/1/2 作为增益，不额外放大 2 分材料">线性 nDCG@{ndcgCutoff} <b>{metricValue(ndcgMetric.linear_ndcg_at_k ?? null)}</b></span>
+                  <span title="前 K 篇中得分至少为 1 的材料比例">Useful Precision@{precisionCutoff} <b>{metricValue(precisionMetric.useful_precision_at_k ?? null)}</b>{precisionDelta ? <em className={precisionDelta.startsWith('-') ? 'negative' : 'positive'}>{precisionDelta}</em> : null}</span>
                   <span title="前 K 篇中得分为 2 的材料比例">Strong Precision@{precisionCutoff} <b>{metricValue(precisionMetric.strong_precision_at_k ?? null)}</b></span>
                   <span title="Top K 覆盖候选池内全部 1/2 分材料的比例">Useful Recall@{recallCutoff} <b>{metricValue(recallMetric.useful_recall_at_k ?? null)}</b></span>
+                  <span title="把所有题目的 Useful 命中数和 Useful Qrels 数分别相加后计算">Useful Recall@{recallCutoff} · 材料微平均 <b>{metricValue(recallMetric.useful_recall_micro_at_k ?? null)}</b></span>
                   <span title="Top K 覆盖候选池内全部 2 分材料的比例">Strong Recall@{recallCutoff} <b>{metricValue(recallMetric.strong_recall_at_k ?? null)}</b></span>
+                  <span title="把所有题目的 Strong 命中数和 Strong Qrels 数分别相加后计算">Strong Recall@{recallCutoff} · 材料微平均 <b>{metricValue(recallMetric.strong_recall_micro_at_k ?? null)}</b></span>
+                  {reportSection !== 'global' ? <>
+                    <small className="retrieval-recall-diagnostic">{recallDistribution(recallMetric, 'useful')}</small>
+                    <small className="retrieval-recall-diagnostic">{recallDistribution(recallMetric, 'strong')}</small>
+                  </> : null}
                 </div>
               );})}
             </div>
@@ -489,16 +576,48 @@ export function RetrievalLlmReport({ viewSwitcher, authorScope }: { viewSwitcher
                 ))}
               </div> : null}
             </details> : null}
+            {query?.qrels ? <div className="retrieval-query-qrels" aria-label="当前问题的 Qrels 分布">
+              <strong>这道题的标注范围</strong>
+              <span>已标注 {query.qrels.labeled_count} / {query.qrels.candidate_count}</span>
+              <span className="qrels-zero">0 分 {query.qrels.zero_count}</span>
+              <span className="qrels-one">1 分 {Math.max(query.qrels.useful_count - query.qrels.strong_count, 0)}</span>
+              <span className="qrels-two">2 分 {query.qrels.strong_count}</span>
+              <span className="qrels-unknown">未标注 {query.qrels.unlabelled_count}</span>
+              <small>Recall 分母：Useful {query.qrels.useful_recall_denominator} · Strong {query.qrels.strong_recall_denominator}</small>
+            </div> : null}
+            {queryRoutes.length ? <div className="retrieval-query-route-report">
+               <div className="retrieval-query-route-heading"><strong>路线对比</strong><span>指标只在当前题目内计算；遇到未标注材料会显示为未知，不会当作 0。</span></div>
+              <div className="retrieval-query-route-table">
+                {queryRoutes.map((route) => {
+                  const routeSummary = query?.route_metrics?.[route];
+                  const metric = routeSummary?.by_cutoff?.[String(selectedQueryCutoff)] || routeSummary?.by_cutoff?.[String(routeSummary.available_cutoffs?.[routeSummary.available_cutoffs.length - 1])];
+                  return <button type="button" key={route} className={selectedQueryRoute === route ? 'active' : ''} onClick={() => { setQueryRoute(route); setOrder('route'); }}>
+                    <strong>{ROUTE_LABELS[route] || route}</strong>
+                    <span>nDCG <b>{metricValue(metric?.ndcg_at_k ?? null)}</b></span>
+                    <span>Useful R <b>{metricValue(metric?.useful_recall_at_k ?? null)}</b></span>
+                    <span>微平均 <b>{metricValue(metric?.useful_recall_micro_at_k ?? null)}</b></span>
+                  </button>;
+                })}
+              </div>
+            </div> : null}
             <div className="retrieval-llm-toolbar">
               <strong>{query?.candidate_count || 0} 个候选材料</strong>
-              <span>相关性顺序按 Judge 分数展示；检索顺序用于核对六路实际排名。</span>
-              <div className="retrieval-order-switch"><button className={order === 'relevance' ? 'active' : ''} type="button" onClick={() => setOrder('relevance')}>相关性顺序</button><button className={order === 'retrieval' ? 'active' : ''} type="button" onClick={() => setOrder('retrieval')}>检索顺序</button></div>
+               <span>相关性顺序按 Judge 分数展示；检索顺序用于核对各路线实际排名。</span>
+              {selectedQueryRoute ? <label>查看路线<select value={selectedQueryRoute} onChange={(event) => { setQueryRoute(event.target.value); setOrder('route'); }}>
+                {queryRoutes.map((route) => <option key={route} value={route}>{ROUTE_LABELS[route] || route}</option>)}
+              </select></label> : null}
+              {queryCutoffs.length ? <label>路线 K<select value={selectedQueryCutoff} onChange={(event) => { setQueryCutoff(Number(event.target.value)); setOrder('route'); }}>
+                {queryCutoffs.map((value) => <option key={value} value={value}>Top {value}</option>)}
+              </select></label> : null}
+              <div className="retrieval-order-switch"><button className={order === 'relevance' ? 'active' : ''} type="button" onClick={() => setOrder('relevance')}>相关性顺序</button><button className={order === 'retrieval' ? 'active' : ''} type="button" onClick={() => setOrder('retrieval')}>最佳检索顺序</button><button className={order === 'route' ? 'active' : ''} type="button" onClick={() => setOrder('route')}>当前路线</button></div>
             </div>
+             {selectedQueryRouteMetric ? <div className="retrieval-selected-query-metric"><strong>{ROUTE_LABELS[selectedQueryRoute] || selectedQueryRoute} · Top {selectedQueryCutoff}</strong><span>指数 nDCG {metricValue(selectedQueryRouteMetric.ndcg_at_k ?? null)}</span><span>线性 nDCG {metricValue(selectedQueryRouteMetric.linear_ndcg_at_k ?? null)}</span><span>Useful Precision {metricValue(selectedQueryRouteMetric.useful_precision_at_k ?? null)}</span><span>Useful Recall（题目平均） {metricValue(selectedQueryRouteMetric.useful_recall_at_k ?? null)}</span><span>Useful Recall（材料微平均） {metricValue(selectedQueryRouteMetric.useful_recall_micro_at_k ?? null)}</span><span>严格计入 {selectedQueryRouteMetric.strict_metric_query_count ?? 0} 题</span><small>{recallDistribution(selectedQueryRouteMetric, 'useful')}</small><small>{recallDistribution(selectedQueryRouteMetric, 'strong')}</small></div> : null}
             <div className="retrieval-llm-list">
               {orderedCandidates.map((candidate, index) => {
                 const actualRouteRanks = Object.keys(candidate.ranking_routes || {}).length
                   ? candidate.ranking_routes
                   : candidate.route_ranks;
+                const activeRouteDetails = selectedQueryRoute ? candidate.ranking_routes?.[selectedQueryRoute] : null;
                 return (
             <article className="retrieval-llm-card" key={candidate.parent_id}>
               <div className="retrieval-llm-card-heading">
@@ -520,6 +639,11 @@ export function RetrievalLlmReport({ viewSwitcher, authorScope }: { viewSwitcher
                   {axis === 'persona_expression_support' && candidate.persona_gold_unit_ids?.length ? <><br /><b>对应 Gold 单元：</b>{candidate.persona_gold_unit_ids.join('、')}</> : null}
                   {candidate.repeat_count ? <><br /><b>稳定性：</b>{candidate.repeat_count} 次判分{candidate.exact_agreement === true ? '，完全一致' : candidate.exact_agreement === false ? '，中位数聚合' : ''}</> : null}
                 </div>
+                {activeRouteDetails?.reranked ? <div className="retrieval-rerank-evidence">
+                  <div><strong>Reranker 审计</strong><span>原排名 #{activeRouteDetails.base_rank ?? '—'} → 新排名 #{activeRouteDetails.rank}</span><span>Cross-encoder {typeof activeRouteDetails.rerank_score === 'number' ? activeRouteDetails.rerank_score.toFixed(4) : '—'}</span></div>
+                  <small>{activeRouteDetails.evidence?.node_type || 'passage'} · 第 {(activeRouteDetails.evidence?.index ?? 0) + 1} 段 · {activeRouteDetails.input_tokens ?? '—'} tokens{activeRouteDetails.input_truncated ? ' · 已截断' : ''}</small>
+                  {activeRouteDetails.evidence?.text ? <p>{activeRouteDetails.evidence.text}</p> : null}
+                </div> : null}
                 <div className="retrieval-route-tags">{ROUTE_ORDER.filter((route) => actualRouteRanks?.[route]).map((route) => <span key={route}>{ROUTE_LABELS[route] || route} · #{actualRouteRanks?.[route].rank}</span>)}</div>
               </details>
             </article>

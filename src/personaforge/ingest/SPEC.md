@@ -699,8 +699,11 @@ parent RRF 排名
   - `retrieve_parents(...)`：检索入口。
   - `retrieve_parents_for_queries(...)`：多 query 检索入口，用于 Query Transform 后的 4 路 retrieval query。
   - `query_child_nodes(...)`：调用 Qdrant `query_points`，分别走 `using="dense"` 和 `using="sparse"`。
-  - `fuse_parent_hits(...)`：按首命中折叠 parent，再用 RRF 融合。
-  - `fuse_parent_rankings(...)`：跨 query 的 parent ranking RRF 融合。
+- `fuse_parent_hits(...)`：按首命中折叠 parent，再用 RRF 融合。
+- `fuse_parent_rankings(...)`：跨 query 的 parent ranking RRF 融合。
+- `fuse_transformed_dense_parent_rankings(...)`：只取四个 Query Transform 的 Dense
+  child 排名，先按每个变换查询折叠 Parent，再跨四个查询做 Parent RRF；这是检验
+  “Query Transform 本身”收益的离线对照路线，不改变在线默认的 Dense+Sparse 链路。
   - `load_parents(...)`：从 `parents.jsonl` 回填 parent 全文。
 - `query_understanding.py`
   - `plan_web_search(...)`：第一次 LLM，判断是否需要联网和生成 Tavily query。

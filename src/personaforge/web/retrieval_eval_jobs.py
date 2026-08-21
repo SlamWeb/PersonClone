@@ -281,8 +281,8 @@ class RetrievalEvalJobManager:
             self._stage(job_id, "freezing_snapshot", "正在冻结语料快照")
             freeze_corpus_snapshot(index_dir=paths["index_dir"], dataset_path=paths["dataset"])
 
-            self._stage(job_id, "building_candidate_pool", "正在构建六路候选池")
-            if not paths["six_route_manifest"].exists():
+            self._stage(job_id, "building_candidate_pool", "正在构建七路候选池")
+            if not paths["route_manifest"].exists():
                 self._run_cli(
                     "eval",
                     "retrieval-pool",
@@ -296,7 +296,7 @@ class RetrievalEvalJobManager:
                     "--qdrant-path",
                     str(paths["index_dir"] / "qdrant"),
                     "--out-dir",
-                    str(paths["six_route_dir"]),
+                    str(paths["route_dir"]),
                     "--split",
                     "all",
                     "--model-name",
@@ -309,7 +309,7 @@ class RetrievalEvalJobManager:
             self._stage(job_id, "freezing_exhaustive_pool", "正在冻结 cutoff 前完整材料池")
             if not paths["full_pool_manifest"].exists():
                 build_exhaustive_retrieval_pool(
-                    paths["six_route_manifest"],
+                    paths["route_manifest"],
                     dataset_path=paths["dataset"],
                     index_dir=paths["index_dir"],
                     out_dir=paths["full_pool_dir"],
@@ -452,15 +452,15 @@ class RetrievalEvalJobManager:
     def _paths(self, job: dict[str, Any]) -> dict[str, Path]:
         eval_dir = Path(str(job["eval_dir"]))
         index_dir = self._index_dir(str(job["author"]))
-        six_route_dir = eval_dir / "retrieval_pool" / "all30_six_route_v1"
+        route_dir = eval_dir / "retrieval_pool" / "all_seven_route_v1"
         full_pool_dir = eval_dir / "retrieval_pool" / "all30_exhaustive_qrels_v2"
         return {
             "eval_dir": eval_dir,
             "index_dir": index_dir,
             "dataset": eval_dir / "dataset.jsonl",
             "dataset_manifest": eval_dir / "dataset_manifest.json",
-            "six_route_dir": six_route_dir,
-            "six_route_manifest": six_route_dir / "manifest.json",
+            "route_dir": route_dir,
+            "route_manifest": route_dir / "manifest.json",
             "full_pool_dir": full_pool_dir,
             "full_pool_manifest": full_pool_dir / "manifest.json",
             "gold_units": eval_dir / f"gold_units_{job['split']}_v2.jsonl",

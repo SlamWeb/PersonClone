@@ -33,6 +33,7 @@ class ParentHit:
     title: str
     path: str
     first_hits: list[ChildHit] = field(default_factory=list)
+    evidence_hit: ChildHit | None = None
     parent: dict[str, Any] | None = None
 
 
@@ -337,6 +338,39 @@ def fuse_parent_rankings(
         )
         for index, (parent_id, score) in enumerate(ranked, start=1)
     ]
+
+
+def fuse_transformed_dense_parent_rankings(
+    retrieval_queries: list[RetrievalQuery],
+    child_routes: dict[str, list[ChildHit]],
+    *,
+    rrf_k: int = 60,
+    per_query_parent_k: int = 30,
+    parent_top_k: int = 20,
+) -> list[ParentHit]:
+    """Fuse only the Dense side of each frozen transformed query.
+
+    ``retrieve_parents_for_queries`` computes both Dense and Sparse hits for
+    every transformed query.  This helper projects those same hits onto the
+    Dense-only ablation before doing the existing two-level Parent RRF:
+    first within each transformed query, then across transformed queries.
+    It therefore isolates the effect of query transformation from the effect
+    of adding Sparse retrieval.
+    """
+
+    per_query_rankings: dict[str, list[ParentHit]] = {}
+    for retrieval_query in retrieval_queries:
+        dense_route = f"{retrieval_query.route}:dense"
+        per_query_rankings[retrieval_query.route] = fuse_parent_hits(
+            {dense_route: child_routes.get(dense_route, [])},
+            rrf_k=rrf_k,
+            parent_top_k=per_query_parent_k,
+        )
+    return fuse_parent_rankings(
+        per_query_rankings,
+        rrf_k=rrf_k,
+        parent_top_k=parent_top_k,
+    )
 
 
 def load_parents(path: Path) -> dict[str, dict[str, Any]]:

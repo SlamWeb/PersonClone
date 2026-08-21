@@ -1167,3 +1167,30 @@ Chat 输入长度限制为 4000 个字符。保护层只包 Chat 和登录，不
 字段白名单，不能把用户名、作者名、路径或请求参数直接拼进 SQL。返回统一安全响应头，
 包括 `X-Content-Type-Options`、`X-Frame-Options`、`Referrer-Policy` 和受限的
 `Permissions-Policy`；没有为了不破坏现有 React 静态资源而强行加入 CSP。
+
+### RAG 细粒度报告（2026-08）
+
+LLM 检索报告按“所有作者 / 当前作者 / 当前问题”三层阅读。总览和作者页显示当前
+切分内的 Qrels 分布：已标注、未标注、0 分、1 分、2 分、Useful（1+2）和 Strong（2）。
+逐题页显示同一组数量，并提供当前排名快照中的路线卡、路线选择、Top K 选择和当前路线的材料顺序。
+聚合指标与单题指标不能混在同一张卡中；单题页只显示当前题的路线指标和材料。
+
+每条路线同时展示指数 nDCG 与线性 nDCG：指数 nDCG 使用 0/1/2 对应 0/1/3 的增益，
+线性 nDCG 使用 0/1/2 本身作为增益。前者突出 2 分材料，后者避免把 2 分材料的优势额外放大。
+
+Recall 同时标为“题目宏平均”和“材料微平均”。作者宏平均是跨作者的主要工程比较口径，
+query-parent 微平均只作补充。未标注不等于 0：报告显示未知数量，严格指标只统计没有
+未知干扰的题目，并显示严格计入题数和覆盖情况。所有新增细节均由冻结的 metrics、labels
+和 ranking snapshot 本地计算，不触发检索或 LLM 调用。
+
+七路评估版本额外显示 `transformed_dense_rrf`（四路 Query Transform 仅走 Dense，
+再跨变换查询做 Parent RRF）。它与 `transformed_rrf`（四路 Query Transform 内部 Dense
++ Sparse，再跨查询做 Parent RRF）共享同一份 Query Transform 计划，便于在页面上直接
+观察“查询改写”和“Sparse 融合”的差异。旧六路快照没有该字段时继续按原六路展示，不能
+用前端补造历史排名。
+
+完成的 reranker 排名快照由现有 RAG 报告自动发现，不从网页在线触发模型计算。指标总览
+把每条 `_reranked` 路线紧邻其 baseline 展示，并直接给出 nDCG 与 Useful Precision 的
+差值；逐题页面允许切换重排路线，显示原排名到新排名、cross-encoder 分数、截断状态和
+实际送入模型的 passage。前端只读取本地不可变快照，不能用页面排序结果反写 Qrels 或
+基础排名。

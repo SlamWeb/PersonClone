@@ -21,17 +21,20 @@ from personaforge.eval.retrieval_pool import ROUTE_ORDER
 from personaforge.ingest.embeddings import TextEncoder
 from personaforge.ingest.query_understanding import RetrievalQuery
 from personaforge.ingest.retrieve import (
+    ChildHit,
     ParentHit,
     fuse_parent_hits,
     fuse_parent_rankings,
+    fuse_transformed_dense_parent_rankings,
     load_parents,
     retrieve_parents,
     retrieve_parents_for_queries,
 )
 
 
-RANKING_SCHEMA_VERSION = "personaforge.eval.retrieval_rankings.v1"
-DEFAULT_RANKING_ID = "six_route_parent_top100_v1"
+LEGACY_RANKING_SCHEMA_VERSION = "personaforge.eval.retrieval_rankings.v1"
+RANKING_SCHEMA_VERSION = "personaforge.eval.retrieval_rankings.v2"
+DEFAULT_RANKING_ID = "seven_route_parent_top100_v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,7 +69,7 @@ def build_retrieval_ranking_snapshot(
     *,
     encoder: TextEncoder,
 ) -> RetrievalRankingResult:
-    """Run six routes and freeze ordered Parent rankings.
+    """Run seven routes and freeze ordered Parent rankings.
 
     The input pool must already contain the frozen query traces and qrels
     namespace.  Query understanding is therefore replayed from disk and no
@@ -191,7 +194,10 @@ def build_retrieval_ranking_snapshot(
 def load_ranking_snapshot(manifest_path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     manifest_path = manifest_path.expanduser().resolve()
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("schema_version") != RANKING_SCHEMA_VERSION:
+    if manifest.get("schema_version") not in {
+        LEGACY_RANKING_SCHEMA_VERSION,
+        RANKING_SCHEMA_VERSION,
+    }:
         raise ValueError(f"Unsupported ranking snapshot: {manifest_path}")
     rankings_path = manifest_path.parent / str(manifest.get("rankings_file") or "rankings.jsonl")
     return manifest, _load_jsonl(rankings_path)
@@ -253,19 +259,31 @@ def _rank_one_query(
             rrf_k=rrf_k,
             exclude_parent_ids=excluded_parent_ids,
         )
+        transformed_dense = fuse_transformed_dense_parent_rankings(
+            retrieval_queries,
+            transformed.routes,
+            rrf_k=rrf_k,
+            per_query_parent_k=per_query_parent_k,
+            parent_top_k=depth,
+        )
+        raw_bm25_children = bm25.search(str(record.get("query") or ""), child_top_k=fetch)
         raw_bm25 = fuse_parent_hits(
-            {"raw_bm25": bm25.search(str(record.get("query") or ""), child_top_k=fetch)},
+            {"raw_bm25": raw_bm25_children},
             rrf_k=rrf_k,
             parent_top_k=depth,
         )
         transformed_dense_bm25_per_query: dict[str, list[ParentHit]] = {}
+        transformed_dense_bm25_children: dict[str, list[ChildHit]] = {}
         for retrieval_query in retrieval_queries:
             dense_route = f"{retrieval_query.route}:dense"
             bm25_route = f"{retrieval_query.route}:bm25"
+            bm25_hits = bm25.search(retrieval_query.query, child_top_k=fetch)
+            transformed_dense_bm25_children[dense_route] = transformed.routes.get(dense_route, [])
+            transformed_dense_bm25_children[bm25_route] = bm25_hits
             transformed_dense_bm25_per_query[retrieval_query.route] = fuse_parent_hits(
                 {
                     dense_route: transformed.routes.get(dense_route, []),
-                    bm25_route: bm25.search(retrieval_query.query, child_top_k=fetch),
+                    bm25_route: bm25_hits,
                 },
                 rrf_k=rrf_k,
                 parent_top_k=per_query_parent_k,
@@ -279,10 +297,26 @@ def _rank_one_query(
             "raw_dense": raw_dense,
             "raw_sparse": raw_sparse,
             "raw_hybrid_rrf": raw.parents,
+            "transformed_dense_rrf": transformed_dense,
             "transformed_rrf": transformed.parents,
             "raw_bm25": raw_bm25,
             "transformed_dense_bm25_rrf": transformed_dense_bm25,
         }
+        evidence_routes = {
+            "raw_dense": {"raw_dense": raw.routes.get("dense", [])},
+            "raw_sparse": {"raw_sparse": raw.routes.get("sparse", [])},
+            "raw_hybrid_rrf": raw.routes,
+            "transformed_dense_rrf": {
+                route: hits
+                for route, hits in transformed.routes.items()
+                if route.endswith(":dense")
+            },
+            "transformed_rrf": transformed.routes,
+            "raw_bm25": {"raw_bm25": raw_bm25_children},
+            "transformed_dense_bm25_rrf": transformed_dense_bm25_children,
+        }
+        for route, parent_hits in last_routes.items():
+            _attach_best_evidence(parent_hits, evidence_routes.get(route, {}))
         if all(len(hits) >= target for hits in last_routes.values()) or fetch >= max_child_top_k:
             break
         next_fetch = min(max_child_top_k, max(fetch * 2, fetch + 500))
@@ -305,13 +339,47 @@ def _rank_one_query(
 
 def _serialise_parent_hit(hit: ParentHit, parents_by_id: dict[str, dict[str, Any]]) -> dict[str, Any]:
     parent = parents_by_id.get(hit.parent_id) or {}
-    return {
+    result = {
         "rank": int(hit.rank),
         "parent_id": str(hit.parent_id),
         "score": float(hit.score),
         "title": str(hit.title or parent.get("title") or ""),
         "path": str(hit.path or parent.get("path") or ""),
     }
+    if hit.evidence_hit is not None:
+        result["evidence"] = {
+            "node_id": hit.evidence_hit.node_id,
+            "node_type": hit.evidence_hit.node_type,
+            "route": hit.evidence_hit.route,
+            "rank": int(hit.evidence_hit.rank),
+        }
+    return result
+
+
+def _attach_best_evidence(
+    parent_hits: list[ParentHit],
+    child_routes: dict[str, list[ChildHit]],
+) -> None:
+    """Attach one route-local evidence node without changing RRF scores."""
+
+    best_by_parent: dict[str, tuple[tuple[int, int, str, str], ChildHit]] = {}
+    type_priority = {"passage": 0, "lead": 1, "title": 2}
+    for route, child_hits in child_routes.items():
+        for hit in child_hits:
+            if not hit.parent_id:
+                continue
+            key = (
+                type_priority.get(hit.node_type, 3),
+                int(hit.rank),
+                route,
+                hit.node_id,
+            )
+            current = best_by_parent.get(hit.parent_id)
+            if current is None or key < current[0]:
+                best_by_parent[hit.parent_id] = (key, hit)
+    for parent_hit in parent_hits:
+        selected = best_by_parent.get(parent_hit.parent_id)
+        parent_hit.evidence_hit = selected[1] if selected else None
 
 
 def _retrieval_queries_from_record(record: dict[str, Any]) -> list[RetrievalQuery]:

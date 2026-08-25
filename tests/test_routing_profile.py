@@ -32,6 +32,21 @@ class FakeEncoder:
         ]
 
 
+class FakeQdrant:
+    def __init__(self) -> None:
+        self.deleted: list[str] = []
+
+    def scroll(self, **_kwargs):
+        class Point:
+            def __init__(self, point_id: str) -> None:
+                self.id = point_id
+
+        return [Point("keep"), Point("stale-same-corpus"), Point("stale-old-corpus")], None
+
+    def delete(self, *, points_selector, **_kwargs) -> None:
+        self.deleted.extend(points_selector)
+
+
 def test_title_cleaning_filters_empty_and_exact_duplicates() -> None:
     rows = [
         {"doc_id": "b", "kind": "answer", "title": "  A\u3000title  ", "updated_at": "2"},
@@ -115,6 +130,19 @@ def test_profile_serialization_and_reuse(tmp_path: Path) -> None:
     second = builder.build()
     assert second.status == "reused"
     assert encoder.calls == calls
+
+
+def test_qdrant_cleanup_keeps_only_active_point_ids(tmp_path: Path) -> None:
+    qdrant = FakeQdrant()
+    builder = RoutingProfileBuilder(
+        data_dir=tmp_path,
+        author_id="demo",
+        encoder=FakeEncoder(),
+        qdrant_client=qdrant,
+        persist_qdrant=True,
+    )
+    builder._cleanup_old_points(active_point_ids={"keep"})
+    assert qdrant.deleted == ["stale-same-corpus", "stale-old-corpus"]
 
 
 def test_agglomerative_configuration_is_used_when_dependency_available() -> None:

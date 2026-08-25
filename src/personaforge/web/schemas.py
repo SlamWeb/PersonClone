@@ -71,6 +71,8 @@ class RoutingProfileRebuildRequest(BaseModel):
     force: bool = False
     distance_threshold: float = Field(default=0.32, gt=0, lt=2)
     min_cluster_size: int = Field(default=3, ge=2, le=100)
+    schema_candidates_per_cluster: int = Field(default=5, ge=1, le=20)
+    schema_max_documents: int = Field(default=72, ge=1, le=200)
 
 
 class RoutingProfileResponse(BaseModel):

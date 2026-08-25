@@ -67,6 +67,11 @@ from personaforge.persona.routing_profile import (
     RoutingProfileBuilder,
     load_routing_profile,
 )
+from personaforge.persona.narrative_builder import (
+    NarrativeSchemaBuildError,
+    NarrativeSchemaBuilder,
+    NarrativeSchemaSelectionConfig,
+)
 from personaforge.web.streaming import sse_event
 from personaforge.web.deployment_guard import (
     DeploymentGuard,
@@ -737,15 +742,41 @@ def create_app(
             except Exception:
                 # Domain vectors and evidence remain useful without an LLM.
                 llm = None
+            encoder = service.embedding_encoder()
+            schema_config_hash = "llm-disabled"
+            if llm is not None:
+                schema_builder = NarrativeSchemaBuilder(
+                    data_dir=config.data_dir,
+                    author_id=safe_author,
+                    encoder=encoder,
+                    llm=llm,
+                    model_name=config.model_name,
+                    embedding_batch_size=config.index_batch_size,
+                    distance_threshold=request.distance_threshold,
+                    min_cluster_size=request.min_cluster_size,
+                    selection=NarrativeSchemaSelectionConfig(
+                        candidates_per_cluster=request.schema_candidates_per_cluster,
+                        max_documents=request.schema_max_documents,
+                    ),
+                )
+                schema_config_hash = schema_builder.config_hash
+                try:
+                    schema_builder.build(force=request.force)
+                except NarrativeSchemaBuildError:
+                    # Keep the existing routing contract available even when
+                    # a provider call fails; the profile records pending
+                    # perspectives while domain vectors remain rebuildable.
+                    pass
             builder = RoutingProfileBuilder(
                 data_dir=config.data_dir,
                 author_id=safe_author,
-                encoder=service.embedding_encoder(),
+                encoder=encoder,
                 llm=llm,
                 model_name=config.model_name,
                 embedding_batch_size=config.index_batch_size,
                 distance_threshold=request.distance_threshold,
                 min_cluster_size=request.min_cluster_size,
+                schema_config_hash=schema_config_hash,
             )
             result = builder.build(force=request.force)
             return RoutingProfileResponse(status=result.status, profile=result.profile)

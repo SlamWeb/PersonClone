@@ -24,6 +24,11 @@ from personaforge.ingest.retrieve import retrieve_parents, retrieve_parents_for_
 from personaforge.llm import DeepSeekJsonClient
 from personaforge.persona.narrative import load_narrative_schema, load_narrative_schema_for_index
 from personaforge.persona.pack import load_persona_pack_for_index
+from personaforge.persona.narrative_builder import (
+    NarrativeSchemaBuildError,
+    NarrativeSchemaBuilder,
+    NarrativeSchemaSelectionConfig,
+)
 from personaforge.persona.routing_profile import RoutingProfileBuilder
 from personaforge.persona.suggestions import generate_suggestions
 from personaforge.persona.writer import WRITER_PROMPT_CHOICES, build_prompt_pack, generate_answer
@@ -551,6 +556,18 @@ def build_parser() -> argparse.ArgumentParser:
     routing_parser.add_argument("--batch-size", type=int, default=12)
     routing_parser.add_argument("--distance-threshold", type=float, default=0.32)
     routing_parser.add_argument("--min-cluster-size", type=int, default=3)
+    routing_parser.add_argument(
+        "--schema-candidates-per-cluster",
+        type=int,
+        default=5,
+        help="Full parent documents considered per title cluster for NarrativeSchema.",
+    )
+    routing_parser.add_argument(
+        "--schema-max-documents",
+        type=int,
+        default=72,
+        help="Global cap on full parent documents sent to NarrativeSchema generation.",
+    )
     routing_parser.add_argument("--force", action="store_true", help="Ignore an unchanged cached profile.")
     routing_parser.add_argument("--no-llm", action="store_true", help="Use provisional labels and skip LLM calls.")
 
@@ -1751,6 +1768,31 @@ def _run_routing_profile(args: argparse.Namespace) -> int:
             llm = DeepSeekJsonClient.from_env()
         except Exception:
             llm = None
+    schema_result = None
+    schema_config_hash = "llm-disabled"
+    if llm is not None:
+        schema_builder = NarrativeSchemaBuilder(
+            data_dir=data_dir,
+            author_id=author,
+            encoder=encoder,
+            llm=llm,
+            model_name=args.model_name,
+            embedding_batch_size=args.batch_size,
+            distance_threshold=args.distance_threshold,
+            min_cluster_size=args.min_cluster_size,
+            selection=NarrativeSchemaSelectionConfig(
+                candidates_per_cluster=args.schema_candidates_per_cluster,
+                max_documents=args.schema_max_documents,
+            ),
+        )
+        schema_config_hash = schema_builder.config_hash
+        try:
+            schema_result = schema_builder.build(force=args.force)
+        except NarrativeSchemaBuildError as exc:
+            # The routing profile remains useful when the LLM is unavailable
+            # or returns an unusable schema: domains still get vectors and
+            # perspective status is explicit in the profile.
+            print(f"Narrative schema skipped: {exc}")
     result = RoutingProfileBuilder(
         data_dir=data_dir,
         author_id=author,
@@ -1760,6 +1802,7 @@ def _run_routing_profile(args: argparse.Namespace) -> int:
         embedding_batch_size=args.batch_size,
         distance_threshold=args.distance_threshold,
         min_cluster_size=args.min_cluster_size,
+        schema_config_hash=schema_config_hash,
     ).build(force=args.force)
     profile = result.profile
     print(f"Routing profile {result.status}: {profile.author_id}")
@@ -1769,6 +1812,14 @@ def _run_routing_profile(args: argparse.Namespace) -> int:
         print(f"  - {prototype.label}: {titles}")
     print(f"- perspective prototypes: {len(profile.perspective_prototypes)}")
     print(f"- status: {profile.status}")
+    if schema_result is not None:
+        print(
+            f"- narrative schema: {schema_result.status} "
+            f"({schema_result.schema.facet_count} facets, "
+            f"{schema_result.selected_document_count} selected parents, "
+            f"{schema_result.llm_calls} LLM calls)"
+        )
+        print(f"- narrative schema file: {schema_result.schema_path}")
     print(f"- profile: {result.profile_path}")
     print(f"- qdrant collection: {profile.qdrant_collection}")
     return 0

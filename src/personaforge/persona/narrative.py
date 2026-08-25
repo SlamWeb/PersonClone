@@ -192,7 +192,7 @@ def render_narrative_schema_prompt(schema: NarrativeSchema) -> str:
         "## Narrative Schema（长期叙事记忆）",
         "",
         "这是一份从该创作者公开表达中归纳出的长期记忆，不是答案模板，也不是每次都要执行的清单。",
-        "当前问题和本轮检索到的作者原文优先；只有相关的记忆才被激活。",
+        "完整 Schema 对模型可见；当前问题和本轮检索到的作者原文优先，模型可按相关性参考，不必平均使用全部记忆。",
         "",
         f"身份锚点：{schema.identity.get('public_identity') or schema.display_name}",
         f"全局叙事概括：{schema.global_summary}",
@@ -200,7 +200,7 @@ def render_narrative_schema_prompt(schema: NarrativeSchema) -> str:
         "核心稳定倾向：",
     ]
     parts.extend(f"- {trait}" for trait in schema.core_traits)
-    parts.extend(["", "场景记忆（只选择与当前问题相符的少量部分）："])
+    parts.extend(["", "场景记忆（完整列出，仅按当前问题相关性参考）："])
     for facet in schema.scene_facets:
         parts.extend(
             [
@@ -218,7 +218,7 @@ def render_narrative_schema_prompt(schema: NarrativeSchema) -> str:
             "",
             "### Magic-If 执行协议",
             "1. Anchoring：先根据当前问题、本轮作者原文和身份锚点判断‘我是谁’。",
-            "2. Selecting：只选与当前情境相关的场景记忆，不平均融合所有记忆。",
+            "2. Selecting：从完整 Schema 中按当前情境选择有帮助的场景记忆，不平均融合所有记忆。",
             "3. Bounding：不超出记忆的适用主题、时间范围和已知边界；缺少证据时不要装作知道。",
             "4. Enacting：把选中的判断方式自然地写进回答，不解释记忆、不复述 schema、不拼贴证据摘录。",
             "",

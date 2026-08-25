@@ -164,7 +164,7 @@ data/authors/zhihu/<author>/narrative_schema.json
 
 `narrative.py` 负责解析、哈希、证据核验和 writer 渲染。渲染时不会把文档 ID 或证据摘录送给 writer，避免模型拼贴原句；证据只用于审计和时间切分防泄漏。
 
-当前 `wu-ren-jun-28/narrative_schema.json` 是从已审核的 `persona_pack.json` 迁移出的 `evidence_backed_bootstrap_v1`，Persona Pack 只是迁移输入，不是 `mrprompt` 的运行时依赖。它不是自动画像器，也不宣称已经找到了因果特征；后续作者扩展应继续人工审核并绑定训练期证据。
+当前 `wu-ren-jun-28/narrative_schema.json` 是从已审核的 `persona_pack.json` 迁移出的 `evidence_backed_bootstrap_v1`，Persona Pack 只是迁移输入，不是 `mrprompt` 的运行时依赖。新作者可以通过 `pf routing-profile <author>` 或 Web rebuild 自动生成同一格式的 `evidence_backed_representative_v1`：先对 answer/article 标题做 BGE-M3 + cosine agglomerative clustering，再从每个领域簇挑选最多 5 篇中心性优先、互动数据辅助的完整 parent，默认全局最多 72 篇。完整正文只在生成请求期间存在，落盘 Schema 只保留短摘录和 doc_id，并在写入前逐字核验。标题聚类只决定取材范围，不直接推断人格；facet 是一次作者级结构化提炼的场景视角，不要求每个领域对应一个 facet。
 
 `mrprompt` 的运行时优先级为：
 
@@ -175,7 +175,7 @@ data/authors/zhihu/<author>/narrative_schema.json
 模型内部执行四步：
 
 1. Anchoring：根据当前问题、本轮原文和身份锚点确定此刻的观察位置。
-2. Selecting：只激活相关场景记忆，不平均融合所有 facet。
+2. Selecting：完整 Schema 会注入上下文，再按当前情境选择有帮助的场景记忆，不平均融合所有 facet。
 3. Bounding：遵守适用主题、时间和知识边界，不补写私人经历或实时事实。
 4. Enacting：把判断动作和表达信号自然写进回答，不解释 schema 或生成过程。
 
@@ -225,13 +225,22 @@ data/authors/zhihu/<author>/narrative_schema.json
 - `verify_narrative_schema_evidence(...)`：逐字核验 facet 的训练期证据。
 - `render_narrative_schema_prompt(...)`：只渲染可用于写作的场景记忆，不渲染审计摘录。
 
+### `narrative_builder.py`
+
+- `NarrativeSchemaBuilder`：读取 `index/parents.jsonl`，复用标题清洗、BGE-M3 和
+  AgglomerativeClustering，按每簇最多 5 篇、全局最多 72 篇选择代表 parent，并调用一次
+  结构化 LLM 生成作者级 Schema。
+- 全文只进入临时请求；写盘前通过 `load_narrative_schema(...,
+  verify_evidence=True)` 核验，JSON 只保存字段、短 excerpt、doc_id 和 corpus/config 元数据。
+- 画像缓存同时检查 `corpus_version` 和 builder config hash；Schema 失败不覆盖旧文件。
+
 ## 后续不进入当前版本的能力
 
 - judge/rewrite 在线闭环。
 - 多轮 session memory。
 - 长度控制前端选项。
 - 多 provider 完整抽象。
-- 自动 Narrative Schema 构建器与人工审核工作台。
+- Narrative Schema 人工审核工作台（自动构建器已支持 CLI/Web rebuild，人工审核 UI 暂缓）。
 
 ## 强效双上下文实验分支
 

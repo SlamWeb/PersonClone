@@ -65,6 +65,7 @@ pf build       Markdown -> parent/child 节点和构建清单
 pf index       节点 -> embedding -> Qdrant collection
 pf retrieve    只测试召回，不生成回答
 pf ask         召回并调用 Writer 生成一条回答
+pf routing-profile <author>  构建/复用作者 Narrative Schema 与 CreatorOS 路由画像
 pf eval        准备冻结数据集、生成评测结果、建立候选池、运行 judge
 pf web         启动 FastAPI 和已构建的 React 页面
 pf forge       按顺序执行抓取、构建、索引和启动 Web
@@ -135,6 +136,7 @@ data/authors/zhihu/<author-token>/index/
 |---|---|
 | `writer.py` | 生成 prompt、组装上下文、调用 LLM、执行回答策略和 MRPrompt 流程 |
 | `narrative.py` | 读取 Narrative Schema，并提供作者叙事信息 |
+| `narrative_builder.py` | 从标题聚类的代表 parent 全文生成、校验并缓存作者级 Narrative Schema |
 | `pack.py` | 兼容旧版 Persona Pack |
 | `routing_profile.py` | 生成、更新并查询供 CreatorOS 使用的 domain/perspective 原型；不改变问答 RAG |
 | `suggestions.py` | 生成产品页面上的建议问题 |
@@ -160,7 +162,9 @@ index/parents.jsonl
 -> answer/article 标题清洗与完全去重
 -> 复用 BGE-M3 dense + L2 normalization
 -> AgglomerativeClustering domain prototypes
--> NarrativeSchema / PersonaPack / 分层代表标题抽取 perspective prototypes
+-> 每簇最多 5 篇中心性优先、互动辅助的 parent（全局默认最多 72 篇）
+-> NarrativeSchema（完整代表 parent 只在 LLM 请求期间使用）
+-> NarrativeSchema facets -> perspective prototypes
 -> routing_profile.json（无原始 float）
 -> creator_routing_profiles（全局 Qdrant，按 corpus_version 原子更新）
 ```
@@ -376,6 +380,7 @@ tests/test_query_understanding.py  联网判断、背景和 query transform
 tests/test_writer.py          Writer 和生成 prompt
 tests/test_persona_pack.py    Persona Pack
 tests/test_narrative_schema.py Narrative Schema
+tests/test_narrative_builder.py 自动 Schema 代表材料选择、生成、校验和缓存复用
 tests/test_eval*.py           离线评测 runner、replay 和候选池
 tests/test_retrieval_*.py     RAG 候选池与评估 Web 后端
 tests/test_generation_evaluation.py Generate 评估与 judge 任务

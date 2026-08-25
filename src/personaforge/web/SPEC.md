@@ -1207,6 +1207,11 @@ POST /api/personas/{author}/routing-profile/rebuild
 ```
 
 GET 需要登录，POST 需要管理员权限。rebuild 可以在 corpus 变化或 `force=true` 时执行；
-未变化且配置未变化会复用已有画像。接口只返回 domain/perspective 原型、证据索引和
-Qdrant point reference，不返回原始文章正文或 float 向量。热点发现、最终作者选择和内容
-生成属于未来 CreatorOS，不在 PersonClone Web 路由实现。
+未变化且配置未变化会复用已有画像。rebuild 在存在 LLM 配置时会先运行同一作者级
+NarrativeSchema 构建：每个标题簇最多取 5 篇完整 parent，默认全局最多 72 篇；全文只在
+LLM 请求期间使用，落盘 Schema 只保留可逐字核验的 `doc_id + excerpt`。LLM 不可用或调用
+失败时不会阻塞领域向量，画像会明确保留 `domain_ready`/`perspective_pending` 状态。
+请求可用 `schema_candidates_per_cluster` 与 `schema_max_documents` 调整该上限。接口只
+返回 domain/perspective 原型、证据索引和 Qdrant point reference，不返回原始文章正文或
+float 向量。热点发现、最终作者选择和内容生成属于未来 CreatorOS，不在 PersonClone Web
+路由实现。

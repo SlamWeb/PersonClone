@@ -135,6 +135,12 @@ class TitleEvidence(BaseModel):
     kind: str
     updated_at: str | None = None
     source: str = "zhihu"
+    created_at: str | None = None
+    text: str = ""
+    like_count: int = 0
+    comment_count: int = 0
+    reaction_count: int = 0
+    repin_count: int = 0
 
 
 def normalize_title(value: str | None) -> str:
@@ -171,6 +177,12 @@ def clean_title_evidence(rows: Iterable[dict[str, Any] | Any]) -> list[TitleEvid
             kind=kind,
             updated_at=_optional_text(get("updated_at")),
             source=str(get("source", "zhihu") or "zhihu"),
+            created_at=_optional_text(get("created_at")),
+            text=str(get("text", "") or get("markdown", "") or ""),
+            like_count=_metadata_count(get, "like_count"),
+            comment_count=_metadata_count(get, "comment_count"),
+            reaction_count=_metadata_count(get, "reaction_count"),
+            repin_count=_metadata_count(get, "repin_count"),
         )
         if not candidate.doc_id:
             continue
@@ -221,7 +233,26 @@ def _representatives(
 ) -> list[TitleEvidence]:
     center = np.asarray(_normalized_centroid(vectors), dtype=np.float32)
     scores = np.asarray(vectors, dtype=np.float32) @ center
-    order = sorted(range(len(evidence)), key=lambda index: (-float(scores[index]), evidence[index].doc_id))
+    engagement = np.asarray([_engagement_score(item) for item in evidence], dtype=np.float32)
+    max_engagement = float(engagement.max()) if len(engagement) else 0.0
+    if max_engagement > 0:
+        engagement = engagement / max_engagement
+    completeness = np.asarray(
+        [min(1.0, math.log1p(len(item.text)) / math.log1p(12000)) for item in evidence],
+        dtype=np.float32,
+    )
+    # The contract is nearest-to-centre first.  Engagement and completeness
+    # only break ties/order equally central candidates; they must not turn a
+    # popular but semantically distant title into a domain representative.
+    order = sorted(
+        range(len(evidence)),
+        key=lambda index: (
+            -float(scores[index]),
+            -float(engagement[index]),
+            -float(completeness[index]),
+            evidence[index].doc_id,
+        ),
+    )
     return [evidence[index] for index in order[: max(3, min(limit, len(order)))]]
 
 
@@ -317,6 +348,7 @@ class RoutingProfileBuilder:
         qdrant_path: Path | None = None,
         qdrant_client: Any | None = None,
         persist_qdrant: bool = True,
+        schema_config_hash: str | None = None,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.author_id = author_id
@@ -335,6 +367,10 @@ class RoutingProfileBuilder:
         self.qdrant_path = Path(qdrant_path or self.data_dir / "system" / "routing_qdrant")
         self.qdrant_client = qdrant_client
         self.persist_qdrant = persist_qdrant
+        # NarrativeSchema is an input to perspective prototypes.  Include the
+        # builder configuration in this profile's cache key so a schema
+        # rebuild with the same corpus cannot leave an older profile reused.
+        self.schema_config_hash = schema_config_hash or "none"
 
     @property
     def author_dir(self) -> Path:
@@ -352,11 +388,13 @@ class RoutingProfileBuilder:
     def config_hash(self) -> str:
         config = {
             "schema_version": ROUTING_PROFILE_SCHEMA_VERSION,
+            "builder_version": 2,
             "model_name": self.model_name,
             "distance_threshold": self.distance_threshold,
             "min_cluster_size": self.min_cluster_size,
             "embedding_batch_size": self.embedding_batch_size,
             "llm_enabled": self.llm is not None,
+            "schema_config_hash": self.schema_config_hash,
         }
         return hashlib.sha256(json.dumps(config, sort_keys=True).encode("utf-8")).hexdigest()[:20]
 
@@ -385,7 +423,7 @@ class RoutingProfileBuilder:
             distance_threshold=self.distance_threshold,
             min_cluster_size=self.min_cluster_size,
         )
-        narrative = self._load_narrative()
+        narrative = self._load_narrative(corpus_version)
         pack = self._load_pack() if narrative is None else None
         domain_specs = self._domain_specs(clusters)
         perspective_specs, perspective_status = self._perspective_specs(
@@ -461,7 +499,11 @@ class RoutingProfileBuilder:
         )
         self._atomic_write(profile)
         if self.persist_qdrant:
-            self._cleanup_old_points(corpus_version)
+            active_point_ids = {
+                prototype.vector_ref.point_id
+                for prototype in (*domain_prototypes, *perspective_prototypes)
+            }
+            self._cleanup_old_points(active_point_ids=active_point_ids)
         return RoutingProfileResult(status="rebuilt", profile=profile, profile_path=str(self.profile_path))
 
     def _load_parent_rows(self) -> list[dict[str, Any]]:
@@ -477,9 +519,18 @@ class RoutingProfileBuilder:
         raw_dir = self.author_dir / "raw"
         return [item.to_dict() for item in load_parent_documents(raw_dir)]
 
-    def _load_narrative(self) -> NarrativeSchema | None:
+    def _load_narrative(self, corpus_version: str | None = None) -> NarrativeSchema | None:
         try:
-            return load_narrative_schema_for_index(self.index_dir, required=False)
+            schema = load_narrative_schema_for_index(self.index_dir, required=False)
+            if schema is None or corpus_version is None:
+                return schema
+            # Legacy/manual schemas do not carry a corpus_version and remain
+            # valid.  Generated schemas do, and must not silently describe a
+            # stale corpus after an author update.
+            schema_version = schema.corpus_snapshot.get("corpus_version")
+            if schema_version and schema_version != corpus_version:
+                return None
+            return schema
         except Exception:
             return None
 
@@ -745,16 +796,32 @@ class RoutingProfileBuilder:
         if points:
             client.upsert(collection_name=ROUTING_COLLECTION, points=points, wait=True)
 
-    def _cleanup_old_points(self, corpus_version: str) -> None:
+    def _cleanup_old_points(self, *, active_point_ids: set[str]) -> None:
         if self.qdrant_client is None:
             return
         from qdrant_client import models
 
+        # Deleting by corpus_version alone misses stale prototypes created by
+        # an older schema/profile build against the same corpus snapshot.  We
+        # retain exactly the point IDs written by this build and remove every
+        # other point belonging to the author.
         selector = models.Filter(
             must=[models.FieldCondition(key="author_id", match=models.MatchValue(value=self.author_id))],
-            must_not=[models.FieldCondition(key="corpus_version", match=models.MatchValue(value=corpus_version))],
         )
-        self.qdrant_client.delete(collection_name=ROUTING_COLLECTION, points_selector=selector, wait=True)
+        stale_points, _ = self.qdrant_client.scroll(
+            collection_name=ROUTING_COLLECTION,
+            scroll_filter=selector,
+            limit=10_000,
+            with_payload=False,
+            with_vectors=False,
+        )
+        stale_ids = [str(point.id) for point in stale_points if str(point.id) not in active_point_ids]
+        if stale_ids:
+            self.qdrant_client.delete(
+                collection_name=ROUTING_COLLECTION,
+                points_selector=stale_ids,
+                wait=True,
+            )
 
     def _atomic_write(self, profile: AuthorRoutingProfile) -> None:
         self.profile_path.parent.mkdir(parents=True, exist_ok=True)
@@ -789,6 +856,31 @@ def load_routing_profile(data_dir: Path, author_id: str) -> AuthorRoutingProfile
 def _optional_text(value: Any) -> str | None:
     text = str(value or "").strip()
     return text or None
+
+
+def _metadata_count(getter: Any, key: str) -> int:
+    """Read an engagement count from a parent row or its metadata object."""
+
+    raw = getter(key, None)
+    if raw is None:
+        metadata = getter("metadata", {})
+        if isinstance(metadata, dict):
+            raw = metadata.get(key)
+    try:
+        return max(0, int(raw or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _engagement_score(item: TitleEvidence) -> float:
+    """Log-scaled engagement score used only as a representative tie-breaker."""
+
+    return math.log1p(
+        item.like_count
+        + 0.5 * item.comment_count
+        + 0.5 * item.reaction_count
+        + 0.25 * item.repin_count
+    )
 
 
 def _text_list(value: Any) -> list[str]:

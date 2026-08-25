@@ -24,6 +24,7 @@ from personaforge.ingest.retrieve import retrieve_parents, retrieve_parents_for_
 from personaforge.llm import DeepSeekJsonClient
 from personaforge.persona.narrative import load_narrative_schema, load_narrative_schema_for_index
 from personaforge.persona.pack import load_persona_pack_for_index
+from personaforge.persona.routing_profile import RoutingProfileBuilder
 from personaforge.persona.suggestions import generate_suggestions
 from personaforge.persona.writer import WRITER_PROMPT_CHOICES, build_prompt_pack, generate_answer
 
@@ -539,6 +540,20 @@ def build_parser() -> argparse.ArgumentParser:
     eval_pairwise_import_parser.add_argument("--responses", required=True)
     eval_pairwise_import_parser.add_argument("--out-file")
 
+    routing_parser = subparsers.add_parser(
+        "routing-profile", help="Build or reuse an author profile for external CreatorOS routing."
+    )
+    routing_parser.add_argument("author", help="Creator token.")
+    routing_parser.add_argument("--data-dir", default="data", help="Local data root.")
+    routing_parser.add_argument("--model-name", default="BAAI/bge-m3")
+    routing_parser.add_argument("--embedding-device", choices=["auto", "cpu", "cuda"], default="auto")
+    routing_parser.add_argument("--no-fp16", action="store_true")
+    routing_parser.add_argument("--batch-size", type=int, default=12)
+    routing_parser.add_argument("--distance-threshold", type=float, default=0.32)
+    routing_parser.add_argument("--min-cluster-size", type=int, default=3)
+    routing_parser.add_argument("--force", action="store_true", help="Ignore an unchanged cached profile.")
+    routing_parser.add_argument("--no-llm", action="store_true", help="Use provisional labels and skip LLM calls.")
+
     web_parser = subparsers.add_parser("web", help="Start the local Web UI.")
     web_parser.add_argument("author", nargs="?", help="Creator token.")
     web_parser.add_argument(
@@ -685,6 +700,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "eval":
         return _run_eval(args)
+
+    if args.command == "routing-profile":
+        return _run_routing_profile(args)
 
     if args.command == "web":
         return _run_web(args)
@@ -1717,6 +1735,43 @@ def _write_prompt_pack_trace(
         "narrative_schema_sha256": narrative_schema_sha256,
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8", newline="\n")
+
+
+def _run_routing_profile(args: argparse.Namespace) -> int:
+    author = parse_user_token(args.author)
+    data_dir = Path(args.data_dir)
+    encoder = BgeM3Encoder(
+        args.model_name,
+        device=args.embedding_device,
+        use_fp16=not args.no_fp16,
+    )
+    llm = None
+    if not args.no_llm:
+        try:
+            llm = DeepSeekJsonClient.from_env()
+        except Exception:
+            llm = None
+    result = RoutingProfileBuilder(
+        data_dir=data_dir,
+        author_id=author,
+        encoder=encoder,
+        llm=llm,
+        model_name=args.model_name,
+        embedding_batch_size=args.batch_size,
+        distance_threshold=args.distance_threshold,
+        min_cluster_size=args.min_cluster_size,
+    ).build(force=args.force)
+    profile = result.profile
+    print(f"Routing profile {result.status}: {profile.author_id}")
+    print(f"- domain prototypes: {len(profile.domain_prototypes)}")
+    for prototype in profile.domain_prototypes:
+        titles = "; ".join(item.title for item in prototype.representative_evidence)
+        print(f"  - {prototype.label}: {titles}")
+    print(f"- perspective prototypes: {len(profile.perspective_prototypes)}")
+    print(f"- status: {profile.status}")
+    print(f"- profile: {result.profile_path}")
+    print(f"- qdrant collection: {profile.qdrant_collection}")
+    return 0
 
 
 def _run_web(args: argparse.Namespace) -> int:

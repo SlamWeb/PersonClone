@@ -35,6 +35,8 @@ from personaforge.web.schemas import (
     LoginRequest,
     PersonaInfo,
     PersonasResponse,
+    RoutingProfileRebuildRequest,
+    RoutingProfileResponse,
     SuggestionsResponse,
     SessionsResponse,
     TurnRunResponse,
@@ -59,8 +61,12 @@ from personaforge.web.author_jobs import (
 )
 from personaforge.web.chat_tasks import ChatTaskManager
 from personaforge.web.conversations import ConversationBusyError, TurnRun
-from personaforge.web.auth import AuthStore, AuthUser
+from personaforge.web.auth import AuthStore, AuthUser, DailyChatQuotaExceeded
 from personaforge.web.service import ChatProgress, PreparedChat, PersonaChatService, WebConfig, sources_from_parent_hits
+from personaforge.persona.routing_profile import (
+    RoutingProfileBuilder,
+    load_routing_profile,
+)
 from personaforge.web.streaming import sse_event
 from personaforge.web.deployment_guard import (
     DeploymentGuard,
@@ -700,6 +706,55 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.get("/api/personas/{author}/routing-profile", response_model=RoutingProfileResponse)
+    def routing_profile(author: str, _user: AuthUser = Depends(current_user)) -> RoutingProfileResponse:
+        try:
+            safe_author = safe_author_token(author)
+            profile = load_routing_profile(config.data_dir, safe_author)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Routing profile not found") from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail="Routing profile is invalid") from exc
+        return RoutingProfileResponse(
+            status="reused",
+            profile=profile,
+        )
+
+    @app.post("/api/personas/{author}/routing-profile/rebuild", response_model=RoutingProfileResponse)
+    def rebuild_routing_profile(
+        author: str,
+        request: RoutingProfileRebuildRequest,
+        _admin: AuthUser = Depends(current_admin),
+    ) -> RoutingProfileResponse:
+        try:
+            safe_author = safe_author_token(author)
+            llm = None
+            try:
+                llm = service.llm_client()
+            except Exception:
+                # Domain vectors and evidence remain useful without an LLM.
+                llm = None
+            builder = RoutingProfileBuilder(
+                data_dir=config.data_dir,
+                author_id=safe_author,
+                encoder=service.embedding_encoder(),
+                llm=llm,
+                model_name=config.model_name,
+                embedding_batch_size=config.index_batch_size,
+                distance_threshold=request.distance_threshold,
+                min_cluster_size=request.min_cluster_size,
+            )
+            result = builder.build(force=request.force)
+            return RoutingProfileResponse(status=result.status, profile=result.profile)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Author index not found") from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     @app.get("/api/personas/{author}/avatar")
     def persona_avatar(author: str, _user: AuthUser = Depends(current_user)) -> FileResponse:

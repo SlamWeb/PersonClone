@@ -8,6 +8,7 @@
 
 ```text
 内容入库主线：知乎内容 -> Markdown -> parent/child 节点 -> BGE-M3 -> Qdrant
+作者路由画像：parents.jsonl 标题 -> BGE-M3 聚类 + Narrative/Pack -> routing_profile.json + creator_routing_profiles
 产品对话主线：用户问题 -> query understanding/transform -> 检索 -> Narrative Schema -> Writer -> 流式回答
 质量验证主线：冻结问题 -> 检索候选池/生成结果 -> 人工或 LLM 评分 -> 可复现结果
 ```
@@ -135,6 +136,7 @@ data/authors/zhihu/<author-token>/index/
 | `writer.py` | 生成 prompt、组装上下文、调用 LLM、执行回答策略和 MRPrompt 流程 |
 | `narrative.py` | 读取 Narrative Schema，并提供作者叙事信息 |
 | `pack.py` | 兼容旧版 Persona Pack |
+| `routing_profile.py` | 生成、更新并查询供 CreatorOS 使用的 domain/perspective 原型；不改变问答 RAG |
 | `suggestions.py` | 生成产品页面上的建议问题 |
 | `SPEC.md` | Persona Pack、Narrative Schema、writer 和 RAG 上下文边界 |
 
@@ -150,6 +152,21 @@ data/authors/zhihu/<author-token>/index/
 -> LLM provider
 -> 回答和 trace
 ```
+
+作者路由画像走独立的离线/管理员重建链路，不阻塞现有添加作者任务：
+
+```text
+index/parents.jsonl
+-> answer/article 标题清洗与完全去重
+-> 复用 BGE-M3 dense + L2 normalization
+-> AgglomerativeClustering domain prototypes
+-> NarrativeSchema / PersonaPack / 分层代表标题抽取 perspective prototypes
+-> routing_profile.json（无原始 float）
+-> creator_routing_profiles（全局 Qdrant，按 corpus_version 原子更新）
+```
+
+CreatorOS 通过 `GET/POST /api/personas/{author}/routing-profile` 使用稳定 API，不能直接
+读取 `data/authors` 内部文件；热点发现、最终作者排序和内容生成不属于 PersonClone。
 
 在线生成的完整架构已经拆成三张可读图，包含请求 JSON、Turn Planner 输出、四路
 Query Transform、两级 Parent RRF、MRPrompt 消息数组、流式生成和回答后的记忆维护：

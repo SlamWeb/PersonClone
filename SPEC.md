@@ -224,6 +224,34 @@ passage 切片原则：
 - 超过目标长度时按长度切分。
 - child node 只用于检索，最终上下文回填 parent 或 parent 片段。
 
+### 8.1 AuthorRoutingProfile（CreatorOS 集成边界）
+
+PersonClone 另提供作者路由画像，但不改变上述问答 RAG：
+
+```text
+parents.jsonl 的 answer/article 标题
+-> 清洗、规范化、完全去重
+-> 复用 BGE-M3 dense + L2 normalization
+-> AgglomerativeClustering（cosine / average / threshold=0.32）
+-> domain_prototypes + NarrativeSchema/PersonaPack perspective_prototypes
+-> routing_profile.json + creator_routing_profiles Qdrant collection
+```
+
+`domain_prototypes` 只描述作者写过的领域；`perspective_prototypes` 只来自经过证据核验的
+Narrative Schema、Persona Pack，或明确列出代表 `doc_id` 的分层抽样。画像不把所有内容平均
+成一个作者向量，也不把原始 float 向量写进 JSON。更新由排序后的 `doc_id + updated_at`
+生成 `corpus_version`，新版本成功写入 Qdrant 后才清理该作者旧版本；未变化时直接复用。
+
+画像落在既有作者目录 `data/authors/zhihu/<author>/routing_profile.json`，外部 CreatorOS
+只能使用以下 API，不能读取 PersonClone 内部文件：
+
+```text
+GET  /api/personas/{author}/routing-profile
+POST /api/personas/{author}/routing-profile/rebuild
+```
+
+CreatorOS 负责热点发现、候选召回、最终决策和内容生成；PersonClone 本次不实现这些能力。
+
 ## 9. Query 与 RAG
 
 MVP 默认 RAG 路线：

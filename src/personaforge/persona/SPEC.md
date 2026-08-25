@@ -261,3 +261,31 @@ Web 通过扫描已完成的 run manifest 自动发现它们；新增实验必�
 整体交给一条身份化 Prompt，不做 Persona Pack、Narrative Schema、表达选择或内容
 规划；正式评测使用 `query_mode=raw` 以保持变量边界清楚。它只通过评估 Runner
 注册为独立 run，不改变默认 Chat。
+
+## AuthorRoutingProfile（CreatorOS 边界）
+
+`routing_profile.py` 负责把作者索引转换成供外部 CreatorOS 查询的作者路由画像，
+不参与现有问答、RAG 排名或 writer prompt。画像分为两类：
+
+- `domain_prototypes`：从 `parents.jsonl` 中 answer/article 的问题或文章标题清洗、去重后，
+  使用现有 BGE-M3 dense 向量和 `AgglomerativeClustering(metric="cosine", linkage="average")`
+  聚类；小簇合并进 `long_tail`，代表标题和 `doc_id` 保留为证据。
+- `perspective_prototypes`：优先读取经过证据核验的 Narrative Schema，其次读取 Persona Pack；
+  两者都不存在时才从不同领域代表标题分层采样并尝试一次结构化 LLM 抽取。没有 LLM 时画像仍可
+  处于 `domain_ready`/`perspective_pending`，不会丢失领域向量。
+
+画像写入 `data/authors/zhihu/<author>/routing_profile.json`，只保存 embedding 元数据和
+Qdrant point reference，不保存 float 向量或原文。所有 domain/perspective 向量进入全局
+`creator_routing_profiles` collection，按 `corpus_version` 先写新版本、再清理该作者旧版本。
+`corpus_version` 由排序后的 `doc_id + updated_at` 计算，未变化且配置未变化时直接复用 JSON。
+
+CLI：
+
+```powershell
+pf routing-profile <author> --no-llm
+```
+
+API：`GET /api/personas/{author}/routing-profile` 查询，管理员通过
+`POST /api/personas/{author}/routing-profile/rebuild` 独立重建。CreatorOS 只能通过这些
+稳定 API 使用画像，不读取 PersonClone 内部作者目录；热点发现、候选召回、最终决策和内容
+生成仍属于 CreatorOS，暂不在本模块实现。

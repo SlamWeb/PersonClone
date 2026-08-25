@@ -1154,6 +1154,11 @@ class PersonaChatService:
     def llm_client(self) -> JsonChatClient:
         return self._get_llm()
 
+    def embedding_encoder(self) -> TextEncoder:
+        """Return the shared BGE-M3 encoder used by chat and routing profiles."""
+
+        return self._get_encoder()
+
     def _write_trace(
         self,
         prepared: PreparedChat,

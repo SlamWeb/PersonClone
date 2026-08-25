@@ -1194,3 +1194,19 @@ query-parent 微平均只作补充。未标注不等于 0：报告显示未知�
 差值；逐题页面允许切换重排路线，显示原排名到新排名、cross-encoder 分数、截断状态和
 实际送入模型的 passage。前端只读取本地不可变快照，不能用页面排序结果反写 Qrels 或
 基础排名。
+
+### AuthorRoutingProfile API
+
+作者路由画像是独立于 Chat/RAG 的管理员重建链路。它复用 PersonaChatService 已缓存的
+BGE-M3 encoder，不创建第二套 embedding 或检索基础设施。`routing_profile.json` 仍由
+作者目录持久化，但 CreatorOS 只能通过稳定的 Pydantic API 读取：
+
+```text
+GET  /api/personas/{author}/routing-profile
+POST /api/personas/{author}/routing-profile/rebuild
+```
+
+GET 需要登录，POST 需要管理员权限。rebuild 可以在 corpus 变化或 `force=true` 时执行；
+未变化且配置未变化会复用已有画像。接口只返回 domain/perspective 原型、证据索引和
+Qdrant point reference，不返回原始文章正文或 float 向量。热点发现、最终作者选择和内容
+生成属于未来 CreatorOS，不在 PersonClone Web 路由实现。

@@ -6,6 +6,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from personaforge.persona.routing_profile import AuthorRoutingProfile
+
 
 class AuthUserInfo(BaseModel):
     id: str
@@ -63,6 +65,17 @@ class PersonaInfo(BaseModel):
 class PersonasResponse(BaseModel):
     personas: list[PersonaInfo]
     default_author: str | None = None
+
+
+class RoutingProfileRebuildRequest(BaseModel):
+    force: bool = False
+    distance_threshold: float = Field(default=0.32, gt=0, lt=2)
+    min_cluster_size: int = Field(default=3, ge=2, le=100)
+
+
+class RoutingProfileResponse(BaseModel):
+    status: Literal["reused", "rebuilt"]
+    profile: AuthorRoutingProfile
 
 
 class SessionSummary(BaseModel):

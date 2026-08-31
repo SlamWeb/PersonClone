@@ -91,6 +91,32 @@ class TavilySearchClient:
                 )
         return results
 
+    async def asearch_many(
+        self,
+        queries: list[str],
+        *,
+        max_results: int = 5,
+    ) -> list[SearchResult]:
+        """Run Tavily requests natively async while preserving deterministic query order."""
+
+        payloads = []
+        for query in queries:
+            payloads.append((query, await self._asearch(query, max_results=max_results)))
+        results: list[SearchResult] = []
+        for query, payload in payloads:
+            for row in payload.get("results") or []:
+                if not isinstance(row, dict):
+                    continue
+                results.append(
+                    SearchResult(
+                        query=query,
+                        title=str(row.get("title") or ""),
+                        url=str(row.get("url") or ""),
+                        content=str(row.get("content") or ""),
+                    )
+                )
+        return results
+
     def _search(self, query: str, *, max_results: int) -> dict[str, object]:
         body = {
             "query": query,
@@ -116,6 +142,33 @@ class TavilySearchClient:
             detail = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"Tavily HTTP {exc.code}: {detail}") from exc
         return json.loads(payload)
+
+    async def _asearch(self, query: str, *, max_results: int) -> dict[str, object]:
+        try:
+            import httpx
+        except ImportError as exc:  # pragma: no cover - web extra supplies httpx.
+            raise RuntimeError(
+                "Async Tavily requests require `httpx`; install with: pip install -e \".[web]\""
+            ) from exc
+        body = {
+            "query": query,
+            "search_depth": self.search_depth,
+            "max_results": max_results,
+            "include_answer": False,
+            "include_raw_content": False,
+        }
+        async with httpx.AsyncClient(timeout=httpx.Timeout(self.timeout_seconds)) as client:
+            response = await client.post(
+                f"{self.base_url.rstrip('/')}/search",
+                json=body,
+                headers={"Authorization": f"Bearer {self.api_key}"},
+            )
+            if response.is_error:
+                raise RuntimeError(f"Tavily HTTP {response.status_code}: {response.text}")
+            payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Unexpected Tavily JSON payload")
+        return payload
 
 
 def build_grounded_query_plan(

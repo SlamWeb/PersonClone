@@ -10,6 +10,7 @@ from typing import Any
 from personaforge.web.conversations import ConversationStore, TurnRun
 from personaforge.web.multiturn import update_conversation_summary
 from personaforge.web.user_memory import update_user_memories
+from personaforge.web.async_streaming import ChatConcurrencyLimiter
 from personaforge.web.service import (
     ChatProgress,
     PersonaChatService,
@@ -27,15 +28,18 @@ class ChatTaskManager:
         service: PersonaChatService,
         *,
         store: ConversationStore | None = None,
-        worker_count: int = 2,
+        worker_count: int | None = None,
         token_flush_characters: int = 48,
         token_flush_seconds: float = 0.08,
+        concurrency_limiter: ChatConcurrencyLimiter | None = None,
     ) -> None:
         self.service = service
         self.store = store or service.conversations
-        self.worker_count = max(1, worker_count)
+        configured_workers = worker_count or service.config.chat_max_concurrency
+        self.worker_count = max(1, configured_workers)
         self.token_flush_characters = max(1, token_flush_characters)
         self.token_flush_seconds = max(0.01, token_flush_seconds)
+        self.concurrency_limiter = concurrency_limiter
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._maintenance_queue: queue.Queue[tuple[PreparedChat, str] | None] = queue.Queue()
         self._stop = threading.Event()
@@ -88,6 +92,7 @@ class ChatTaskManager:
         parent_top_k: int,
         trace_capture: str,
         owner_id: str | None = None,
+        enqueue: bool = True,
     ) -> TurnRun:
         turn = self.store.create_turn(
             author=author,
@@ -99,13 +104,19 @@ class ChatTaskManager:
             trace_capture=trace_capture,
             owner_id=owner_id,
         )
-        self.enqueue(turn.id)
+        if enqueue:
+            self.enqueue(turn.id)
         return turn
 
     def retry(self, turn_id: str) -> TurnRun:
         turn = self.store.retry_turn(turn_id)
         self.enqueue(turn.id)
         return turn
+
+    def schedule_maintenance(self, prepared: PreparedChat, answer: str) -> None:
+        """Schedule post-response memory work for direct async streams."""
+
+        self._maintenance_queue.put((prepared, answer))
 
     def enqueue(self, turn_id: str) -> None:
         with self._queued_lock:
@@ -164,6 +175,13 @@ class ChatTaskManager:
         return True
 
     def _run_turn(self, turn_id: str) -> None:
+        if self.concurrency_limiter is None:
+            self._run_turn_unlimited(turn_id)
+            return
+        with self.concurrency_limiter.sync_slot():
+            self._run_turn_unlimited(turn_id)
+
+    def _run_turn_unlimited(self, turn_id: str) -> None:
         if not self.store.claim_turn(turn_id):
             return
         turn = self.store.get_turn(turn_id)

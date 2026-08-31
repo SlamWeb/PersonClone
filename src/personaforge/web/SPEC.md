@@ -212,6 +212,31 @@ stream_text(messages, options) -> iterator[str]
 
 这只是 provider 能力扩展，不改变现有非流式 `complete_text`。
 
+### 并发与取消合同
+
+`POST /api/chat/stream` 使用 async generator 驱动 `StreamingResponse`。HTTP URL、Cookie
+登录态、请求字段与 `meta/token/error/done` payload 保持兼容；既有 `accepted/status`
+进度事件继续保留。
+
+交互式流与持久化 chat worker 共用进程级容量上限：
+
+```text
+PERSONAFORGE_CHAT_MAX_CONCURRENCY=2
+```
+
+默认值 2 是本地单 GPU 的保守值，不是写死的产品上限。超过上限的请求在服务端排队，
+不返回容量错误。客户端排队或生成期间断开时取消自己的上游请求；已开始的原生 async
+DeepSeek/Tavily HTTP response 必须关闭，turn 标记为 `interrupted`。成功流必须以 `done`
+结束；一个请求失败不得影响其他作者的流。
+
+同步 SQLite、embedded Qdrant、parent JSON 和 prompt preparation 在受限 worker 中执行；
+BGE-M3 是 CPU/GPU 密集步骤，也只能在 worker 中运行，并由共享 encoder lock 保护。默认
+DeepSeek writer stream、grounded JSON 请求和 Tavily 使用原生 async HTTP。Qdrant client
+按检索请求创建，并在 `finally` 关闭，不在作者之间共享。
+
+完整分类、共享状态边界、真实双作者基准和已知瓶颈见
+[`docs/CHAT_STREAM_CONCURRENCY_AUDIT.md`](../../../docs/CHAT_STREAM_CONCURRENCY_AUDIT.md)。
+
 ## 缓存
 
 FastAPI 进程内缓存：

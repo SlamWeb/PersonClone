@@ -560,6 +560,48 @@ class ConversationStore:
             )
         return self.get_turn(turn_id)
 
+    def interrupt_turn(
+        self,
+        turn_id: str,
+        *,
+        reason: str,
+        partial_answer: str = "",
+    ) -> TurnRun:
+        """Mark a queued/running stream interrupted without manufacturing an SSE error."""
+
+        now = utc_now_iso()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT status, assistant_message_id, selected_attempt_id FROM turn_runs WHERE id = ?",
+                (turn_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(turn_id)
+            if str(row["status"]) == "completed":
+                return self.get_turn(turn_id)
+            connection.execute(
+                """
+                UPDATE turn_runs
+                SET status = 'interrupted', stage = 'interrupted', label = ?,
+                    partial_answer = ?, updated_at = ?, completed_at = ?
+                WHERE id = ?
+                """,
+                (reason, partial_answer, now, now, turn_id),
+            )
+            connection.execute(
+                """
+                UPDATE messages
+                SET status = 'interrupted', text = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (partial_answer, now, str(row["assistant_message_id"])),
+            )
+            connection.execute(
+                "UPDATE generation_attempts SET status = 'interrupted', updated_at = ? WHERE id = ?",
+                (now, str(row["selected_attempt_id"])),
+            )
+        return self.get_turn(turn_id)
+
     def append_event(self, turn_id: str, event_type: str, payload: dict[str, Any]) -> int:
         with self._connect() as connection:
             cursor = connection.execute(

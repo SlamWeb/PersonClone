@@ -65,47 +65,48 @@ def retrieve_parents(
     collection_name = collection_name_for_author(source, author)
     qdrant_path = qdrant_path or index_dir / "qdrant"
     client = create_local_client(qdrant_path)
-    encoder = encoder or BgeM3Encoder()
-    timing: dict[str, int] = {}
-    started_at = perf_counter()
-    embedding = encoder.encode_texts([query], batch_size=1)[0]
-    timing["embedding"] = _elapsed_ms(started_at)
+    try:
+        encoder = encoder or BgeM3Encoder()
+        timing: dict[str, int] = {}
+        started_at = perf_counter()
+        embedding = encoder.encode_texts([query], batch_size=1)[0]
+        timing["embedding"] = _elapsed_ms(started_at)
 
-    started_at = perf_counter()
-    dense_hits = query_child_nodes(
-        client,
-        collection_name,
-        query_vector=embedding.dense,
-        route="dense",
-        child_top_k=child_top_k,
-        exclude_parent_ids=exclude_parent_ids,
-    )
-    timing["dense"] = _elapsed_ms(started_at)
-    started_at = perf_counter()
-    sparse_hits = query_child_nodes(
-        client,
-        collection_name,
-        query_vector={
-            "indices": embedding.sparse.indices,
-            "values": embedding.sparse.values,
-        },
-        route="sparse",
-        child_top_k=child_top_k,
-        exclude_parent_ids=exclude_parent_ids,
-    )
-    timing["sparse"] = _elapsed_ms(started_at)
+        started_at = perf_counter()
+        dense_hits = query_child_nodes(
+            client,
+            collection_name,
+            query_vector=embedding.dense,
+            route="dense",
+            child_top_k=child_top_k,
+            exclude_parent_ids=exclude_parent_ids,
+        )
+        timing["dense"] = _elapsed_ms(started_at)
+        started_at = perf_counter()
+        sparse_hits = query_child_nodes(
+            client,
+            collection_name,
+            query_vector={
+                "indices": embedding.sparse.indices,
+                "values": embedding.sparse.values,
+            },
+            route="sparse",
+            child_top_k=child_top_k,
+            exclude_parent_ids=exclude_parent_ids,
+        )
+        timing["sparse"] = _elapsed_ms(started_at)
 
-    routes = {"dense": dense_hits, "sparse": sparse_hits}
-    started_at = perf_counter()
-    parent_hits = fuse_parent_hits(routes, rrf_k=rrf_k, parent_top_k=parent_top_k)
-    timing["parent_aggregation"] = _elapsed_ms(started_at)
-    started_at = perf_counter()
-    parents_by_id = load_parents(index_dir / "parents.jsonl")
-    for hit in parent_hits:
-        hit.parent = parents_by_id.get(hit.parent_id)
-    timing["parent_load"] = _elapsed_ms(started_at)
-
-    client.close()
+        routes = {"dense": dense_hits, "sparse": sparse_hits}
+        started_at = perf_counter()
+        parent_hits = fuse_parent_hits(routes, rrf_k=rrf_k, parent_top_k=parent_top_k)
+        timing["parent_aggregation"] = _elapsed_ms(started_at)
+        started_at = perf_counter()
+        parents_by_id = load_parents(index_dir / "parents.jsonl")
+        for hit in parent_hits:
+            hit.parent = parents_by_id.get(hit.parent_id)
+        timing["parent_load"] = _elapsed_ms(started_at)
+    finally:
+        client.close()
     return RetrieveResult(
         query=query,
         collection_name=collection_name,
@@ -136,62 +137,63 @@ def retrieve_parents_for_queries(
     collection_name = collection_name_for_author(source, author)
     qdrant_path = qdrant_path or index_dir / "qdrant"
     client = create_local_client(qdrant_path)
-    encoder = encoder or BgeM3Encoder()
+    try:
+        encoder = encoder or BgeM3Encoder()
 
-    timing: dict[str, int] = {}
-    child_routes: dict[str, list[ChildHit]] = {}
-    parent_routes: dict[str, list[ParentHit]] = {}
-    for retrieval_query in retrieval_queries:
-        started_at = perf_counter()
-        embedding = encoder.encode_texts([retrieval_query.query], batch_size=1)[0]
-        timing[f"{retrieval_query.route}:embedding"] = _elapsed_ms(started_at)
-        dense_route = f"{retrieval_query.route}:dense"
-        sparse_route = f"{retrieval_query.route}:sparse"
-        started_at = perf_counter()
-        dense_hits = query_child_nodes(
-            client,
-            collection_name,
-            query_vector=embedding.dense,
-            route=dense_route,
-            vector_name="dense",
-            child_top_k=child_top_k,
-            exclude_parent_ids=exclude_parent_ids,
-        )
-        timing[dense_route] = _elapsed_ms(started_at)
-        started_at = perf_counter()
-        sparse_hits = query_child_nodes(
-            client,
-            collection_name,
-            query_vector={
-                "indices": embedding.sparse.indices,
-                "values": embedding.sparse.values,
-            },
-            route=sparse_route,
-            vector_name="sparse",
-            child_top_k=child_top_k,
-            exclude_parent_ids=exclude_parent_ids,
-        )
-        timing[sparse_route] = _elapsed_ms(started_at)
-        child_routes[dense_route] = dense_hits
-        child_routes[sparse_route] = sparse_hits
-        started_at = perf_counter()
-        parent_routes[retrieval_query.route] = fuse_parent_hits(
-            {dense_route: dense_hits, sparse_route: sparse_hits},
-            rrf_k=rrf_k,
-            parent_top_k=per_query_parent_k,
-        )
-        timing[f"{retrieval_query.route}:parent_rrf"] = _elapsed_ms(started_at)
+        timing: dict[str, int] = {}
+        child_routes: dict[str, list[ChildHit]] = {}
+        parent_routes: dict[str, list[ParentHit]] = {}
+        for retrieval_query in retrieval_queries:
+            started_at = perf_counter()
+            embedding = encoder.encode_texts([retrieval_query.query], batch_size=1)[0]
+            timing[f"{retrieval_query.route}:embedding"] = _elapsed_ms(started_at)
+            dense_route = f"{retrieval_query.route}:dense"
+            sparse_route = f"{retrieval_query.route}:sparse"
+            started_at = perf_counter()
+            dense_hits = query_child_nodes(
+                client,
+                collection_name,
+                query_vector=embedding.dense,
+                route=dense_route,
+                vector_name="dense",
+                child_top_k=child_top_k,
+                exclude_parent_ids=exclude_parent_ids,
+            )
+            timing[dense_route] = _elapsed_ms(started_at)
+            started_at = perf_counter()
+            sparse_hits = query_child_nodes(
+                client,
+                collection_name,
+                query_vector={
+                    "indices": embedding.sparse.indices,
+                    "values": embedding.sparse.values,
+                },
+                route=sparse_route,
+                vector_name="sparse",
+                child_top_k=child_top_k,
+                exclude_parent_ids=exclude_parent_ids,
+            )
+            timing[sparse_route] = _elapsed_ms(started_at)
+            child_routes[dense_route] = dense_hits
+            child_routes[sparse_route] = sparse_hits
+            started_at = perf_counter()
+            parent_routes[retrieval_query.route] = fuse_parent_hits(
+                {dense_route: dense_hits, sparse_route: sparse_hits},
+                rrf_k=rrf_k,
+                parent_top_k=per_query_parent_k,
+            )
+            timing[f"{retrieval_query.route}:parent_rrf"] = _elapsed_ms(started_at)
 
-    started_at = perf_counter()
-    parent_hits = fuse_parent_rankings(parent_routes, rrf_k=rrf_k, parent_top_k=parent_top_k)
-    timing["parent_aggregation"] = _elapsed_ms(started_at)
-    started_at = perf_counter()
-    parents_by_id = load_parents(index_dir / "parents.jsonl")
-    for hit in parent_hits:
-        hit.parent = parents_by_id.get(hit.parent_id)
-    timing["parent_load"] = _elapsed_ms(started_at)
-
-    client.close()
+        started_at = perf_counter()
+        parent_hits = fuse_parent_rankings(parent_routes, rrf_k=rrf_k, parent_top_k=parent_top_k)
+        timing["parent_aggregation"] = _elapsed_ms(started_at)
+        started_at = perf_counter()
+        parents_by_id = load_parents(index_dir / "parents.jsonl")
+        for hit in parent_hits:
+            hit.parent = parents_by_id.get(hit.parent_id)
+        timing["parent_load"] = _elapsed_ms(started_at)
+    finally:
+        client.close()
     return RetrieveResult(
         query=query,
         collection_name=collection_name,

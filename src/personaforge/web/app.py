@@ -60,6 +60,7 @@ from personaforge.web.author_jobs import (
     safe_author_token,
 )
 from personaforge.web.chat_tasks import ChatTaskManager
+from personaforge.web.async_streaming import ChatConcurrencyLimiter, async_chat_stream_events
 from personaforge.web.conversations import ConversationBusyError, TurnRun
 from personaforge.web.auth import AuthStore, AuthUser, DailyChatQuotaExceeded
 from personaforge.web.service import ChatProgress, PreparedChat, PersonaChatService, WebConfig, sources_from_parent_hits
@@ -126,7 +127,12 @@ def create_app(
             batch_size=config.index_batch_size,
         )
     )
-    chat_manager = chat_manager or ChatTaskManager(service)
+    chat_stream_concurrency = ChatConcurrencyLimiter(config.chat_max_concurrency)
+    chat_manager = chat_manager or ChatTaskManager(
+        service,
+        worker_count=config.chat_max_concurrency,
+        concurrency_limiter=chat_stream_concurrency,
+    )
     auth_store = auth_store or AuthStore(config.data_dir)
     retrieval_evaluations = RetrievalEvaluationStore(config.data_dir)
     generation_evaluations = GenerationEvaluationStore(config.data_dir)
@@ -176,6 +182,7 @@ def create_app(
     app.state.service = service
     app.state.author_jobs = job_manager
     app.state.chat_tasks = chat_manager
+    app.state.chat_stream_concurrency = chat_stream_concurrency
     app.state.auth = auth_store
     app.state.retrieval_evaluations = retrieval_evaluations
     app.state.generation_evaluations = generation_evaluations
@@ -902,9 +909,17 @@ def create_app(
             request,
             owner_id=user.id,
             deployment_guard=deployment_guard,
+            enqueue=False,
         )
         return StreamingResponse(
-            _persistent_chat_stream_events(chat_manager, turn.id, initial_turn=turn),
+            async_chat_stream_events(
+                service,
+                chat_manager.store,
+                turn,
+                request,
+                concurrency_limit=chat_stream_concurrency,
+                after_complete=chat_manager.schedule_maintenance,
+            ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -1330,6 +1345,7 @@ def _create_chat_turn(
     *,
     owner_id: str | None = None,
     deployment_guard: DeploymentGuard | None = None,
+    enqueue: bool = True,
 ):
     author = (request.author or service.default_author() or "").strip()
     if not author:
@@ -1346,6 +1362,7 @@ def _create_chat_turn(
             parent_top_k=request.parent_top_k,
             trace_capture=request.trace_capture,
             owner_id=owner_id,
+            enqueue=enqueue,
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Conversation not found") from exc

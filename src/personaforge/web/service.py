@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
 import threading
-from dataclasses import dataclass
+from concurrent.futures import CancelledError as FutureCancelledError
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
 from time import perf_counter
-from typing import Any, Iterator
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterator
 from uuid import uuid4
 
 from personaforge.ingest.embeddings import BgeM3Encoder, TextEncoder, prepare_bge_m3_runtime
@@ -78,6 +82,13 @@ class WebConfig:
     secure_cookies: bool | None = None
     session_days: int = 30
     deployment_guards_enabled: bool = True
+    chat_max_concurrency: int = field(
+        default_factory=lambda: _positive_env_int("PERSONAFORGE_CHAT_MAX_CONCURRENCY", 2)
+    )
+
+    def __post_init__(self) -> None:
+        if self.chat_max_concurrency < 1:
+            raise ValueError("chat_max_concurrency must be a positive integer")
 
 
 @dataclass(slots=True)
@@ -142,6 +153,85 @@ class ChatProgress:
 
     stage: str
     label: str
+
+
+class ChatPreparationCancelled(RuntimeError):
+    """Raised cooperatively when an HTTP stream disappears during preparation."""
+
+
+@dataclass(frozen=True, slots=True)
+class _AsyncWorkerError:
+    error: BaseException
+
+
+_ASYNC_WORKER_DONE = object()
+
+
+class _AsyncLoopBridge:
+    """Let sync domain functions wait on cancellable native-async HTTP calls."""
+
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        cancelled: threading.Event,
+    ) -> None:
+        self.loop = loop
+        self.cancelled = cancelled
+        self._active: set[Future[Any]] = set()
+        self._lock = threading.Lock()
+
+    def run(self, awaitable: Awaitable[Any]) -> Any:
+        future = asyncio.run_coroutine_threadsafe(awaitable, self.loop)
+        with self._lock:
+            self._active.add(future)
+        try:
+            while True:
+                if self.cancelled.is_set():
+                    future.cancel()
+                    raise ChatPreparationCancelled("Chat stream client disconnected")
+                try:
+                    return future.result(timeout=0.1)
+                except FutureTimeoutError:
+                    continue
+                except FutureCancelledError as exc:
+                    raise ChatPreparationCancelled("Chat stream client disconnected") from exc
+        finally:
+            with self._lock:
+                self._active.discard(future)
+
+    def cancel_all(self) -> None:
+        with self._lock:
+            active = list(self._active)
+        for future in active:
+            future.cancel()
+
+
+class _LoopJsonClient:
+    """Sync protocol adapter backed by request-local native async provider calls."""
+
+    def __init__(self, delegate: JsonChatClient, bridge: _AsyncLoopBridge) -> None:
+        self.delegate = delegate
+        self.bridge = bridge
+        self.last_usage: Any = None
+
+    def complete_json(self, messages: list[dict[str, str]], **kwargs: Any) -> dict[str, object]:
+        method_with_usage = getattr(self.delegate, "acomplete_json_with_usage", None)
+        if callable(method_with_usage):
+            payload, usage = self.bridge.run(method_with_usage(messages, **kwargs))
+            self.last_usage = usage
+            return payload
+        method = getattr(self.delegate, "acomplete_json", None)
+        if callable(method):
+            return self.bridge.run(method(messages, **kwargs))
+        payload = self.delegate.complete_json(messages, **kwargs)
+        self.last_usage = getattr(self.delegate, "last_usage", None)
+        return payload
+
+    def complete_text(self, messages: list[dict[str, str]], **kwargs: Any) -> str:
+        return self.delegate.complete_text(messages, **kwargs)
+
+    def stream_text(self, messages: list[dict[str, str]], **kwargs: Any) -> Iterator[str]:
+        return self.delegate.stream_text(messages, **kwargs)
 
 
 class _SynchronizedEncoder:
@@ -291,7 +381,11 @@ class PersonaChatService:
         parent_top_k: int | None = None,
         trace_capture: str = "summary",
         turn_id: str | None = None,
+        cancelled: Callable[[], bool] | None = None,
+        llm_override: JsonChatClient | None = None,
+        search_many_override: Callable[[list[str], int], list[SearchResult]] | None = None,
     ) -> Iterator[ChatProgress | PreparedChat]:
+        _raise_if_cancelled(cancelled)
         selected_author = (author or self.default_author() or "").strip()
         if not selected_author:
             raise ValueError("No local persona index found. Run `pf build` and `pf index` first.")
@@ -331,7 +425,8 @@ class PersonaChatService:
                 else None
             )
             stages: list[dict[str, Any]] = []
-            llm = self._get_llm()
+            llm = llm_override or self._get_llm()
+            _raise_if_cancelled(cancelled)
             completed_turns = self.conversations.get_completed_turns(selected_session_id)
             try:
                 owner_id = self.conversations.get_conversation_owner(selected_session_id)
@@ -371,6 +466,7 @@ class PersonaChatService:
                     model=self.config.model_name,
                     limit=8,
                 )
+                _raise_if_cancelled(cancelled)
                 memory_candidates = [hit.memory for hit in memory_hits]
                 stages.append(
                     self._stage(
@@ -391,6 +487,7 @@ class PersonaChatService:
                     memory_candidates=memory_candidates,
                     llm=llm,
                 )
+                _raise_if_cancelled(cancelled)
                 planner_usage = self._usage_or_estimate(
                     llm,
                     query,
@@ -471,10 +568,17 @@ class PersonaChatService:
                     yield ChatProgress(stage="web_grounding", label="正在查询相关背景")
                     stage_started_at = perf_counter()
                     try:
-                        search_results = TavilySearchClient.from_env().search_many(
-                            plan.search_queries,
-                            max_results=self.config.max_search_results,
-                        )
+                        if search_many_override is not None:
+                            search_results = search_many_override(
+                                plan.search_queries,
+                                self.config.max_search_results,
+                            )
+                        else:
+                            search_results = TavilySearchClient.from_env().search_many(
+                                plan.search_queries,
+                                max_results=self.config.max_search_results,
+                            )
+                        _raise_if_cancelled(cancelled)
                         stages.append(
                             self._stage(
                                 "tavily_search",
@@ -512,6 +616,7 @@ class PersonaChatService:
                     search_results=search_results,
                     llm=llm,
                 )
+                _raise_if_cancelled(cancelled)
                 objective_background = transform.objective_background
                 retrieval_queries = transform.retrieval_queries
                 stages.append(
@@ -582,6 +687,7 @@ class PersonaChatService:
                         per_query_parent_k=self.config.per_query_parent_k,
                         parent_top_k=resolved_parent_top_k,
                     )
+                _raise_if_cancelled(cancelled)
                 stages.extend(self._retrieval_stages(retrieve_result, retrieval_started_at))
             elif plan.retrieval_policy == "reuse" and source_turn is not None:
                 yield ChatProgress(stage="retrieval_reuse", label="正在延续上次回答")
@@ -639,6 +745,7 @@ class PersonaChatService:
                 clarification_focus=plan.clarification_focus if plan.turn_type == "unclear" else "",
                 user_memories=[memory.content for memory in selected_memories],
             )
+            _raise_if_cancelled(cancelled)
             response_max_tokens = response_token_limit(
                 plan.response_depth,
                 retrieve_result.parents,
@@ -725,6 +832,60 @@ class PersonaChatService:
             )
         self.record_prepared_trace(prepared)
         yield prepared
+
+    async def aiter_prepare_chat(
+        self,
+        **kwargs: Any,
+    ) -> AsyncIterator[ChatProgress | PreparedChat]:
+        """Bridge the sync/CPU preparation pipeline without blocking the ASGI loop."""
+
+        loop = asyncio.get_running_loop()
+        output: asyncio.Queue[object] = asyncio.Queue()
+        cancelled = threading.Event()
+        bridge = _AsyncLoopBridge(loop, cancelled)
+        llm = _LoopJsonClient(self._get_llm(), bridge)
+
+        def search_many(queries: list[str], max_results: int) -> list[SearchResult]:
+            client = TavilySearchClient.from_env()
+            async_method = getattr(client, "asearch_many", None)
+            if callable(async_method):
+                return bridge.run(async_method(queries, max_results=max_results))
+            return client.search_many(queries, max_results=max_results)
+
+        def publish(item: object) -> None:
+            try:
+                loop.call_soon_threadsafe(output.put_nowait, item)
+            except RuntimeError:
+                # The request loop can close while a native dependency unwinds.
+                return
+
+        def run() -> None:
+            try:
+                for item in self.iter_prepare_chat(
+                    **kwargs,
+                    cancelled=cancelled.is_set,
+                    llm_override=llm,
+                    search_many_override=search_many,
+                ):
+                    publish(item)
+            except BaseException as exc:
+                publish(_AsyncWorkerError(exc))
+            finally:
+                publish(_ASYNC_WORKER_DONE)
+
+        worker = loop.run_in_executor(None, run)
+        try:
+            while True:
+                item = await output.get()
+                if item is _ASYNC_WORKER_DONE:
+                    break
+                if isinstance(item, _AsyncWorkerError):
+                    raise item.error
+                yield item  # type: ignore[misc]
+            await worker
+        finally:
+            cancelled.set()
+            bridge.cancel_all()
 
     def _iter_prepare_chat_v1(
         self,
@@ -981,6 +1142,70 @@ class PersonaChatService:
             prepared.generation_usage = usage_payload or self._usage_or_estimate(
                 self._get_llm(), *(message.get("content", "") for message in prepared.messages)
             )
+
+    async def astream_answer(self, prepared: PreparedChat) -> AsyncIterator[str]:
+        """Stream generation natively when supported and close it on request cancellation."""
+
+        prepared.generation_started_at = perf_counter()
+        first_token_at: float | None = None
+        usage_payload: dict[str, Any] | None = None
+        stream: Any = None
+
+        def receive_usage(usage: Any) -> None:
+            nonlocal usage_payload
+            usage_payload = provider_usage(usage)
+
+        try:
+            llm = self._get_llm()
+            async_stream_with_usage = getattr(llm, "astream_text_with_usage", None)
+            async_stream = getattr(llm, "astream_text", None)
+            if callable(async_stream_with_usage):
+                stream = async_stream_with_usage(
+                    prepared.messages,
+                    temperature=self.config.temperature,
+                    max_tokens=prepared.response_max_tokens or self.config.max_tokens,
+                    on_usage=receive_usage,
+                )
+                async for token in stream:
+                    if first_token_at is None:
+                        first_token_at = perf_counter()
+                        prepared.generation_ttft_ms = elapsed_ms(prepared.generation_started_at)
+                    yield token
+            elif callable(async_stream):
+                stream = async_stream(
+                    prepared.messages,
+                    temperature=self.config.temperature,
+                    max_tokens=prepared.response_max_tokens or self.config.max_tokens,
+                )
+                async for token in stream:
+                    if first_token_at is None:
+                        first_token_at = perf_counter()
+                        prepared.generation_ttft_ms = elapsed_ms(prepared.generation_started_at)
+                    yield token
+            else:
+                iterator = self.stream_answer(prepared)
+                stream = iterator
+                while True:
+                    token = await asyncio.to_thread(_next_token, iterator)
+                    if token is _ASYNC_WORKER_DONE:
+                        break
+                    yield str(token)
+        finally:
+            close = getattr(stream, "aclose", None)
+            if callable(close):
+                await close()
+            elif stream is not None:
+                close = getattr(stream, "close", None)
+                if callable(close):
+                    close()
+            if prepared.generation_started_at is not None:
+                prepared.generation_duration_ms = elapsed_ms(prepared.generation_started_at)
+            if usage_payload is not None:
+                prepared.generation_usage = usage_payload
+            elif prepared.generation_usage is None:
+                prepared.generation_usage = estimated_usage_for_text(
+                    *(message.get("content", "") for message in prepared.messages)
+                )
 
     def record_prepared_trace(self, prepared: PreparedChat) -> Path:
         return self._write_trace(prepared, status="prepared")
@@ -1761,6 +1986,31 @@ def utc_now() -> str:
 
 def elapsed_ms(started_at: float) -> int:
     return round((perf_counter() - started_at) * 1000)
+
+
+def _positive_env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _raise_if_cancelled(cancelled: Callable[[], bool] | None) -> None:
+    if cancelled is not None and cancelled():
+        raise ChatPreparationCancelled("Chat stream client disconnected")
+
+
+def _next_token(iterator: Iterator[str]) -> object:
+    try:
+        return next(iterator)
+    except StopIteration:
+        return _ASYNC_WORKER_DONE
 
 
 def trace_error(error: Exception) -> dict[str, str]:

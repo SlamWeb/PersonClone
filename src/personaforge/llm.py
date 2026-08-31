@@ -7,7 +7,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterator, Protocol
+from typing import AsyncIterator, Callable, Iterator, Protocol
 
 from personaforge.env import first_env_value, load_env_file
 
@@ -131,6 +131,51 @@ class DeepSeekJsonClient:
             raise ValueError(f"Unexpected chat completion payload: {payload!r}") from exc
         return parse_json_object(text), usage
 
+    async def acomplete_json(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float = 0.0,
+        max_tokens: int = 1024,
+    ) -> dict[str, object]:
+        payload, _usage = await self.acomplete_json_with_usage(
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return payload
+
+    async def acomplete_json_with_usage(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float = 0.0,
+        max_tokens: int = 1024,
+    ) -> tuple[dict[str, object], LlmUsage | None]:
+        """Return JSON through native async HTTP with request-local usage."""
+
+        body: dict[str, object] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "response_format": {"type": "json_object"},
+        }
+        if self.thinking:
+            body["thinking"] = {"type": self.thinking}
+        payload = await _post_json_async(
+            _chat_endpoint(self.base_url),
+            body,
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            timeout_seconds=self.timeout_seconds,
+        )
+        usage = _usage_from_payload(payload)
+        try:
+            text = str(payload["choices"][0]["message"]["content"]).strip()
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ValueError(f"Unexpected chat completion payload: {payload!r}") from exc
+        return parse_json_object(text), usage
+
     def complete_text(
         self,
         messages: list[dict[str, str]],
@@ -205,6 +250,51 @@ class DeepSeekJsonClient:
             timeout_seconds=self.timeout_seconds,
             on_usage=receive_usage,
         )
+
+    async def astream_text(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+    ) -> AsyncIterator[str]:
+        """Yield text with native async HTTP so cancellation closes the response."""
+
+        async for token in self.astream_text_with_usage(
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        ):
+            yield token
+
+    async def astream_text_with_usage(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+        on_usage: Callable[[LlmUsage], None] | None = None,
+    ) -> AsyncIterator[str]:
+        """Stream one request without request-local state leaking through the shared client."""
+
+        body: dict[str, object] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        if self.thinking:
+            body["thinking"] = {"type": self.thinking}
+        async for token in _post_json_stream_async(
+            _chat_endpoint(self.base_url),
+            body,
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            timeout_seconds=self.timeout_seconds,
+            on_usage=on_usage,
+        ):
+            yield token
 
 
 def parse_json_object(text: str) -> dict[str, object]:
@@ -284,6 +374,78 @@ def _post_json_stream(
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"HTTP {exc.code} from {url}: {detail}") from exc
+
+
+async def _post_json_async(
+    url: str,
+    body: dict[str, object],
+    *,
+    headers: dict[str, str] | None = None,
+    timeout_seconds: float = 90.0,
+) -> dict[str, object]:
+    try:
+        import httpx
+    except ImportError as exc:  # pragma: no cover - web extra supplies httpx.
+        raise RuntimeError(
+            "Async LLM requests require `httpx`; install with: pip install -e \".[web]\""
+        ) from exc
+
+    request_headers = {"Content-Type": "application/json", **(headers or {})}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds)) as client:
+        response = await client.post(url, json=body, headers=request_headers)
+        if response.is_error:
+            detail = response.content.decode("utf-8", errors="replace")
+            raise RuntimeError(f"HTTP {response.status_code} from {url}: {detail}")
+        payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError(f"Unexpected JSON payload from {url}")
+    return payload
+
+
+async def _post_json_stream_async(
+    url: str,
+    body: dict[str, object],
+    *,
+    headers: dict[str, str] | None = None,
+    timeout_seconds: float = 90.0,
+    on_usage: Callable[[LlmUsage], None] | None = None,
+) -> AsyncIterator[str]:
+    try:
+        import httpx
+    except ImportError as exc:  # pragma: no cover - web extra supplies httpx.
+        raise RuntimeError(
+            "Async LLM streaming requires `httpx`; install with: pip install -e \".[web]\""
+        ) from exc
+
+    request_headers = {"Content-Type": "application/json", **(headers or {})}
+    timeout = httpx.Timeout(timeout_seconds)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async with client.stream(
+            "POST",
+            url,
+            json=body,
+            headers=request_headers,
+        ) as response:
+            if response.is_error:
+                detail = (await response.aread()).decode("utf-8", errors="replace")
+                raise RuntimeError(f"HTTP {response.status_code} from {url}: {detail}")
+            async for raw_line in response.aiter_lines():
+                line = raw_line.strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                data_part = line.removeprefix("data:").strip()
+                if data_part == "[DONE]":
+                    break
+                try:
+                    payload = json.loads(data_part)
+                except json.JSONDecodeError:
+                    continue
+                usage = _usage_from_payload(payload)
+                if usage is not None and on_usage is not None:
+                    on_usage(usage)
+                text = _stream_delta_text(payload)
+                if text:
+                    yield text
 
 
 def _stream_delta_text(payload: dict[str, object]) -> str:

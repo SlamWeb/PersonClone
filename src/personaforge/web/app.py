@@ -62,7 +62,7 @@ from personaforge.web.author_jobs import (
 from personaforge.web.chat_tasks import ChatTaskManager
 from personaforge.web.async_streaming import ChatConcurrencyLimiter, async_chat_stream_events
 from personaforge.web.conversations import ConversationBusyError, TurnRun
-from personaforge.web.auth import AuthStore, AuthUser, DailyChatQuotaExceeded
+from personaforge.web.auth import AuthStore, AuthUser
 from personaforge.web.service import ChatProgress, PreparedChat, PersonaChatService, WebConfig, sources_from_parent_hits
 from personaforge.persona.routing_profile import (
     RoutingProfileBuilder,

@@ -41,10 +41,22 @@ def write_trace(
     path = trace_path(data_dir, author, trace_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8", newline="\n")
+    temporary.write_text(json.dumps(_redact_trace(payload), ensure_ascii=False, indent=2), encoding="utf-8", newline="\n")
     temporary.replace(path)
     prune_traces(data_dir, author, keep=retention, protected_trace_id=trace_id)
     return path
+
+
+def _redact_trace(value: Any) -> Any:
+    # Local import avoids coupling token-estimation consumers to the memory store.
+    from personaforge.web.user_memory import redact_sensitive_text
+    if isinstance(value, str):
+        return redact_sensitive_text(value)
+    if isinstance(value, list):
+        return [_redact_trace(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _redact_trace(item) for key, item in value.items()}
+    return value
 
 
 def read_trace(data_dir: Path, author: str, trace_id: str) -> dict[str, Any]:

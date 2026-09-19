@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from personaforge.persona.context_budget import estimate_tokens, messages_tokens, explicit_constraint
 from personaforge.ingest.retrieve import ParentHit
 from personaforge.persona.narrative import NarrativeSchema, render_narrative_schema_prompt
 from personaforge.persona.pack import PersonaPack, render_persona_pack_prompt
@@ -119,7 +120,87 @@ def build_prompt_pack(
     return render_prompt_pack(messages, query=query, writer_prompt=writer_prompt)
 
 
-def build_writer_messages(
+def build_writer_messages(*, input_token_budget: int = 48000,
+                          budget_trace: dict[str, Any] | None = None,
+                          recent_history_message_count: int = 6,
+                          **kwargs: Any) -> list[dict[str, str]]:
+    """Keep current query and explicit constraints intact; report every omitted component.
+
+    Budget is input-only, after reserving output tokens at the service boundary.
+    A 25% estimation margin is used; this is not a provider tokenizer guarantee.
+    """
+    values = dict(kwargs)
+    for key in ('parent_hits', 'conversation_messages', 'user_memories', 'content_hits', 'style_hits'):
+        if values.get(key) is not None:
+            values[key] = list(values[key])
+    history = values.get('conversation_messages') or []
+    recent_ids = {id(m) for m in history[-recent_history_message_count:]} if recent_history_message_count else set()
+
+    def account(messages):
+        schema = values.get('narrative_schema')
+        summary = values.get('conversation_summary') or {}
+        history = values.get('conversation_messages') or []
+        return {
+            'narrative_schema_tokens': estimate_tokens(render_narrative_schema_prompt(schema)) if schema else 0,
+            'conversation_summary_tokens': estimate_tokens('\n'.join(f'- {k}: {v}' for k, v in summary.items() if v)),
+            'recent_history_tokens': sum(estimate_tokens(m['content']) for m in history if id(m) in recent_ids),
+            'relevant_old_history_tokens': sum(estimate_tokens(m['content']) for m in history if id(m) not in recent_ids),
+            'user_memory_tokens': estimate_tokens('\n'.join('- ' + m for m in values.get('user_memories') or [])),
+            'objective_background_tokens': estimate_tokens(values.get('objective_background') or ''),
+            'author_parent_evidence_tokens': estimate_tokens(pack_author_context(_merge_parent_hits(
+                values.get('parent_hits') or [], values.get('content_hits'), values.get('style_hits')))),
+            'total_writer_input_tokens': messages_tokens(messages),
+        }
+
+    messages = _build_writer_messages_unbudgeted(**values)
+    before = account(messages)
+    dropped = []
+    target = int(input_token_budget / 1.25)
+    while messages_tokens(messages) > target:
+        history = values.get('conversation_messages') or []
+        # Drop entire user/assistant turns, never half of a pair or an explicit user constraint.
+        removable = [(i, history[i:i+2]) for i in range(0, len(history), 2)
+                     if not any(m['role'] == 'user' and explicit_constraint(m['content']) for m in history[i:i+2])]
+        old = [(i, pair) for i, pair in removable if all(id(m) not in recent_ids for m in pair)]
+        if old:
+            i, pair = old[0]
+            del history[i:i+len(pair)]
+            dropped.append('relevant_old_history')
+        elif values.get('user_memories'):
+            values['user_memories'].pop()
+            dropped.append('user_memory')
+        elif values.get('conversation_summary') and not explicit_constraint(str(values['conversation_summary'])):
+            values['conversation_summary'] = {}
+            dropped.append('conversation_summary')
+        elif removable:
+            i, pair = removable[0]
+            del history[i:i+len(pair)]
+            dropped.append('recent_history')
+        elif values.get('objective_background'):
+            values['objective_background'] = ''
+            dropped.append('objective_background')
+        elif values.get('style_hits'):
+            values['style_hits'].pop()
+            dropped.append('style_evidence')
+        elif len(values.get('content_hits') or []) > 1:
+            values['content_hits'].pop()
+            dropped.append('content_evidence')
+        elif len(values.get('parent_hits') or []) > 1:
+            values['parent_hits'].pop()
+            dropped.append('author_parent_evidence')
+        else:
+            raise ValueError('Writer context exceeds input budget: current request, explicit constraints, '
+                             'identity and highest-ranked author evidence were preserved. Increase the '
+                             'configured context budget or shorten the request.')
+        messages = _build_writer_messages_unbudgeted(**values)
+    if budget_trace is not None:
+        budget_trace.update(source='estimated', estimation_margin=1.25, input_token_budget=input_token_budget,
+                            before=before, after=account(messages), dropped_components=dropped,
+                            final_injected_memory_count=len(values.get('user_memories') or []))
+    return messages
+
+
+def _build_writer_messages_unbudgeted(
     *,
     query: str,
     parent_hits: list[ParentHit],

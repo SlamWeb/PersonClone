@@ -673,13 +673,13 @@ dense+sparse 双路召回和 RRF 融合。表结构包括：
   置信度、来源 message IDs、版本关系和软删除状态。
 - `user_memory_embeddings`：BGE-M3 dense 与 sparse 表征缓存。
 - `user_memory_settings`：每个用户的总开关和自动写入开关。
-- `user_memory_checkpoints`：每个用户、每个会话已经完成长期记忆审查的消息序号；只有
-  checkpoint 之后的新 Turn 会进入下一批窗口。
+- `user_memory_checkpoints`：每个用户、每个会话已可靠完成 Atomic Evidence 提取的用户消息序号。
+- `user_memory_evidence`：独立原子证据、脱敏来源、动态 topic、状态与归纳版本关联；不直接进入 Writer。
 
 读取链路仅在 `grounded` 模式启用：
 
 ```text
-当前 query
+当前 query；依赖上下文的追问增加最近最多 3 轮的限长文本
 -> BGE-M3 从 active memories 召回最多 8 条候选
 -> 现有 Turn Planner 在同一次 LLM 调用中选择最多 4 条 memory_ids
 -> 只把选中内容作为“用户上下文”交给 Writer
@@ -689,21 +689,27 @@ dense+sparse 双路召回和 RRF 融合。表结构包括：
 冲突时当前消息优先。Query Transform 使用 Planner 完成必要指代消解后的问题，不把
 全部用户记忆直接拼进作者 RAG query。
 
-写入在回答保存完成后进入独立后台维护队列，不占用聊天 worker，不影响下一条回答，
-也不使用定时轮询。每个会话维护
-最多 3 个尚未审查的完整 Turn：未达到阈值时只返回 `deferred`，不调用记忆 LLM；累计
-3 Turn，或 Planner 判断当前消息明确值得长期记忆、用户主动要求记住/忘记/纠正时，
-立即刷新整个窗口。无新 Turn 时永远不会重复执行。
+写入在回答保存完成后进入独立后台维护队列，不影响已完成回答。V2 区分提取与归纳：
 
 ```text
-checkpoint 之后最多 3 个完整 user + assistant Turn
--> 候选提取 LLM
--> 无候选：推进 checkpoint，跳过 Critic
--> 有候选：保守审查 LLM
--> 确定性证据、主语、疑问、敏感信息和 schema 校验
--> create / extend / replace / reject
--> 推进 checkpoint，窗口清零
+checkpoint 后最早的 3 个完整 Turn（顺序消费所有完整窗口）
+-> Atomic Evidence Extraction + 确定性验证
+-> evidence 插入 + checkpoint CAS 同一事务提交
+-> 按动态 memory_key 聚合 pending atoms
+-> 满足低频触发条件时 Consolidator / Critic
+-> Memory 版本更新 + evidence 状态同一事务提交
 ```
+
+普通窗口不足 3 轮时保留尾部；显式 remember/correct/forget 或 flush 可处理尾部。
+无候选也可靠推进提取 checkpoint，非法响应和写入失败则回滚；归纳失败保留 pending atoms。
+归纳触发：同 topic 3 个独立来源消息、重要度 5、显式操作、事件状态变化或 flush。
+维护线程空闲时每 60 秒扫描已空闲 300 秒的 SQLite 积压，恢复重启后丢失的队列工作。
+较早可重试但未完成的 turn 阻挡后续 checkpoint，避免后来重试时丢证据。
+
+新增 Writer 分项 token 估算与预算 trace；`PERSONAFORGE_WRITER_CONTEXT_BUDGET` 默认 64000，
+预留输出并增加估算余量。优先移除旧历史、Memory、可移除会话状态、背景和低排名作者证据；
+保留当前 query、识别出的明确约束和最高排名作者证据；仍超限时显式报错。
+完整设计、迁移限制和测试映射见 `docs/architecture/generation/context-memory-v2.md`。
 
 关键安全边界：
 
@@ -714,10 +720,11 @@ checkpoint 之后最多 3 个完整 user + assistant Turn
 - API key、密码、Cookie、token 永不进入候选；第三方财务事件只存必要概括，不保存
   金额、比例、余额和杠杆倍数。
 - 自动修订以新版本 supersede 旧版本，保留审计链；兼容的新证据使用 `extend`，发生
-  冲突、状态变化或用户纠正时使用 `replace`，以时间更近的用户证据为准，避免旧错误
-  被拼回新版本。
+  状态变化或用户纠正时可使用 `replace`；稳定偏好结合证据数量、原始时间与长期意图判断，
+  不统一 latest-wins，临时“简单说”不得覆盖长期偏好。归纳输出直接形成完整新版本，避免字符串拼接。
 - 删除单个会话不会自动删除已经独立形成的长期记忆；用户可在“我的记忆”中纠正、
-  置顶、遗忘或全部清空。遗忘是软删除，后续召回只读取 active 状态。
+  置顶、遗忘或全部清空。遗忘同时停止相关证据后续归纳；手动纠正使旧 pending 证据 superseded。
+  遗忘是软删除，后续召回只读取 active 状态。
 
 记忆 API：
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 import math
 import re
 import sqlite3
@@ -15,6 +16,8 @@ from uuid import uuid4
 from personaforge.ingest.embeddings import SparseEmbedding, TextEmbedding, TextEncoder
 from personaforge.llm import JsonChatClient
 from personaforge.web.conversations import ConversationTurn, utc_now_iso
+
+from personaforge.web.memory_evidence import EVIDENCE_SCHEMA, EvidenceStoreMixin
 
 MemoryKind = Literal["semantic", "episodic", "procedural"]
 MemorySensitivity = Literal["normal", "private", "restricted"]
@@ -87,7 +90,7 @@ class MemoryRecallHit:
         }
 
 
-class UserMemoryStore:
+class UserMemoryStore(EvidenceStoreMixin):
     """SQLite repository for user-owned long-term memory."""
 
     def __init__(self, data_dir: Path) -> None:
@@ -173,18 +176,21 @@ class UserMemoryStore:
         pinned: bool = False,
         supersedes_id: str | None = None,
         preserve_previous: bool = True,
+        _connection: sqlite3.Connection | None = None,
     ) -> UserMemory:
         kind = kind if kind in MEMORY_KINDS else "episodic"
         sensitivity = sensitivity if sensitivity in SENSITIVITIES else "private"
         event_status = event_status if event_status in EVENT_STATUSES else "ongoing"
-        memory_key = _normalize_key(memory_key)
-        content = content.strip()
+        memory_key = canonical_memory_key(memory_key)
+        content = redact_sensitive_text(content.strip(), force_finance=sensitivity == 'restricted')
+        evidence_quotes = [] if sensitivity == 'restricted' else [redact_sensitive_text(q) for q in evidence_quotes]
         if not content:
             raise ValueError("Memory content cannot be empty.")
         now = utc_now_iso()
         memory_id = f"mem-{uuid4().hex}"
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
+        with (nullcontext(_connection) if _connection is not None else self._connect()) as connection:
+            if _connection is None:
+                connection.execute("BEGIN IMMEDIATE")
             previous = None
             if supersedes_id:
                 previous = connection.execute(
@@ -217,7 +223,7 @@ class UserMemoryStore:
                     "UPDATE user_memories SET updated_at = ?, confidence = MAX(confidence, ?) WHERE id = ?",
                     (now, confidence, previous_id),
                 )
-                return self.get(owner_id, previous_id)
+                return _row_to_memory(connection.execute("SELECT * FROM user_memories WHERE id=?", (previous_id,)).fetchone())
             if previous_id:
                 connection.execute(
                     "UPDATE user_memories SET status = 'superseded', updated_at = ? WHERE id = ?",
@@ -241,29 +247,30 @@ class UserMemoryStore:
                     json.dumps(evidence_quotes, ensure_ascii=False), previous_id, now, now,
                 ),
             )
-        return self.get(owner_id, memory_id)
+            return _row_to_memory(connection.execute("SELECT * FROM user_memories WHERE id=?", (memory_id,)).fetchone())
 
     def correct(self, owner_id: str, memory_id: str, content: str) -> UserMemory:
         previous = self.get(owner_id, memory_id)
         if previous.status != "active":
             raise ValueError("Only active memories can be corrected.")
-        return self.save_revision(
-            owner_id,
-            kind=previous.kind,
-            memory_key=previous.memory_key,
-            content=content,
-            sensitivity=previous.sensitivity,
-            importance=previous.importance,
-            confidence=1.0,
-            event_status=previous.event_status,
-            source_author=previous.source_author,
-            source_conversation_id=previous.source_conversation_id,
-            source_message_ids=previous.source_message_ids,
-            evidence_quotes=previous.evidence_quotes,
-            pinned=previous.pinned,
-            supersedes_id=previous.id,
-            preserve_previous=False,
-        )
+        with self._connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            active = connection.execute("SELECT status FROM user_memories WHERE id=? AND owner_id=?",
+                                        (memory_id, owner_id)).fetchone()
+            if active is None or active[0] != 'active':
+                raise ValueError('Memory changed during correction; refresh and retry.')
+            connection.execute("""UPDATE user_memory_evidence SET status='superseded', updated_at=?
+                WHERE owner_id=? AND topic_key=? AND status='pending'""",
+                (utc_now_iso(), owner_id, canonical_memory_key(previous.memory_key)))
+            return self.save_revision(
+                owner_id, kind=previous.kind, memory_key=previous.memory_key, content=content,
+                sensitivity=previous.sensitivity, importance=previous.importance, confidence=1.0,
+                event_status=previous.event_status, source_author=previous.source_author,
+                source_conversation_id=previous.source_conversation_id,
+                source_message_ids=previous.source_message_ids, evidence_quotes=previous.evidence_quotes,
+                pinned=previous.pinned, supersedes_id=previous.id, preserve_previous=False,
+                _connection=connection,
+            )
 
     def set_pinned(self, owner_id: str, memory_id: str, pinned: bool) -> UserMemory:
         self.get(owner_id, memory_id)
@@ -275,15 +282,17 @@ class UserMemoryStore:
         return self.get(owner_id, memory_id)
 
     def forget(self, owner_id: str, memory_id: str) -> None:
-        self.get(owner_id, memory_id)
+        previous = self.get(owner_id, memory_id)
         with self._connect() as connection:
+            self.suppress_evidence(connection, owner_id, previous.memory_key)
             connection.execute(
-                "UPDATE user_memories SET status = 'forgotten', pinned = 0, updated_at = ? WHERE owner_id = ? AND id = ?",
-                (utc_now_iso(), owner_id, memory_id),
+                "UPDATE user_memories SET status = 'forgotten', pinned = 0, updated_at = ? WHERE owner_id = ? AND memory_key = ?",
+                (utc_now_iso(), owner_id, previous.memory_key),
             )
 
     def clear(self, owner_id: str) -> int:
         with self._connect() as connection:
+            self.suppress_evidence(connection, owner_id)
             cursor = connection.execute(
                 "UPDATE user_memories SET status = 'forgotten', pinned = 0, updated_at = ? WHERE owner_id = ? AND status = 'active'",
                 (utc_now_iso(), owner_id),
@@ -393,6 +402,7 @@ class UserMemoryStore:
 
     def _initialize(self) -> None:
         with self._connect() as connection:
+            connection.executescript(EVIDENCE_SCHEMA)
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS user_memories (
@@ -516,230 +526,218 @@ def recall_user_memories(
 
 
 def update_user_memories(
-    store: UserMemoryStore,
-    owner_id: str,
-    *,
-    author: str,
-    conversation_id: str,
-    user_turns: list[ConversationTurn],
-    llm: JsonChatClient,
-    related_memories: list[UserMemory] | None = None,
-    force_flush: bool = False,
+    store: UserMemoryStore, owner_id: str, *, author: str, conversation_id: str,
+    user_turns: list[ConversationTurn], llm: JsonChatClient,
+    related_memories: list[UserMemory] | None = None, force_flush: bool = False,
     window_size: int = 3,
 ) -> dict[str, Any]:
-    started_at = time.perf_counter()
+    """Consume oldest complete windows; extraction and consolidation have separate durability."""
+    started = time.perf_counter()
     settings = store.settings(owner_id)
-    if not settings["enabled"] or not settings["auto_write"] or not user_turns:
-        return {"status": "skipped", "duration_ms": 0, "operations": [], "rejections": []}
-    window_size = max(1, int(window_size))
+    result: dict[str, Any] = {"status": "skipped", "operations": [], "rejections": [],
+                              "batches": [], "extracted_evidence_ids": [], "critic_skipped": True}
+    if not settings['enabled'] or not settings['auto_write']:
+        return {**result, "duration_ms": 0}
     checkpoint = store.window_checkpoint(owner_id, conversation_id)
-    pending_turns = [turn for turn in user_turns if turn.sequence > checkpoint]
-    if not pending_turns:
-        return {
-            "status": "skipped",
-            "reason": "no_pending_turns",
-            "duration_ms": 0,
-            "pending_turns": 0,
-            "operations": [],
-            "rejections": [],
-        }
-    latest_query = pending_turns[-1].query.strip()
-    explicit_flush = any(
-        predicate(latest_query)
-        for predicate in (_is_explicit_remember, _is_explicit_forget, _is_explicit_correction)
-    )
-    if not force_flush and not explicit_flush and len(pending_turns) < window_size:
-        return {
-            "status": "deferred",
-            "reason": "window_not_full",
-            "duration_ms": round((time.perf_counter() - started_at) * 1000),
-            "pending_turns": len(pending_turns),
-            "window_size": window_size,
-            "operations": [],
-            "rejections": [],
-        }
-    source_turns = pending_turns[-window_size:]
-    through_sequence = max(turn.sequence for turn in source_turns)
-    latest_query = source_turns[-1].query.strip()
-    if _is_explicit_forget(latest_query) and related_memories:
-        operations = []
-        for memory in related_memories:
-            store.forget(owner_id, memory.id)
-            operations.append(
-                {"operation": "forget", "memory_id": memory.id, "memory_key": memory.memory_key}
-            )
-        store.advance_window_checkpoint(owner_id, conversation_id, through_sequence)
-        return {
-            "status": "completed",
-            "duration_ms": round((time.perf_counter() - started_at) * 1000),
-            "operations": operations,
-            "rejections": [],
-            "source_message_ids": [source_turns[-1].user_message_id],
-            "through_sequence": through_sequence,
-            "flush_reason": "explicit",
-        }
-    source_text = {turn.user_message_id: turn.query for turn in source_turns}
-    source_context = "\n".join(source_text.values())
-    force_finance_redaction = any(marker in source_context for marker in THIRD_PARTY_MARKERS) and any(
-        marker in source_context for marker in FINANCE_MARKERS
-    )
-    sanitized = {
-        message_id: redact_sensitive_text(text, force_finance=force_finance_redaction)
-        for message_id, text in source_text.items()
-    }
-    context_messages: list[dict[str, str]] = []
-    for turn in source_turns:
-        context_messages.extend(
-            [
-                {
-                    "role": "user",
-                    "message_id": turn.user_message_id,
-                    "content": sanitized[turn.user_message_id],
-                },
-                {
-                    "role": "assistant",
-                    "message_id": turn.assistant_message_id,
-                    "content": redact_sensitive_text(
-                        turn.assistant_text,
-                        force_finance=force_finance_redaction,
-                    ),
-                },
-            ]
-        )
-    selected_existing = related_memories or []
+    pending = sorted((t for t in user_turns if t.sequence > checkpoint), key=lambda t: t.sequence)
+    window_size = max(1, int(window_size))
+    explicit = any(_is_explicit_remember(t.query) or _is_explicit_correction(t.query)
+                   or _is_explicit_forget(t.query) for t in pending)
+    flush = force_flush or explicit
+    result.update(reason="no_pending_turns" if not pending else "window_not_full",
+                  pending_turns=len(pending), window_size=window_size)
+    while len(pending) >= window_size or (flush and pending):
+        turns = pending[:window_size]
+        source = {t.user_message_id: t.query for t in turns}
+        joined = '\n'.join(source.values())
+        finance = any(m in joined for m in THIRD_PARTY_MARKERS) and any(m in joined for m in FINANCE_MARKERS)
+        sanitized = {key: redact_sensitive_text(value, force_finance=finance) for key, value in source.items()}
+        context = [message for t in turns for message in (
+            {"role": "user", "message_id": t.user_message_id, "content": sanitized[t.user_message_id]},
+            {"role": "assistant", "message_id": t.assistant_message_id,
+             "content": redact_sensitive_text(t.assistant_text, force_finance=finance)})]
+        forget = any(_is_explicit_forget(t.query) for t in turns)
+        # A selected target is required. Never guess which private facts to delete.
+        if forget and related_memories:
+            for memory in related_memories:
+                store.forget(owner_id, memory.id)
+                result['operations'].append({"operation": "forget", "memory_id": memory.id,
+                                             "memory_key": memory.memory_key})
+        extraction_turns = [t for t in turns if not _is_explicit_forget(t.query)]
+        atoms = []
+        if extraction_turns:
+            eligible = {t.user_message_id: sanitized[t.user_message_id] for t in extraction_turns}
+            payload = llm.complete_json([
+                {"role": "system", "content": MEMORY_EXTRACTOR_PROMPT},
+                {"role": "user", "content": _memory_write_prompt(
+                    context_messages=context, source_messages=eligible,
+                    existing=store.list_active(owner_id),
+                    existing_topics=list(dict.fromkeys(row['topic_key'] for row in
+                        store.list_evidence(owner_id, status='pending'))))},
+            ], temperature=0.0, max_tokens=1400)
+            if not isinstance(payload, dict) or not isinstance(payload.get('candidates'), list):
+                raise ValueError('Invalid atom extraction response; checkpoint unchanged.')
+            for candidate in _canonicalize_extracted_candidates(payload['candidates'], eligible):
+                atom, reason = _validated_candidate(candidate, source_text={k: source[k] for k in eligible},
+                                                    sanitized=eligible)
+                if atom is None:
+                    result['rejections'].append({"reason": reason})
+                    continue
+                atom['memory_key'] = canonical_memory_key(atom['memory_key'])
+                atom['source_author'] = author
+                atom['source_conversation_id'] = conversation_id
+                atom['source_messages'] = {k: eligible[k] for k in atom['source_message_ids']}
+                atom['source_timestamps'] = {t.user_message_id: t.created_at for t in turns
+                                             if t.user_message_id in atom['source_message_ids']}
+                atom['remember'] = any(_is_explicit_remember(source[k]) for k in atom['source_message_ids'])
+                atom['explicit'] = any(_is_explicit_remember(source[k]) or _is_explicit_correction(source[k])
+                                       for k in atom['source_message_ids'])
+                atom['correction'] = any(_is_explicit_correction(source[k]) for k in atom['source_message_ids'])
+                atoms.append(atom)
+        ids = store.commit_evidence_batch(owner_id, conversation_id, checkpoint, turns[-1].sequence, atoms)
+        checkpoint = turns[-1].sequence
+        result['batches'].append({"source_turn_ids": [t.id for t in turns],
+                                  "source_message_ids": list(source), "evidence_ids": ids,
+                                  "through_sequence": checkpoint})
+        result['extracted_evidence_ids'].extend(ids)
+        result.update(status='completed', through_sequence=checkpoint, source_message_ids=list(source),
+                      flush_reason='explicit' if explicit else 'planner' if force_flush else 'window_full')
+        pending = pending[len(turns):]
+    consolidation = consolidate_user_memories(store, owner_id, llm=llm, force=flush)
+    result['operations'].extend(consolidation['operations'])
+    result['rejections'].extend(consolidation['rejections'])
+    result['consolidation'] = consolidation
+    result['critic_skipped'] = not consolidation['attempted_topics']
+    if consolidation['attempted_topics']:
+        result['status'] = 'completed'
+    elif not result['batches'] and pending:
+        result['status'] = 'deferred'
+    result['pending_turns'] = len(pending)
+    result['duration_ms'] = round((time.perf_counter() - started) * 1000)
+    return result
 
-    extraction = llm.complete_json(
-        [
-            {"role": "system", "content": MEMORY_EXTRACTOR_PROMPT},
-            {
-                "role": "user",
-                "content": _memory_write_prompt(
-                    context_messages=context_messages,
-                    source_messages=sanitized,
-                    existing=selected_existing,
-                ),
-            },
-        ],
-        temperature=0.0,
-        max_tokens=1400,
-    )
-    candidates = extraction.get("candidates") if isinstance(extraction, dict) else []
-    if not isinstance(candidates, list):
-        candidates = []
-    candidates = _canonicalize_extracted_candidates(candidates, sanitized)
-    if not candidates:
-        store.advance_window_checkpoint(owner_id, conversation_id, through_sequence)
-        return {
-            "status": "completed",
-            "duration_ms": round((time.perf_counter() - started_at) * 1000),
-            "pending_turns": len(source_turns),
-            "through_sequence": through_sequence,
-            "flush_reason": "explicit" if explicit_flush else "planner" if force_flush else "window_full",
-            "critic_skipped": True,
-            "operations": [],
-            "rejections": [],
-            "source_message_ids": list(sanitized),
-        }
-    candidate_keys = {
-        _normalize_key(str(candidate.get("memory_key") or "user.context"))
-        for candidate in candidates if isinstance(candidate, dict)
-    }
-    matching_existing = [
-        memory for memory in store.list_active(owner_id)
-        if memory.memory_key in candidate_keys
-    ]
-    existing_by_id = {
-        memory.id: memory for memory in [*selected_existing, *matching_existing]
-    }
-    existing = list(existing_by_id.values())
-    critique = llm.complete_json(
-        [
-            {"role": "system", "content": MEMORY_CRITIC_PROMPT},
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "context_messages": context_messages,
-                        "source_messages": sanitized,
-                        "existing_memories": [
-                            {
-                                "id": memory.id,
-                                "memory_key": memory.memory_key,
-                                "content": memory.content,
-                                "updated_at": memory.updated_at,
-                            }
-                            for memory in existing
-                        ],
-                        "candidates": candidates,
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-            },
-        ],
-        temperature=0.0,
-        max_tokens=1600,
-    )
-    reviewed = critique.get("memories") if isinstance(critique, dict) else []
-    if not isinstance(reviewed, list):
-        reviewed = []
 
-    operations: list[dict[str, Any]] = []
-    rejections: list[dict[str, str]] = []
-    for item in reviewed:
-        if not isinstance(item, dict) or str(item.get("decision") or "reject") != "approve":
-            rejections.append({"reason": str(item.get("reason") or "critic_rejected")})
+def canonical_memory_key(key: str) -> str:
+    """Small alias vocabulary, open-ended topics; no fuzzy merging of different people."""
+    key = _normalize_key(key)
+    aliases = {'user.preference.response_length': 'user.preference.answer_length',
+               'user.communication.conciseness': 'user.preference.answer_length'}
+    return aliases.get(key, key)
+
+
+def consolidate_user_memories(store: UserMemoryStore, owner_id: str, *, llm: JsonChatClient,
+                              force: bool = False) -> dict[str, Any]:
+    """Dream only changed topics. Atom status and memory revision commit together."""
+    result: dict[str, Any] = {'operations': [], 'rejections': [], 'attempted_topics': []}
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for row in store.list_evidence(owner_id, status='pending'):
+        groups.setdefault(row['topic_key'], []).append(row)
+    for topic, all_rows in groups.items():
+        rows = all_rows[:24]  # Bounded topic work; remaining evidence is durable for the next run.
+        atoms = [json.loads(row['payload_json']) for row in rows]
+        existing = [m for m in store.list_active(owner_id) if canonical_memory_key(m.memory_key) == topic]
+        source = {k: v for atom in atoms for k, v in atom['source_messages'].items()}
+        important = any(a['importance'] >= 5 or a['explicit'] for a in atoms)
+        state_change = bool(existing) and any(a['event_status'] != existing[0].event_status for a in atoms)
+        if not (force or important or state_change or len(source) >= 3):
             continue
-        normalized, reason = _validated_candidate(item, source_text=source_text, sanitized=sanitized)
-        if normalized is None:
-            rejections.append({"reason": reason})
-            continue
-        supersedes_id = str(item.get("supersedes_id") or "").strip() or None
-        if supersedes_id and supersedes_id not in {memory.id for memory in existing}:
-            supersedes_id = None
-        if supersedes_id is None:
-            supersedes_id = next(
-                (
-                    memory.id for memory in existing
-                    if memory.memory_key == normalized["memory_key"]
-                ),
-                None,
+        result['attempted_topics'].append(topic)
+        payload = llm.complete_json([
+            {'role': 'system', 'content': MEMORY_CRITIC_PROMPT},
+            {'role': 'user', 'content': json.dumps({
+                'topic_key': topic, 'source_messages': source,
+                'candidates': atoms,
+                'evidence': [{'id': row['id'], 'timestamp': row['created_at']} for row in rows],
+                'existing_memories': [m.to_api() for m in existing],
+            }, ensure_ascii=False)},
+        ], temperature=0.0, max_tokens=1600)
+        if not isinstance(payload, dict) or not isinstance(payload.get('memories'), list):
+            raise ValueError('Invalid consolidation response; evidence remains pending.')
+        approved = [item for item in payload['memories'] if isinstance(item, dict)
+                    and item.get('decision') == 'approve']
+        if len(approved) > 1:
+            raise ValueError('Consolidation must produce at most one memory per topic.')
+        normalized = None
+        reason = 'critic_rejected'
+        if approved:
+            normalized, reason = _validated_candidate(approved[0], source_text=source, sanitized=source)
+            if normalized:
+                levels = {'normal': 0, 'private': 1, 'restricted': 2}
+                normalized['sensitivity'] = max(
+                    [normalized['sensitivity'], *(a['sensitivity'] for a in atoms),
+                     *(m.sensitivity for m in existing)], key=levels.__getitem__)
+                if normalized['sensitivity'] == 'restricted':
+                    normalized['content'] = _generalize_finance_numbers(normalized['content'])
+                    normalized['evidence_quotes'] = []
+        ids = [row['id'] for row in rows]
+        with store._connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            marks = ','.join('?' for _ in ids)
+            pending_count = connection.execute(
+                f"SELECT COUNT(*) FROM user_memory_evidence WHERE owner_id=? AND status='pending' AND id IN ({marks})",
+                (owner_id, *ids),
+            ).fetchone()[0]
+            if pending_count != len(ids):
+                continue  # Concurrent forget / consolidation won; never resurrect its evidence.
+            active_ids = {row[0] for row in connection.execute(
+                "SELECT id FROM user_memories WHERE owner_id=? AND status='active' AND memory_key IN (?,?)",
+                (owner_id, topic, existing[0].memory_key if existing else topic),
+            )}
+            if active_ids != {m.id for m in existing}:
+                raise RuntimeError('Memory revision changed during consolidation; retry.')
+            memory_id = None
+            operation = 'no-op'
+            mode = str(approved[0].get('revision_mode') or 'extend') if approved else 'extend'
+            if normalized:
+                normalized['memory_key'] = topic
+                previous = existing[0] if existing else None
+                correction = any(a['correction'] for a in atoms)
+                # A local brevity request cannot change a stable preference, even if the LLM approves it.
+                durable = any(marker in '\n'.join(source.values()) for marker in
+                              ('以后', '一直', '通常', '喜欢', '偏好', '请记住', '总是'))
+                if previous and previous.event_status == 'stable' and mode == 'replace' and not (correction or durable):
+                    normalized = None
+                    reason = 'temporary_request_cannot_replace_stable_memory'
+                else:
+                    normalized['pinned'] = bool(normalized['pinned']) or any(a.get('remember') for a in atoms)
+                    if previous:
+                        normalized['pinned'] |= previous.pinned
+                    if previous and mode != 'replace' and not correction:
+                        normalized['source_message_ids'] = list(dict.fromkeys(
+                            previous.source_message_ids + normalized['source_message_ids']))
+                        if normalized['sensitivity'] != 'restricted':
+                            normalized['evidence_quotes'] = list(dict.fromkeys(
+                                previous.evidence_quotes + normalized['evidence_quotes']))
+                    memory = store.save_revision(owner_id, **normalized,
+                        source_author=atoms[-1]['source_author'],
+                        source_conversation_id=atoms[-1]['source_conversation_id'],
+                        supersedes_id=previous.id if previous else None,
+                        preserve_previous=False, _connection=connection)
+                    memory_id = memory.id
+                    operation = 'no-op' if previous and previous.id == memory.id else 'supersede' if previous else 'create'
+            connection.execute(
+                f"UPDATE user_memory_evidence SET status=?, memory_id=?, updated_at=? WHERE owner_id=? AND id IN ({marks})",
+                ('consolidated' if normalized else 'rejected', memory_id, utc_now_iso(), owner_id, *ids),
             )
-        revision_mode = str(item.get("revision_mode") or "extend").strip()
-        pinned = bool(normalized.pop("pinned")) or _is_explicit_remember(latest_query)
-        memory = store.save_revision(
-            owner_id,
-            **normalized,
-            source_author=author,
-            source_conversation_id=conversation_id,
-            supersedes_id=supersedes_id,
-            pinned=pinned,
-            preserve_previous=(
-                revision_mode != "replace" and not _is_explicit_correction(latest_query)
-            ),
-        )
-        operations.append(
-            {
-                "operation": "supersede" if memory.supersedes_id else "create",
-                "memory_id": memory.id,
-                "memory_key": memory.memory_key,
-                "kind": memory.kind,
-                "sensitivity": memory.sensitivity,
-                "revision_mode": revision_mode if memory.supersedes_id else "new",
-            }
-        )
-    store.advance_window_checkpoint(owner_id, conversation_id, through_sequence)
-    return {
-        "status": "completed",
-        "duration_ms": round((time.perf_counter() - started_at) * 1000),
-        "pending_turns": len(source_turns),
-        "through_sequence": through_sequence,
-        "flush_reason": "explicit" if explicit_flush else "planner" if force_flush else "window_full",
-        "critic_skipped": False,
-        "operations": operations,
-        "rejections": rejections,
-        "source_message_ids": list(sanitized),
-    }
+        if not normalized:
+            result['rejections'].append({'reason': reason})
+        result['operations'].append({'operation': operation, 'memory_id': memory_id,
+            'memory_key': topic, 'topic_key': topic, 'evidence_ids': ids,
+            'superseded_memory_id': existing[0].id if existing and operation == 'supersede' else None,
+            'revision_mode': mode if existing else 'new'})
+    return result
+
+
+def memory_retrieval_text(query: str, recent_turns: list[ConversationTurn],
+                          summary: dict[str, Any] | None = None) -> str:
+    """Resolve lightweight follow-up recall without an additional model call."""
+    dependent = bool(re.search(r'^(那|然后|这种|这样|这时|他|她|它|继续|所以|what next|then)', query.strip(), re.I))
+    if not dependent:
+        return query
+    recent = '\n'.join(f'用户：{t.query[:400]}\n助手上下文：{t.assistant_text[:200]}' for t in recent_turns[-3:])
+    background = json.dumps(summary, ensure_ascii=False)[:400] if summary and not recent else ''
+    return redact_sensitive_text(f'Recent:\n{recent}\nSummary:\n{background}\nCurrent:\n{query}')
+
 
 
 def redact_sensitive_text(text: str, *, force_finance: bool = False) -> str:
@@ -765,6 +763,10 @@ def _validated_candidate(
         str(value) for value in item.get("source_message_ids", [])
         if str(value) in source_text
     ] if isinstance(item.get("source_message_ids"), list) else []
+    if isinstance(item.get('source_message_ids'), list) and any(
+        str(value) not in source_text for value in item['source_message_ids']
+    ):
+        return None, "non_user_evidence_id"
     if not content or confidence < 0.8 or not source_ids:
         return None, "missing_content_evidence_or_confidence"
     if any(pattern.search(content) for pattern in SECRET_PATTERNS):
@@ -786,6 +788,19 @@ def _validated_candidate(
         for message_id in source_ids
     ):
         return None, "question_promoted_to_belief"
+    if all(any(marker in source_text[mid] for marker in QUESTION_MARKERS)
+           and not any(marker in source_text[mid] for marker in ("我", "以后", "请记住"))
+           for mid in source_ids):
+        return None, "general_knowledge_question"
+    if any(marker in source_joined for marker in ("简单说", "简短说", "一句话")) and not any(
+        marker in source_joined for marker in ("以后", "一直", "通常", "喜欢", "偏好", "请记住")
+    ):
+        return None, "temporary_request_not_memory"
+    source_relation = _third_party_relation(source_joined)
+    if source_relation and _third_party_relation(content) != source_relation and not any(
+        marker in content for marker in ("用户担心", "用户希望")
+    ):
+        return None, "third_party_attribution_mismatch"
     if "未提供资金支持" in content and not any(
         marker in source_joined for marker in ("没给钱", "没有给钱", "未提供资金", "没出钱")
     ):
@@ -796,6 +811,7 @@ def _validated_candidate(
         str(value).strip() for value in item.get("evidence_quotes", []) if str(value).strip()
     ] if isinstance(item.get("evidence_quotes"), list) else []
     if sensitivity == "restricted":
+        content = _generalize_finance_numbers(content)
         evidence_quotes = []
     elif not evidence_quotes or any(
         quote not in "\n".join(sanitized[message_id] for message_id in source_ids)
@@ -841,12 +857,14 @@ def _memory_write_prompt(
     context_messages: list[dict[str, str]],
     source_messages: dict[str, str],
     existing: list[UserMemory],
+    existing_topics: list[str] | None = None,
 ) -> str:
     return json.dumps(
         {
             "context_messages": context_messages,
             "eligible_evidence_message_ids": list(source_messages),
             "source_messages": source_messages,
+            "existing_topics": existing_topics or [],
             "existing_memories": [
                 {
                     "id": memory.id,
@@ -967,12 +985,14 @@ def _is_explicit_forget(text: str) -> bool:
 
 def _is_explicit_remember(text: str) -> bool:
     compact = re.sub(r"\s+", "", text)
-    return any(marker in compact for marker in ("请记住", "帮我记住", "以后记得"))
+    return any(marker in compact for marker in ("请记住", "帮我记住", "以后记得", "以后都"))
 
 
 def _is_explicit_correction(text: str) -> bool:
     compact = re.sub(r"\s+", "", text)
-    return "不是" in compact and "是" in compact
+    return any(marker in compact for marker in ("前面说错了", "刚才记错了", "纠正一下")) or (
+        "不是" in compact and "是" in compact and not any(m in compact for m in ("是不是", "？", "?"))
+    )
 
 
 def _float(value: Any, default: float) -> float:
@@ -996,6 +1016,10 @@ def _sparse_dot(left: SparseEmbedding, right: SparseEmbedding) -> float:
 
 
 MEMORY_EXTRACTOR_PROMPT = """你是 PersonaForge 的用户长期记忆候选提取器。
+
+V2：提取最小可追溯的 Atomic Evidence，不重写整个用户画像。
+优先使用 existing_memories / existing_topics 中语义一致的 memory_key；仅在人物和主题
+明显不同的时候创建新 key。不要因为措辞差异拆分同一个主题，也不能合并不同亲友。
 
 context_messages 包含完整的用户与助手对话，只用于理解代词、指代和用户在回应什么。
 只有 source_messages 和 eligible_evidence_message_ids 中的用户原话可以作为记忆事实依据。
@@ -1024,7 +1048,12 @@ MEMORY_CRITIC_PROMPT = """你是用户长期记忆的保守审查器。逐条核
 余额、杠杆倍数等精确数值。只要批准，confidence 应表示经过本轮审查后的置信度。
 若多个候选具有相同 memory_key，只能输出一条。若已有相同 key，将已有 id 写入
 supersedes_id：新证据与旧内容兼容时 revision_mode=extend；出现冲突、状态改变或用户纠正
-时 revision_mode=replace，内容必须以时间更近的用户证据为准，不能把矛盾的新旧事实并列。
+时区分：时态状态变化和用户明确纠错可 revision_mode=replace；稳定偏好不能统一 latest-wins。
+V2 中 candidates 是已存储的原子证据。按 topic_key 合并成一个稳定归纳，保留来源；
+不要直接逐条 append。extend 的 content 必须包含仍成立的旧记忆和新的兼容信息，形成完整新归纳。
+考虑独立用户消息数量、source_timestamps 所示原始证据时间跨度、表达强度以及以后/通常等长期意图。
+一次“简单说”只是局部要求；不足以替换过去反复明确的详细解释偏好。
+新状态替代旧 active 状态，旧 evidence 保留。证据不足可 decision=reject，不得编造。
 不得把隐喻扩写成具体事实，例如
 “没递拐杖”本身不能推出“没有提供资金支持”。
 

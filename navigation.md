@@ -495,7 +495,7 @@ cd ..
 | Persona Pack、Narrative Schema、MRPrompt、Magic-If | `persona/SPEC.md`、`persona/writer.py`、`persona/narrative.py` | 作者画像文件、生成 run、生成 prompt、trace、Writer 测试 |
 | 生成质量、六维 rubric、人工评分、LLM judge | `eval/gold_judge.py`、`web/generation_evaluation.py`、`GenerationEvaluationWorkspace.tsx` | `data/eval/<dataset>/judge_*`、API schema、前端类型、judge 测试 |
 | Chat 多轮上下文、planner、摘要 | `web/SPEC.md`、`web/multiturn.py`、`web/conversations.py` | `service.py`、SQLite schema、trace、multiturn 测试 |
-| 用户长期记忆 | `web/user_memory.py`、`web/SPEC.md` | SQLite、Chat 上下文选择、记忆页面、用户记忆测试 |
+| 用户长期记忆 | `web/user_memory.py`、`web/memory_evidence.py`、`web/SPEC.md` | SQLite 原子证据/checkpoint、低频归纳、Chat recall/gate、`test_memory_v2.py`、generation/context-memory-v2.md |
 | trace、耗时、token、检索过程 | `web/trace.py`、`web/streaming.py`、`web/SPEC.md` | `service.py`、`api.ts`、开发者模式页面、trace 测试 |
 | Study 1 协议、材料、参与者流程 | `studies/SPEC.md`、`docs/research/STUDY1_PROTOCOL_V2.md` | `studies/study1_materials.py`、`study1_service.py`、`StudyWorkspace.tsx`、材料审计和实验测试 |
 | Study 1 统计字段、导出、回放 | `studies/study1_analysis.py`、`StudyWorkspace.tsx` | SQLite 导出、分析包、管理员回放、研究文档 |
@@ -512,3 +512,6 @@ cd ..
 6. 如果目录、接口、字段或运行命令改变，同步更新 SPEC 和本导航。
 7. 检查 `.env`、auth state、raw corpus、Qdrant、评估结果没有被提交。
 ```
+
+Context V2 的 Writer 输入预算实现位于 `persona/writer.py` 与 `persona/context_budget.py`，
+服务配置/trace 位于 `web/service.py`；修改预算同时检查 `tests/test_context_budget.py`。

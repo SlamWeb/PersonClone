@@ -153,3 +153,54 @@ def test_memory_trace_failure_does_not_reopen_completed_turn(tmp_path) -> None:
 
     assert store.get_turn(turn.id).status == "completed"
     assert [event["event"] for event in store.list_events(turn.id)][-1] == "done"
+
+
+def test_memory_extraction_failure_keeps_answer_completed(tmp_path, monkeypatch):
+    from personaforge.web.user_memory import UserMemoryStore
+    import personaforge.web.chat_tasks as tasks
+    store = ConversationStore(tmp_path)
+    service = FakeChatService(store)
+    service.user_memories = UserMemoryStore(tmp_path)
+    def fail(*args, **kwargs):
+        raise RuntimeError('private provider input must not appear in trace')
+    monkeypatch.setattr(tasks, 'update_user_memories', fail)
+    manager = ChatTaskManager(service, store=store, worker_count=1)
+    turn = manager.create_turn(author='alice',conversation_id=None,query='问题',query_mode='raw',
+        writer_prompt='strong_identity',parent_top_k=20,trace_capture='summary')
+    manager.run_once()
+    assert store.get_turn(turn.id).status == 'completed'
+    assert store.list_events(turn.id)[-1]['event'] == 'done'
+    assert service.memory_updates[0]['memory_update']['user_memory']['status'] == 'failed'
+    assert 'private provider input' not in str(service.memory_updates)
+
+
+def test_idle_recovery_uses_durable_conversation_without_prepared_chat(tmp_path):
+    from personaforge.web.user_memory import UserMemoryStore
+    from test_user_memory import FakeLlm
+    store = ConversationStore(tmp_path)
+    service = FakeChatService(store)
+    service.user_memories = UserMemoryStore(tmp_path)
+    llm = FakeLlm([{'candidates':[]}])
+    service.llm_client = lambda: llm
+    turn = store.save_completed_turn(conversation_id='c',author='alice',query='Redis AOF 是什么？',
+        answer='日志。',sources=[],trace_id=None)
+    manager = ChatTaskManager(service,store=store,worker_count=1)
+    assert manager.recover_idle_memories(idle_seconds=0) == 1
+    assert service.user_memories.window_checkpoint('local-user','c') == store.get_completed_turns('c')[0].sequence
+    assert manager.recover_idle_memories(idle_seconds=0) == 0
+
+
+def test_memory_checkpoint_waits_for_retryable_earlier_turn(tmp_path):
+    store = ConversationStore(tmp_path)
+    failed = store.create_turn(author='alice',conversation_id='c',query='先前的问题',query_mode='raw',
+        writer_prompt='strong_identity',parent_top_k=20,trace_capture='summary')
+    store.claim_turn(failed.id)
+    store.fail_turn(failed.id,{'message':'failed'})
+    store.save_completed_turn(conversation_id='c',author='alice',query='后来的问题',
+        answer='回答',sources=[],trace_id=None)
+    assert len(store.get_completed_turns('c')) == 1
+    assert store.get_memory_eligible_turns('c') == []
+    store.retry_turn(failed.id)
+    store.claim_turn(failed.id)
+    store.complete_turn(failed.id,answer='重试回答',sources=[],trace_id=None)
+    assert len(store.get_memory_eligible_turns('c')) == 2

@@ -28,3 +28,14 @@ def test_estimated_usage_is_explicitly_labelled() -> None:
     assert usage["source"] == "estimated"
     assert usage["estimated_tokens"] > 0
     assert "note" in usage
+
+
+def test_full_trace_redacts_restricted_finance_and_credentials(tmp_path):
+    payload = {'writer': {'full_messages': [
+        {'role': 'user', 'content': '我哥贷款十倍杠杆亏掉20w，怎么办？ password=secret'}]},
+        'token_budget': {'total_writer_input_tokens': 12345}}
+    write_trace(tmp_path, 'alice', 'trace-redacted', payload)
+    result = read_trace(tmp_path, 'alice', 'trace-redacted')
+    assert '20w' not in str(result) and '十倍' not in str(result) and 'secret' not in str(result)
+    assert result['token_budget']['total_writer_input_tokens'] == 12345
+    assert '20w' in payload['writer']['full_messages'][0]['content']

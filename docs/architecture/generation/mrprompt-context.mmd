@@ -33,13 +33,17 @@ flowchart TB
 
     LIMIT["动态 max_tokens<br/>取检索 Top5 正文 token 中位数 typical<br/><b>brief</b>: 0.55×，限制在 192..512<br/><b>normal</b>: 至少 600<br/><b>deep</b>: 1.35×，至少 900<br/>最终不超过服务 configured_max"]
     CALL["E. Writer 流式调用<br/><b>temperature</b>: 0.85<br/><b>max_tokens</b>: 动态上限<br/><b>input</b>: messages 数组<br/><b>output</b>: 最终回答 token stream"]
-    ARRAY --> CALL
+    ARRAY --> BUDGET["分项 token 估算 + 输入预算<br/>保留当前请求与明确约束，裁减低优先级上下文<br/>记录 before / after / omissions；受保护内容仍超限则显式失败"] --> CALL
     LIMIT --> CALL
     ANSWER["最终回答<br/>实时送往 React，只显示回答正文<br/>引用来源由服务层根据 Parent 另行展示"]
     CALL --> ANSWER
 
-    AFTER["F. 回答完成后的维护队列<br/>更新更早会话摘要<br/>用户记忆窗口每 3 个新 turn 检查一次<br/>明确记住、纠正或遗忘请求可立即 flush<br/>维护失败不会回滚已经生成的回答"]
+    AFTER["F. 回答完成后的维护队列<br/>更新更早会话摘要<br/>按最早未处理窗口每 3 个 turn 提取 Atomic Evidence<br/>动态 topic 低频 Consolidation，空闲恢复积压<br/>明确记住、纠正或遗忘请求可立即 flush<br/>维护失败不会回滚已经生成的回答"]
     ANSWER --> AFTER
+    AFTER --> ATOMS["user_memory_evidence<br/>可追溯原子证据 + 提取 checkpoint 原子提交"]
+    ATOMS --> DREAM["动态 memory_key / Consolidation<br/>Memory 版本与 evidence 状态原子提交"]
+    DREAM --> RECALL["active User Memory<br/>Context-aware Dense + Sparse / RRF Top8"]
+    RECALL --> GATE["Planner Utility Gate 0..4<br/>个人事实高门槛，允许 0"] --> USERMEM
 
     NOTE["三种‘记忆’不要混淆<br/><b>Narrative Schema</b>：作者是谁、如何观察和表达<br/><b>Conversation Summary / History</b>：这次会话聊过什么<br/><b>User Memory</b>：当前用户是谁、有哪些长期背景与偏好"]
     NOTE -.-> USERMEM

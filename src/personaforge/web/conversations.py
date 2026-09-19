@@ -59,6 +59,7 @@ class ConversationTurn:
     trace_id: str | None
     parent_ids: list[str]
     sequence: int
+    created_at: str | None = None
 
     @property
     def memory_text(self) -> str:
@@ -745,7 +746,7 @@ class ConversationStore:
                 SELECT
                     t.id, t.conversation_id, t.author, t.user_message_id,
                     t.assistant_message_id, t.trace_id, t.parent_ids_json,
-                    u.text AS query, u.sequence AS user_sequence,
+                    u.text AS query, u.sequence AS user_sequence, u.created_at AS user_created_at,
                     a.text AS assistant_text, a.status AS assistant_status
                 FROM turn_runs t
                 JOIN messages u ON u.id = t.user_message_id
@@ -768,9 +769,21 @@ class ConversationStore:
                 trace_id=str(row["trace_id"]) if row["trace_id"] else None,
                 parent_ids=_json_string_list(row["parent_ids_json"]),
                 sequence=int(row["user_sequence"]),
+                created_at=str(row["user_created_at"]),
             )
             for row in rows
         ]
+
+    def get_memory_eligible_turns(self, conversation_id: str) -> list[ConversationTurn]:
+        """Do not advance derived checkpoints past a turn that may still be retried."""
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT MIN(u.sequence) FROM turn_runs t JOIN messages u ON u.id=t.user_message_id
+                WHERE t.conversation_id=? AND t.status != 'completed'""", (conversation_id,),
+            ).fetchone()
+        barrier = row[0] if row else None
+        return [t for t in self.get_completed_turns(conversation_id)
+                if barrier is None or t.sequence < barrier]
 
     def get_summary(self, conversation_id: str) -> dict[str, Any]:
         with self._connect() as connection:

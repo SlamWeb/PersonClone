@@ -56,6 +56,7 @@ from personaforge.web.user_memory import (
     UserMemory,
     UserMemoryStore,
     recall_user_memories,
+    memory_retrieval_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -76,6 +77,9 @@ class WebConfig:
     max_search_results: int = 5
     temperature: float = 0.85
     max_tokens: int = 1600
+    writer_context_budget: int = field(
+        default_factory=lambda: _positive_env_int("PERSONAFORGE_WRITER_CONTEXT_BUDGET", 64000)
+    )
     trace_retention: int = DEFAULT_TRACE_RETENTION
     index_batch_size: int = 12
     auth_required: bool = True
@@ -89,6 +93,8 @@ class WebConfig:
     def __post_init__(self) -> None:
         if self.chat_max_concurrency < 1:
             raise ValueError("chat_max_concurrency must be a positive integer")
+        if self.writer_context_budget <= self.max_tokens:
+            raise ValueError("writer_context_budget must leave room for Writer input")
 
 
 @dataclass(slots=True)
@@ -461,7 +467,7 @@ class PersonaChatService:
                 memory_hits = recall_user_memories(
                     self.user_memories,
                     owner_id,
-                    query,
+                    memory_retrieval_text(query, recent_turns, dict(summary_state.get("summary") or {})),
                     encoder=self._get_encoder(),
                     model=self.config.model_name,
                     limit=8,
@@ -519,8 +525,6 @@ class PersonaChatService:
             selected_memories = [
                 memory for memory in memory_candidates if memory.id in set(plan.memory_ids)
             ]
-            if selected_memories:
-                self.user_memories.mark_accessed(owner_id, [memory.id for memory in selected_memories])
             if turn_id:
                 self.conversations.set_turn_plan(turn_id, plan.to_dict())
 
@@ -732,7 +736,10 @@ class PersonaChatService:
 
             yield ChatProgress(stage="writer", label="正在准备回答")
             writer_started_at = perf_counter()
+            writer_budget: dict[str, Any] = {}
             messages = build_writer_messages(
+                input_token_budget=self.config.writer_context_budget - self.config.max_tokens,
+                budget_trace=writer_budget,
                 query=query,
                 parent_hits=retrieve_result.parents,
                 objective_background=objective_background,
@@ -745,6 +752,9 @@ class PersonaChatService:
                 clarification_focus=plan.clarification_focus if plan.turn_type == "unclear" else "",
                 user_memories=[memory.content for memory in selected_memories],
             )
+            selected_memories = selected_memories[:writer_budget['final_injected_memory_count']]
+            if selected_memories:
+                self.user_memories.mark_accessed(owner_id, [memory.id for memory in selected_memories])
             _raise_if_cancelled(cancelled)
             response_max_tokens = response_token_limit(
                 plan.response_depth,
@@ -758,6 +768,7 @@ class PersonaChatService:
                     writer_started_at,
                     details={
                         "parent_count": len(retrieve_result.parents),
+                        "token_budget": writer_budget,
                         "history_turn_count": len(selected_turns),
                         "message_count": len(messages),
                         "context_characters": sum(
@@ -1037,7 +1048,10 @@ class PersonaChatService:
 
             yield ChatProgress(stage="writer", label="正在准备回答")
             writer_started_at = perf_counter()
+            writer_budget: dict[str, Any] = {}
             messages = build_writer_messages(
+                input_token_budget=self.config.writer_context_budget - self.config.max_tokens,
+                budget_trace=writer_budget,
                 query=query,
                 parent_hits=retrieve_result.parents,
                 objective_background=objective_background,
@@ -1052,6 +1066,7 @@ class PersonaChatService:
                     writer_started_at,
                     details={
                         "parent_count": len(retrieve_result.parents),
+                        "token_budget": writer_budget,
                         "message_count": len(messages),
                         "context_characters": sum(len(message.get("content", "")) for message in messages),
                         "persona_pack_id": persona_pack.pack_id if persona_pack else None,

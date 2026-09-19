@@ -298,3 +298,12 @@ API：`GET /api/personas/{author}/routing-profile` 查询，管理员通过
 `POST /api/personas/{author}/routing-profile/rebuild` 独立重建。CreatorOS 只能通过这些
 稳定 API 使用画像，不读取 PersonClone 内部作者目录；热点发现、候选召回、最终决策和内容
 生成仍属于 CreatorOS，暂不在本模块实现。
+
+
+## Context V2 Writer budget
+
+`build_writer_messages` 保持原有 prompt 与未超预算的消息结构，增加 provider-neutral 输入预算。
+Web 配置 `PERSONAFORGE_WRITER_CONTEXT_BUDGET`，扣除最大输出后传入；直接调用默认输入 48000。
+分项估算、25% 余量、裁减顺序与明确约束保护见
+`docs/architecture/generation/context-memory-v2.md`。预算保护覆盖单轮及多轮构建入口。
+不改变 Narrative Schema、RAG 排序或作者生成策略；过大的受保护输入显式失败，不静默截断。

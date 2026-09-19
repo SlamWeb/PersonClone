@@ -5,6 +5,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
+import logging
 from typing import Any
 
 from personaforge.web.conversations import ConversationStore, TurnRun
@@ -149,10 +150,17 @@ class ChatTaskManager:
                 self._queue.task_done()
 
     def _maintenance_loop(self) -> None:
+        next_recovery = 0.0
         while True:
             try:
                 item = self._maintenance_queue.get(timeout=0.25)
             except queue.Empty:
+                if time.monotonic() >= next_recovery:
+                    try:
+                        self.recover_idle_memories()
+                    except Exception as exc:
+                        logging.getLogger(__name__).warning("Memory recovery failed (%s)", type(exc).__name__)
+                    next_recovery = time.monotonic() + 60
                 continue
             if item is None:
                 return
@@ -310,12 +318,12 @@ class ChatTaskManager:
                     prepared.owner_id,
                     author=prepared.author,
                     conversation_id=prepared.session_id,
-                    user_turns=self.store.get_completed_turns(prepared.session_id),
+                    user_turns=self.store.get_memory_eligible_turns(prepared.session_id),
                     llm=self.service.llm_client(),
                     related_memories=[
                         memory
                         for memory in (prepared.recalled_memories or [])
-                        if memory.id in set(prepared.selected_memory_ids or [])
+                        if memory.id in set((prepared.turn_plan or {}).get('memory_ids', prepared.selected_memory_ids) or [])
                     ],
                     force_flush=bool(
                         prepared.turn_plan
@@ -326,7 +334,7 @@ class ChatTaskManager:
                 user_memory_payload = {
                     "status": "failed",
                     "duration_ms": round((time.perf_counter() - user_memory_started_at) * 1000),
-                    "error": trace_error(exc),
+                    "error": {"type": type(exc).__name__, "message": "Memory maintenance failed; durable work will retry."},
                     "operations": [],
                     "rejections": [],
                 }
@@ -351,3 +359,47 @@ class ChatTaskManager:
             # Memory and trace enrichment are derived data. A completed answer
             # must remain completed even when this post-response write fails.
             return
+
+    def recover_idle_memories(self, *, idle_seconds: int = 300) -> int:
+        """Single maintenance worker recovers durable backlog after restart or an idle session.
+
+        No in-memory PreparedChat is required. Full conversations remain the source.
+        """
+        if not hasattr(self.service, 'user_memories'):
+            return 0
+        with self.store._connect() as connection:
+            rows = connection.execute(
+                """SELECT c.id, c.owner_id, c.author FROM conversations c
+                WHERE (julianday('now') - julianday(c.updated_at))*86400 >= ?
+                AND NOT EXISTS (SELECT 1 FROM turn_runs t WHERE t.conversation_id=c.id
+                                AND t.status IN ('queued','running'))
+                AND (EXISTS (
+                    SELECT 1 FROM turn_runs t JOIN messages u ON u.id=t.user_message_id
+                    WHERE t.conversation_id=c.id AND t.status='completed'
+                    AND u.sequence > COALESCE((SELECT through_sequence FROM user_memory_checkpoints cp
+                        WHERE cp.owner_id=c.owner_id AND cp.conversation_id=c.id),0))
+                    OR EXISTS (SELECT 1 FROM user_memory_evidence e WHERE e.owner_id=c.owner_id
+                               AND e.source_conversation_id=c.id AND e.status='pending'))
+                ORDER BY c.updated_at DESC LIMIT 20""", (idle_seconds,),
+            ).fetchall()
+        processed = 0
+        for row in rows:
+            turns = self.store.get_memory_eligible_turns(row['id'])
+            try:
+                selected = []
+                if turns:
+                    plan = self.store.get_turn(turns[-1].id).planner or {}
+                    active = {m.id: m for m in self.service.user_memories.list_active(row['owner_id'])}
+                    selected = [active[mid] for mid in plan.get('memory_ids', []) if mid in active]
+                payload = update_user_memories(self.service.user_memories, row['owner_id'],
+                    author=row['author'], conversation_id=row['id'], user_turns=turns,
+                    llm=self.service.llm_client(), force_flush=True, related_memories=selected)
+                processed += 1
+                if turns and turns[-1].trace_id:
+                    self.service.update_memory_trace(author=row['author'], trace_id=turns[-1].trace_id,
+                        memory_update={'status': 'completed', 'trigger': 'idle_recovery', 'user_memory': payload},
+                        answer=turns[-1].assistant_text)
+            except Exception as exc:
+                # Never log provider responses, which may contain raw restricted input.
+                logging.getLogger(__name__).warning("Memory recovery failed (%s)", type(exc).__name__)
+        return processed

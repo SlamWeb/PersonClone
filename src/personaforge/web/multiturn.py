@@ -162,7 +162,7 @@ def parse_turn_plan(
         memory_write_policy = "defer"
     memory_ids = [
         memory_id
-        for memory_id in _string_list(payload.get("memory_ids"))
+        for memory_id in dict.fromkeys(_string_list(payload.get("memory_ids")))
         if memory_id in available_memory_ids
     ][:4]
 
@@ -496,6 +496,11 @@ def _explicit_memory_write_policy(query: str) -> MemoryWritePolicy:
 
 
 TURN_PLANNER_SYSTEM_PROMPT = """你是 PersonaForge 的 Conversation-aware Turn Planner。
+
+Memory utility gate 必须偏 precision：只有记忆会实质改变当前回答才选；普通问题允许 memory_ids=[]。
+行为偏好（解释节奏、长短）可影响表达；职业、亲友关系、财务和生活事件等个人事实必须与
+当前问题直接有关，门槛更高。用户问 Redis AOF 等普通知识时，不带入职业、关系或求职经历。
+即使候选被 pinned，也不代表本轮应该使用。不要为了表现了解用户而强行个性化。
 
 你只负责理解当前用户在延续什么话题、把残缺追问补成可独立检索的问题，并决定
 是否需要联网和作者历史检索。你不能模仿作者，不能预测作者立场，不能生成答案。

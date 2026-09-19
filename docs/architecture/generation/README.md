@@ -48,7 +48,22 @@ Parent 聚合只使用名次，不把 Dense、Sparse 的原始相似度跨模型
 
 这张图回答“最终送给 Writer LLM 的完整信息由什么组成”。它特别区分了作者身份记忆、当前用户记忆和会话记忆，三者作用不同。
 
-![PersonaForge MRPrompt 上下文窗口](mrprompt-context.png)
+当前 V2 以 [MRPrompt 图源码](mrprompt-context.mmd) 和
+[Context / Memory V2 审计、生命周期与合同](context-memory-v2.md) 为准；旧 PNG 是 V1 快照。
+
+```mermaid
+flowchart LR
+    C[Full Conversation] --> H[Summary + Recent + Relevant]
+    C --> E[Atomic Evidence]
+    E --> T[Dynamic Topics / Consolidation]
+    T --> M[Consolidated User Memory]
+    M --> R[Context-aware Recall Top8]
+    R --> G[Planner Utility Gate 0..4]
+    G --> W[Budgeted Working Context]
+    H --> W
+    N[Narrative Schema + Author Evidence + Background] --> W
+    W --> O[Writer]
+```
 
 对应源码：[mrprompt-context.mmd](mrprompt-context.mmd)
 
@@ -89,7 +104,7 @@ Parent 聚合只使用名次，不把 Dense、Sparse 的原始相似度跨模型
 2. Background + Query Transform：根据可选搜索结果生成客观背景和四路本地检索 query。
 3. Writer：接收 MRPrompt 上下文并流式生成最终回答。
 
-回答完成后，维护线程可能额外调用会话摘要、User Memory Extractor 和 User Memory Critic。这些调用不阻塞用户看到答案。
+回答完成后，维护线程可能额外调用会话摘要、Atomic Evidence Extractor 和低频 Memory Consolidator / Critic。这些调用不阻塞用户看到答案。
 
 特殊分支：
 
@@ -125,3 +140,11 @@ Parent 聚合只使用名次，不把 Dense、Sparse 的原始相似度跨模型
 - RAG 与 Generate 评估平台如何生成指标。
 
 它们分别属于后续的“入库链路”“RAG 评估链路”和“生成评估链路”架构图。
+
+
+## 7. V2 交付与验证
+
+完整审计、schema、checkpoint/重试/隐私边界、分项预算、测试映射与 V3 方向见
+[context-memory-v2.md](context-memory-v2.md)。Conversation Summary 压缩本次会话远期历史；
+Atomic Evidence 保留可追溯用户证据；Consolidated Memory 是经归纳的跨会话用户模型；
+Retrieval 只产候选，Gate 才决定当前用途；Narrative Schema 始终描述作者，不描述用户。

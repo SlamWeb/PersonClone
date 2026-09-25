@@ -30,6 +30,7 @@ from personaforge.persona.narrative_builder import (
     NarrativeSchemaSelectionConfig,
 )
 from personaforge.persona.routing_profile import RoutingProfileBuilder
+from personaforge.persona.wiki import build_persona_wiki, load_persona_wiki
 from personaforge.persona.suggestions import generate_suggestions
 from personaforge.persona.writer import WRITER_PROMPT_CHOICES, build_prompt_pack, generate_answer
 
@@ -571,6 +572,12 @@ def build_parser() -> argparse.ArgumentParser:
     routing_parser.add_argument("--force", action="store_true", help="Ignore an unchanged cached profile.")
     routing_parser.add_argument("--no-llm", action="store_true", help="Use provisional labels and skip LLM calls.")
 
+    wiki_parser = subparsers.add_parser(
+        "persona-wiki", help="Compile validated Pack and Narrative assets into an author Wiki."
+    )
+    wiki_parser.add_argument("author", help="Creator token.")
+    wiki_parser.add_argument("--data-dir", default="data", help="Local data root.")
+
     web_parser = subparsers.add_parser("web", help="Start the local Web UI.")
     web_parser.add_argument("author", nargs="?", help="Creator token.")
     web_parser.add_argument(
@@ -720,6 +727,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "routing-profile":
         return _run_routing_profile(args)
+
+    if args.command == "persona-wiki":
+        author = parse_user_token(args.author)
+        index_dir = Path(args.data_dir) / "authors" / "zhihu" / author / "index"
+        path = build_persona_wiki(index_dir)
+        wiki = load_persona_wiki(index_dir)
+        print(f"Persona Wiki: {path}")
+        print(f"- author: {wiki['author_id']}")
+        print(f"- cards: {len(wiki['cards'])}")
+        return 0
 
     if args.command == "web":
         return _run_web(args)

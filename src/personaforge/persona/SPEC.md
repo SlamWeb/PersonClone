@@ -181,6 +181,34 @@ data/authors/zhihu/<author>/narrative_schema.json
 
 旧的 `persona_pack` 变体继续保留用于兼容和对照；前端允许显式切换 Writer，默认值只决定首次进入和没有本地选择记录时的优先分支。
 
+## Persona Wiki 首步迁移资产
+
+`pf persona-wiki <author> --data-dir <data>` 将作者目录里现有的 Persona Pack 和 Narrative Schema 编译成一份 `persona_wiki.json`。编译是离线确定性的，不调用 LLM；构建前复用两个旧加载器逐字核验 `index/parents.jsonl` 中的引用。作者 ID 不一致或证据失效时不覆盖旧 Wiki。
+
+Wiki 的 `core` 暂取 Narrative Schema 的公开身份、全局概括和稳定倾向（没有 Schema 时只有 Pack 的显示名），`cards` 保留 Pack claim 与 Schema scene facet 的独立命名空间、条件、边界、原文摘录及来源哈希。`shared_source_links` 仅表示共用原文文档，不能解释为支持、矛盾或语义去重。Wiki loader 再次验证原文摘录；逐字存在不等于对作者立场的语义判断已被证实。
+
+Web 默认 `mrprompt` 在可用时自动构建/刷新并使用整份 Wiki；旧文件仍作构建输入，Wiki 校验失败时回退到 Narrative Schema。当前不对 Wiki 卡片做 query-time 检索。Writer 固定前缀依次是 System + 整份 Wiki、当前登录用户的全部活跃记忆（仅设置启用时）、更早会话摘要、原始角色历史消息；本轮 Raw 与当前问题留在后面。Wiki 与用户记忆在预算压力下不被静默删减，超出预算明确失败。服务按 Wiki、原文库和源资产文件版本缓存已核验 Wiki，不在每轮重扫原文。暂不宣称该 Wiki 已完成语义去重或表现优于旧 Schema。
+
+## Persona Wiki V2 本地试跑（暂不接 Web）
+
+`wiki_pilot.py` 是独立于上述 Pack/Schema 迁移资产的试跑校验器。候选观察和主题草稿由模型读取训练期原文后生成；此模块只检查选样是否避开冻结评测的 `excluded_parent_ids`、正文哈希、逐字摘录、来源覆盖、观察引用和主题 ID，并渲染不含内部文档 ID 的人物概览、主题页及风格页。来源存在只能证明摘录真实，不能证明模型转述在语义上正确；语义检查另行进行。
+
+主题页可选 `section_path`（零到三级标题路径）组织阅读层级；原始来源仍由独立观察账本追溯，页面层级不把原文当作树叶，也不要求当前 Writer 具备 Wiki 搜索能力。
+
+本地命令：
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m personaforge.persona.wiki_pilot `
+  --index-dir data/authors/zhihu/<author>/index `
+  --pilot-dir data/authors/zhihu/<author>/persona_wiki_v2_pilot `
+  --eval-manifest data/eval/<dataset>/dataset_manifest.json
+```
+
+试跑目录下的 `sample_manifest.json`、`source_outcomes.jsonl`、`observations.jsonl` 和 `wiki_draft.json` 是输入；验证成功后生成 `persona_wiki_readable.md` 和 `validation_report.json`。所有真实作者试跑文件留在被 Git 忽略的 `data/` 下，不覆盖当前 `persona_wiki.json`，不改变 Writer 或 Web。旧 Pack/Schema 只用于最终结果对照，不作为 V2 的建库输入。
+
+全量训练 Wiki 在同一命令后加 `--require-full-train`。此模式要求样本清单的 `author` 匹配冻结评测作者、`documents` 正好覆盖当前索引扣除 `excluded_parent_ids` 后的所有训练文档、全部文档各有处理结果且各自明确 `reviewed: true`，并核对冻结索引与排除名单的规范化 SHA-256。`uncertain` 可以是完成审阅后的结论，但不能拿来掩盖未审阅材料。最终 `wiki_draft.json` 须把 `source_observations_sha256` 绑定到本次合并后的整份观察清单，防止旧40篇草稿伪装成全量 Wiki。验证报告记录训练覆盖、已审阅数、数据集/索引/观察/Wiki 草稿的规范化与文件字节哈希，以及可读版哈希；这只是来源与版本完整性校验，不等于语义质量或生成效果验收。完成整份 Wiki 后再做生成质量对照，不以 40 篇试跑结果判断效果。
+
 ## 上下文打包
 
 `pack_author_context(...)` 接收已经按 `writer_context_top_k` 截断的 parent hits，输出给 writer 的紧凑上下文。

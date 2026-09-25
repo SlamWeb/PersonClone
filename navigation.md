@@ -9,7 +9,7 @@
 ```text
 内容入库主线：知乎内容 -> Markdown -> parent/child 节点 -> BGE-M3 -> Qdrant
 作者路由画像：parents.jsonl 标题 -> BGE-M3 聚类 + Narrative/Pack -> routing_profile.json + creator_routing_profiles
-产品对话主线：用户问题 -> query understanding/transform -> 检索 -> Narrative Schema -> Writer -> 流式回答
+产品对话主线：用户问题 -> query understanding/transform -> 检索 -> Persona Wiki（失败时回退 Narrative Schema）-> Writer -> 流式回答
 质量验证主线：冻结问题 -> 检索候选池/生成结果 -> 人工或 LLM 评分 -> 可复现结果
 ```
 
@@ -138,6 +138,8 @@ data/authors/zhihu/<author-token>/index/
 | `narrative.py` | 读取 Narrative Schema，并提供作者叙事信息 |
 | `narrative_builder.py` | 从标题聚类的代表 parent 全文生成、校验并缓存作者级 Narrative Schema |
 | `pack.py` | 兼容旧版 Persona Pack |
+| `wiki.py` | 将已核验的 Pack 和 Narrative Schema 编译为单份可追溯 Persona Wiki；Web 的 MRPrompt 固定注入整份 Wiki |
+| `wiki_pilot.py` | 独立核验新 Persona Wiki 试跑的训练期边界、来源摘录和页面引用，渲染本地可读视图；暂不接 Web |
 | `routing_profile.py` | 生成、更新并查询供 CreatorOS 使用的 domain/perspective 原型；不改变问答 RAG |
 | `suggestions.py` | 生成产品页面上的建议问题 |
 | `SPEC.md` | Persona Pack、Narrative Schema、writer 和 RAG 上下文边界 |
@@ -149,7 +151,7 @@ data/authors/zhihu/<author-token>/index/
 -> query understanding / transform
 -> dense+sparse+RRF 召回
 -> 截取 writer context top-k（可做 RAG20/RAG5 对比）
--> Narrative Schema 或旧 Persona Pack
+-> Persona Wiki，或兼容用的 Narrative Schema / Persona Pack
 -> 作者身份、边界、Magic-If 等写作指令
 -> LLM provider
 -> 回答和 trace

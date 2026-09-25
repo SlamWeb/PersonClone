@@ -31,6 +31,7 @@ from personaforge.ingest.retrieve import ParentHit, RetrieveResult, retrieve_par
 from personaforge.llm import DeepSeekJsonClient, JsonChatClient
 from personaforge.persona.narrative import load_narrative_schema_for_index
 from personaforge.persona.pack import load_persona_pack_for_index
+from personaforge.persona.wiki import build_persona_wiki, load_persona_wiki
 from personaforge.persona.writer import build_writer_messages
 from personaforge.web.conversations import ConversationStore
 from personaforge.web.multiturn import (
@@ -272,8 +273,46 @@ class PersonaChatService:
         self._encoder_warmup_error: str | None = None
         self._llm = llm
         self._llm_local = threading.local()
+        self._wiki_lock = threading.Lock()
+        self._wiki_cache: dict[Path, tuple[tuple[Any, ...], dict[str, Any]]] = {}
         self.conversations = conversation_store or ConversationStore(config.data_dir)
         self.user_memories = user_memory_store or UserMemoryStore(config.data_dir)
+
+    def _load_persona_wiki(self, index_dir: Path) -> dict[str, Any]:
+        """Verify once per file version, then reuse the immutable Wiki in memory."""
+
+        index_dir = index_dir.resolve()
+        paths = (
+            index_dir.parent / "persona_wiki.json",
+            index_dir / "parents.jsonl",
+            index_dir.parent / "persona_pack.json",
+            index_dir.parent / "narrative_schema.json",
+            index_dir / "persona_pack.json",
+            index_dir / "narrative_schema.json",
+        )
+        with self._wiki_lock:
+            if not paths[0].exists():
+                build_persona_wiki(index_dir)
+            signature = tuple(
+                (path.stat().st_mtime_ns, path.stat().st_size) if path.exists() else None
+                for path in paths
+            )
+            cached = self._wiki_cache.get(index_dir)
+            if cached is not None and cached[0] == signature:
+                return cached[1]
+            try:
+                wiki = load_persona_wiki(index_dir)
+            except ValueError as exc:
+                if "source changed; rebuild" not in str(exc):
+                    raise
+                build_persona_wiki(index_dir)
+                wiki = load_persona_wiki(index_dir)
+                signature = tuple(
+                    (path.stat().st_mtime_ns, path.stat().st_size) if path.exists() else None
+                    for path in paths
+                )
+            self._wiki_cache[index_dir] = (signature, wiki)
+            return wiki
 
     def prepare_encoder_runtime(self) -> None:
         """Load native embedding dependencies before any app worker threads start."""
@@ -425,9 +464,20 @@ class PersonaChatService:
                 if writer_prompt == "persona_pack"
                 else None
             )
+            persona_wiki = None
+            wiki_fallback_reason = None
+            if writer_prompt == "mrprompt":
+                try:
+                    persona_wiki = self._load_persona_wiki(index_dir)
+                    if persona_wiki["author_id"] != selected_author:
+                        raise ValueError("Persona Wiki belongs to a different author.")
+                except (ValueError, FileNotFoundError, json.JSONDecodeError) as exc:
+                    persona_wiki = None
+                    wiki_fallback_reason = type(exc).__name__
+                    logger.warning("Persona Wiki unavailable for %s: %s", selected_author, exc)
             narrative_schema = (
                 load_narrative_schema_for_index(index_dir, required=True)
-                if writer_prompt == "mrprompt"
+                if writer_prompt == "mrprompt" and persona_wiki is None
                 else None
             )
             stages: list[dict[str, Any]] = []
@@ -464,23 +514,28 @@ class PersonaChatService:
             memory_candidates: list[UserMemory] = []
             if query_mode == "grounded":
                 memory_started_at = perf_counter()
-                memory_hits = recall_user_memories(
-                    self.user_memories,
-                    owner_id,
-                    memory_retrieval_text(query, recent_turns, dict(summary_state.get("summary") or {})),
-                    encoder=self._get_encoder(),
-                    model=self.config.model_name,
-                    limit=8,
-                )
+                if persona_wiki is not None:
+                    if self.user_memories.settings(owner_id)["enabled"]:
+                        memory_candidates = self.user_memories.list_active(owner_id)
+                else:
+                    memory_hits = recall_user_memories(
+                        self.user_memories,
+                        owner_id,
+                        memory_retrieval_text(query, recent_turns, dict(summary_state.get("summary") or {})),
+                        encoder=self._get_encoder(),
+                        model=self.config.model_name,
+                        limit=8,
+                    )
+                    memory_candidates = [hit.memory for hit in memory_hits]
                 _raise_if_cancelled(cancelled)
-                memory_candidates = [hit.memory for hit in memory_hits]
                 stages.append(
                     self._stage(
                         "user_memory_recall",
-                        "召回跨会话用户记忆",
+                        "读取固定用户记忆" if persona_wiki is not None else "召回跨会话用户记忆",
                         memory_started_at,
                         details={
-                            "candidate_count": len(memory_hits),
+                            "mode": "fixed_prefix" if persona_wiki is not None else "dynamic_recall",
+                            "candidate_count": len(memory_candidates),
                             "candidates": [hit.trace_payload() for hit in memory_hits],
                         },
                     )
@@ -522,9 +577,10 @@ class PersonaChatService:
                 )
             )
             planner_duration_ms = elapsed_ms(planner_started_at)
-            selected_memories = [
-                memory for memory in memory_candidates if memory.id in set(plan.memory_ids)
-            ]
+            selected_memories = (
+                memory_candidates if persona_wiki is not None else
+                [memory for memory in memory_candidates if memory.id in set(plan.memory_ids)]
+            )
             if turn_id:
                 self.conversations.set_turn_plan(turn_id, plan.to_dict())
 
@@ -746,6 +802,7 @@ class PersonaChatService:
                 writer_prompt=writer_prompt,
                 persona_pack=persona_pack,
                 narrative_schema=narrative_schema,
+                persona_wiki=persona_wiki,
                 conversation_summary=conversation_context.summary,
                 conversation_messages=turns_to_chat_messages(selected_turns),
                 response_depth=plan.response_depth,
@@ -782,6 +839,10 @@ class PersonaChatService:
                         "narrative_schema_id": narrative_schema.schema_id if narrative_schema else None,
                         "narrative_schema_sha256": narrative_schema.sha256 if narrative_schema else None,
                         "narrative_schema_facet_count": narrative_schema.facet_count if narrative_schema else 0,
+                        "persona_wiki_source_hashes": persona_wiki["source_hashes"] if persona_wiki else None,
+                        "persona_wiki_mode": "fixed_prefix" if persona_wiki else "legacy_fallback",
+                        "persona_wiki_card_ids": writer_budget.get("final_wiki_card_ids", []),
+                        "persona_wiki_fallback_reason": wiki_fallback_reason,
                         "selected_user_memory_count": len(selected_memories),
                     },
                     usage=estimated_usage_for_text(

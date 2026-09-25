@@ -659,7 +659,7 @@ Tailscale 只控制哪些设备可以访问服务，不能替代应用身份。�
 
 ## 用户长期记忆 v1
 
-用户长期记忆与会话摘要、作者 Persona Pack 是三种不同状态：
+用户长期记忆与会话摘要、作者 Persona Wiki（或兼容用的 Persona Pack）是不同状态：
 
 - 会话摘要只压缩当前会话，用于短期指代和连续性。
 - 用户长期记忆跨会话、跨作者共享，但按登录用户 `owner_id` 严格隔离。
@@ -685,6 +685,8 @@ dense+sparse 双路召回和 RRF 融合。表结构包括：
 -> 只把选中内容作为“用户上下文”交给 Writer
 ```
 
+当 `mrprompt` 使用 Persona Wiki 时，`grounded` 模式暂改为读取当前 `owner_id` 的全部 active 记忆，不进行每轮 BGE-M3 记忆召回，也不依赖 Planner 选出的 `memory_ids` 才注入。Writer 将这份少量用户记忆放在 Wiki 后、会话摘要和原始历史消息前，形成当前用户的稳定前缀；设置关闭或记忆被遗忘时立即不再注入。它仍只描述用户，不作为作者观点。`raw` 模式继续保留无长期记忆基线；未使用 Wiki 的旧 Writer 变体仍走上述动态召回，便于对照。固定前缀超预算时明确失败，不静默截断 Wiki 或用户记忆。
+
 `raw` 模式保持无长期记忆基线。用户记忆不能作为作者观点或外部事实；当前消息与记忆
 冲突时当前消息优先。Query Transform 使用 Planner 完成必要指代消解后的问题，不把
 全部用户记忆直接拼进作者 RAG query。
@@ -707,7 +709,7 @@ checkpoint 后最早的 3 个完整 Turn（顺序消费所有完整窗口）
 较早可重试但未完成的 turn 阻挡后续 checkpoint，避免后来重试时丢证据。
 
 新增 Writer 分项 token 估算与预算 trace；`PERSONAFORGE_WRITER_CONTEXT_BUDGET` 默认 64000，
-预留输出并增加估算余量。优先移除旧历史、Memory、可移除会话状态、背景和低排名作者证据；
+预留输出并增加估算余量。旧 Writer 路径优先移除旧历史、Memory、可移除会话状态、背景和低排名作者证据；Wiki 固定前缀路径保留 Wiki 和用户记忆，
 保留当前 query、识别出的明确约束和最高排名作者证据；仍超限时显式报错。
 完整设计、迁移限制和测试映射见 `docs/architecture/generation/context-memory-v2.md`。
 
